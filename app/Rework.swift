@@ -1,0 +1,290 @@
+// ⌥Tab on a selection (1 November 2026; Apple Writing Tools, Raycast AI; item 7 in docs/typing-models-research.md).
+// He selects text in any field and presses ⌥Tab: a small list opens under the selection - Shorter, Fix, Clearer,
+// Warmer, Formal, List, Translate - or he types what to do. 1-7, or ↑ ↓ and Tab / Return, picks; the text goes to
+// engine `/rework` (Claude through his `claude` sign-in, the local model offline) and the new text shows in the list.
+// Tab or Return puts it over the selection (a paste, so line breaks never send a chat message); a digit tries another
+// command; Esc keeps his text. Backspace as the very next key after Tab brings his text back (⌘Z in the app works too).
+// Nothing leaves the Mac before he picks a command. Not in skipped apps, password fields or under secure input.
+import AppKit
+import Carbon
+import ScreenCaptureKit
+
+final class Rework {
+    static let shared = Rework()
+    enum State { case closed, menu, working, result, failed }
+    private(set) var state: State = .closed
+    var isOpen: Bool { state != .closed }
+    struct Cmd { let id: String; let name: String; var hint: String }
+    var cmds: [Cmd] = [
+        Cmd(id: "shorter", name: "Shorter", hint: "about half as long"),
+        Cmd(id: "fix", name: "Fix", hint: "typos and endings only"),
+        Cmd(id: "clearer", name: "Clearer", hint: "plain words, point first"),
+        Cmd(id: "warmer", name: "Warmer", hint: "friendlier"),
+        Cmd(id: "formal", name: "Formal", hint: "for a business message"),
+        Cmd(id: "list", name: "List", hint: "one point a line"),
+        Cmd(id: "translate", name: "Translate", hint: "→ English"),
+    ]
+    var sel = 0
+    var typed = ""                  // his own instruction
+    private(set) var original = "", result = "", ran = "", by = "", ms = 0
+    private var el: AXUIElement?, pid: pid_t = 0, app = "", anchor = CGRect.zero, seq = 0
+    struct Done { let el: AXUIElement; let old: String; let new: String; let revision: Int; let at: Date }
+    static var last: Done?
+
+    let panel: NSPanel
+    let view = ReworkView()
+
+    init() {
+        panel = NSPanel(contentRect: .zero, styleMask: [.nonactivatingPanel, .borderless], backing: .buffered, defer: true)
+        panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = false
+        panel.level = .popUpMenu; panel.ignoresMouseEvents = true; panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        panel.contentView = view
+    }
+
+    /// In the event tap, no Accessibility calls: could ⌥Tab open the list here at all?
+    func mayStart() -> Bool {
+        let st = Drafter.shared.settings
+        guard st.rework, Talk.shared.state == .idle, !IsSecureEventInputEnabled(),
+              let front = NSWorkspace.shared.frontmostApplication, !st.skip.contains(front.bundleIdentifier ?? "") else { return false }
+        return true
+    }
+
+    /// ⌥Tab, off the tap: open on a selection. false = nothing selected here, the key goes on to the app.
+    func start() -> Bool {
+        if isOpen { close("⌥tab"); return true }
+        let st = Drafter.shared.settings
+        guard mayStart(), let front = NSWorkspace.shared.frontmostApplication, let el = Focus.focused() else { return false }
+        AXUIElementSetMessagingTimeout(el, 0.15)
+        let role: String = Focus.attr(el, kAXRoleAttribute) ?? "", sub: String = Focus.attr(el, kAXSubroleAttribute) ?? ""
+        guard role != "AXSecureTextField", sub != (kAXSecureTextFieldSubrole as String),
+              let text = Focus.selection(), text.trimmingCharacters(in: .whitespacesAndNewlines).count >= 2,
+              (text as NSString).length <= 3000 else { return false }
+        Fields.end("rework")
+        Keys.shared.cancel(); Ghost.shared.hide()
+        self.el = el; pid = front.processIdentifier; app = front.localizedName ?? ""
+        original = text; typed = ""; sel = 0; result = ""; ran = ""
+        cmds[6].hint = Translate.lang(text, share: 0.6) == "uk" ? "→ English" : "→ Українська"
+        anchor = Focus.selectionRect(el) ?? Focus.frame(el) ?? CGRect(x: NSEvent.mouseLocation.x, y: 200, width: 1, height: 18)
+        state = .menu
+        Engine.shared.post("/rework", ["warm": true])
+        draw()
+        log("rework: open, \(text.count) chars in \(front.bundleIdentifier ?? "?")")
+        return true
+    }
+
+    func close(_ why: String) {
+        guard isOpen else { return }
+        state = .closed; seq += 1
+        panel.orderOut(nil)
+        log("rework: closed (\(why))")
+    }
+
+    /// Keys while the list is open. true = swallowed; false = it goes to the app (the list closed first).
+    func key(_ code: Int64, typed ch: String, mods: CGEventFlags) -> Bool {
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier != pid { close("app changed"); return false }
+        if code == 48, mods == .maskAlternate { close("⌥tab"); return true }
+        if !mods.subtracting(.maskShift).isEmpty { close("shortcut"); return false }
+        let digit = ch.count == 1 ? Int(ch).flatMap { (1...cmds.count).contains($0) ? $0 : nil } : nil
+        switch state {
+        case .menu:
+            switch code {
+            case 53: close("esc")
+            case 126: sel = max(0, sel - 1); draw()
+            case 125: sel = min(cmds.count, sel + 1); draw()
+            case 36, 76, 48: if !typed.trimmingCharacters(in: .whitespaces).isEmpty { run("custom") } else if sel < cmds.count { run(cmds[sel].id) }
+            case 51: if !typed.isEmpty { typed.removeLast(); draw() }
+            case 123, 124, 115, 119, 116, 121: close("arrow"); return false
+            default:
+                if typed.isEmpty, let d = digit { run(cmds[d - 1].id) }
+                else if let c = ch.unicodeScalars.first, !CharacterSet.controlCharacters.contains(c), typed.count < 200 {
+                    typed += ch; sel = cmds.count; draw()
+                }
+            }
+            return true
+        case .working, .result, .failed:
+            switch code {
+            case 53: close("esc"); return true
+            case 36, 76, 48:
+                // closed now, so a second key cannot apply it twice; the field is checked off the tap
+                if state == .result { close("tab"); DispatchQueue.main.async { self.apply() } }
+                return true
+            default:
+                if let d = digit { run(cmds[d - 1].id); return true }
+                close("typed"); return false          // he types on: his key goes to the app as usual
+            }
+        case .closed: return false
+        }
+    }
+
+    func run(_ cmd: String) {
+        ran = cmd; state = .working; seq += 1
+        let mine = seq, t0 = Date()
+        draw()
+        Engine.shared.post("/rework", ["text": original, "cmd": cmd, "custom": cmd == "custom" ? typed : "", "app": app], timeout: 45) { j in
+            guard mine == self.seq, self.state == .working else { return }
+            let out = (j?["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            self.ms = Int(Date().timeIntervalSince(t0) * 1000)
+            log("rework \(cmd) \(self.ms)ms by \(j?["by"] as? String ?? "-") " + (out.isEmpty ? "none" : "\(self.original.count) → \(out.count) chars"))
+            if out.isEmpty { self.state = .failed } else { self.result = out; self.by = j?["by"] as? String ?? ""; self.state = .result }
+            self.draw()
+        }
+    }
+
+    /// Tab on the result: pasted over the selection, if it is still his selection; else it goes to the clipboard.
+    func apply() {
+        let new = result, old = original
+        guard let el else { close("no field"); return }
+        close("tab")   // already closed by the key; kept for other callers
+        guard let now = Focus.focused(), CFEqual(now, el), NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+              Focus.selection() == old else {
+            NSPasteboard.general.clearContents(); NSPasteboard.general.setString(new, forType: .string)
+            Ghost.shared.flash("Selection changed · new text copied"); log("rework: selection changed, copied"); return
+        }
+        Focus.paste(new)
+        Rework.last = Done(el: el, old: old, new: new, revision: Keys.shared.inputRevision, at: Date())
+        log("rework applied \(ran), \(old.count) → \(new.count) chars")
+    }
+
+    /// Backspace as the very next key after Tab: his own text comes back.
+    static func takeBack() -> Bool {
+        guard let d = last, Keys.shared.inputRevision == d.revision + 1, Date().timeIntervalSince(d.at) < 60 else { last = nil; return false }
+        last = nil
+        guard let now = Focus.focused(), CFEqual(now, d.el), Focus.before(now)?.hasSuffix(Fixer.norm(d.new)) ?? false else { return false }
+        DispatchQueue.main.async {
+            Fields.left(d.new.count, shift: true)
+            Focus.paste(d.old)
+            log("rework taken back")
+        }
+        return true
+    }
+
+    // MARK: drawing
+
+    func draw() {
+        view.model = self
+        let size = view.fit()
+        // under the selection, else above it (AX rects are top-left based)
+        let scr = NSScreen.screens.first(where: { $0.frame.contains(NSPoint(x: anchor.midX, y: (NSScreen.screens.first?.frame.height ?? 0) - anchor.midY)) }) ?? NSScreen.main
+        let h = NSScreen.screens.first?.frame.height ?? 0, vis = scr?.visibleFrame ?? .zero
+        var x = anchor.minX, y = h - anchor.maxY - 6 - size.height
+        if y < vis.minY + 4 { y = h - anchor.minY + 6 }
+        y = min(max(y, vis.minY + 4), vis.maxY - size.height - 4)
+        x = min(max(x, vis.minX + 4), vis.maxX - size.width - 4)
+        panel.setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: true)
+        view.needsDisplay = true
+        panel.orderFrontRegardless()
+    }
+}
+
+/// The list, the working line and the result, drawn flat in PixelKit's paper (2 px corners, a 1 px line).
+final class ReworkView: NSView {
+    weak var model: Rework?
+    override var isFlipped: Bool { true }
+    let W: CGFloat = 380, pad: CGFloat = 10, row: CGFloat = 24
+
+    private func a(_ size: CGFloat, _ color: NSColor, mono: Bool = false, weight: NSFont.Weight = .regular) -> [NSAttributedString.Key: Any] {
+        [.font: mono ? PK.mono(size, weight) : PK.text(size, weight), .foregroundColor: color]
+    }
+    private var resultText: NSAttributedString {
+        let p = NSMutableParagraphStyle(); p.lineBreakMode = .byWordWrapping; p.lineSpacing = 2
+        return NSAttributedString(string: model?.result ?? "", attributes: a(13, PK.ink).merging([.paragraphStyle: p]) { x, _ in x })
+    }
+    private func resultHeight() -> CGFloat {
+        let r = resultText.boundingRect(with: NSSize(width: W - 2 * pad, height: 10_000), options: [.usesLineFragmentOrigin, .usesFontLeading])
+        return min(ceil(r.height), 15 * 12)
+    }
+
+    func fit() -> NSSize {
+        guard let m = model else { return .zero }
+        switch m.state {
+        case .menu: return NSSize(width: W, height: 28 + CGFloat(m.cmds.count + 1) * row + 8)
+        case .working, .failed: return NSSize(width: W, height: 28 + row + 8)
+        case .result: return NSSize(width: W, height: 28 + resultHeight() + 12 + row + 6)
+        case .closed: return .zero
+        }
+    }
+
+    private func cap(_ t: String, at p: NSPoint) -> CGFloat {   // a small keycap; returns its width
+        let at = a(10, PK.ink.withAlphaComponent(0.75), mono: true, weight: .medium)
+        let s = (t as NSString).size(withAttributes: at)
+        let r = NSRect(x: p.x, y: p.y, width: ceil(s.width) + 8, height: ceil(s.height) + 3)
+        let b = NSBezierPath(roundedRect: r, xRadius: 2, yRadius: 2)
+        PK.key.setFill(); b.fill(); PK.keyEdge.setStroke(); b.lineWidth = 1; b.stroke()
+        (t as NSString).draw(at: NSPoint(x: r.minX + 4, y: r.minY + 1.5), withAttributes: at)
+        return r.width
+    }
+
+    override func draw(_ dirty: NSRect) {
+        guard let m = model else { return }
+        let box = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 2, yRadius: 2)
+        PK.paper.withAlphaComponent(0.98).setFill(); box.fill(); PK.line.setStroke(); box.lineWidth = 1; box.stroke()
+        // head: the kind square, what is going on, esc on the right
+        PK.drawMark(Kind.rework.mark, in: NSRect(x: pad - 2, y: 6, width: 16, height: 16), tint: Kind.rework.color)
+        let name = m.ran == "custom" ? "Your words" : (m.cmds.first { $0.id == m.ran }?.name ?? "")
+        let head: String
+        switch m.state {
+        case .menu: head = "Rework · \(m.original.count) characters"
+        case .working: head = "\(name) · writing…"
+        case .result: head = "\(name) · \(m.by) · \(String(format: "%.1f", Double(m.ms) / 1000)) s"
+        case .failed: head = "\(name) · nothing better came back"
+        case .closed: head = ""
+        }
+        (head as NSString).draw(at: NSPoint(x: pad + 20, y: 6), withAttributes: a(11.5, PK.muted))
+        let escW = ("esc" as NSString).size(withAttributes: a(10, PK.ink, mono: true)).width + 8
+        _ = cap("esc", at: NSPoint(x: W - pad - escW, y: 6))
+        PK.rule.setFill(); NSRect(x: 0, y: 26, width: W, height: 1).fill()
+        var y: CGFloat = 30
+        switch m.state {
+        case .menu:
+            for (i, c) in m.cmds.enumerated() {
+                if i == m.sel { PK.selected.setFill(); NSRect(x: 2, y: y, width: W - 4, height: row).fill() }
+                _ = cap("\(i + 1)", at: NSPoint(x: pad, y: y + 4))
+                (c.name as NSString).draw(at: NSPoint(x: pad + 26, y: y + 4), withAttributes: a(13, PK.ink))
+                (c.hint as NSString).draw(at: NSPoint(x: pad + 110, y: y + 5), withAttributes: a(12, PK.muted))
+                y += row
+            }
+            if m.sel == m.cmds.count { PK.selected.setFill(); NSRect(x: 2, y: y, width: W - 4, height: row).fill() }
+            let t = m.typed.isEmpty ? "or type what to do…" : m.typed
+            (t as NSString).draw(with: NSRect(x: pad + 26, y: y + 4, width: W - pad * 2 - 26 - 50, height: 18), options: [.truncatesLastVisibleLine, .usesLineFragmentOrigin],
+                                 attributes: a(13, m.typed.isEmpty ? PK.faint : PK.ink))
+            if !m.typed.isEmpty { _ = cap("⏎", at: NSPoint(x: W - pad - 22, y: y + 4)) }
+        case .working, .failed:
+            (("1-\(m.cmds.count) another") as NSString).draw(at: NSPoint(x: pad, y: y + 4), withAttributes: a(12, PK.muted))
+        case .result:
+            let h = resultHeight()
+            resultText.draw(with: NSRect(x: pad, y: y + 2, width: W - 2 * pad, height: h), options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
+            y += h + 10
+            PK.rule.setFill(); NSRect(x: 0, y: y - 4, width: W, height: 1).fill()
+            var x = pad
+            x += cap("tab", at: NSPoint(x: x, y: y + 2)) + 5
+            ("replace" as NSString).draw(at: NSPoint(x: x, y: y + 2), withAttributes: a(12, PK.muted)); x += 62
+            x += cap("1-\(m.cmds.count)", at: NSPoint(x: x, y: y + 2)) + 5
+            ("another" as NSString).draw(at: NSPoint(x: x, y: y + 2), withAttributes: a(12, PK.muted))
+        case .closed: break
+        }
+    }
+}
+
+private var reworkShots = 0
+
+extension Rework {
+    /// Test: a picture of the list and the text around it into data/rework-N.png (post <bundle id>.reworkshot).
+    func shot() {
+        guard panel.isVisible, let scr = NSScreen.screens.first else { log("reworkshot: nothing shown"); return }
+        let f = panel.frame, h = scr.frame.height
+        let r = CGRect(x: f.minX - 40, y: h - f.maxY - 20, width: f.width + 80, height: f.height + 90)
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { c, _ in
+            guard let d = c?.displays.first else { return }
+            let cfg = SCStreamConfiguration(); cfg.sourceRect = r; cfg.width = Int(r.width * 2); cfg.height = Int(r.height * 2)
+            SCScreenshotManager.captureImage(contentFilter: SCContentFilter(display: d, excludingWindows: []), configuration: cfg) { img, _ in
+                reworkShots += 1
+                let out = Home.data.appendingPathComponent("rework-\(reworkShots).png")
+                if let img, let dest = CGImageDestinationCreateWithURL(out as CFURL, "public.png" as CFString, 1, nil) {
+                    CGImageDestinationAddImage(dest, img, nil); CGImageDestinationFinalize(dest)
+                }
+                log("reworkshot: \(img == nil ? "failed" : "saved")")
+            }
+        }
+    }
+}

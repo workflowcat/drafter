@@ -1,0 +1,614 @@
+"""One warm model with a reusable prompt cache. Only one model is loaded per process.
+
+The prompt has a fixed head (style, dictionary, examples) and a moving tail (app, window, text before the caret).
+Consecutive keystrokes share most tokens, so the cache is trimmed back to the common part and only new tokens are fed.
+"""
+import copy, gc, math, os, re, threading, time
+from collections import OrderedDict
+
+import mlx.core as mx
+from mlx_lm import load
+from mlx_lm.generate import generate_step, generation_stream
+from mlx_lm.models.cache import make_prompt_cache, can_trim_prompt_cache, trim_prompt_cache
+from mlx_lm.sample_utils import make_sampler
+
+CAP_GB = float(os.environ.get("DRAFTER_CAP_GB", "3.6"))   # guard cap for the whole engine
+mx.set_memory_limit(int(CAP_GB * 0.92 * 2**30))          # MLX tries to stay under this (below 2.6 GB it stalls the 4B model)
+mx.set_cache_limit(64 * 2**20)                             # never keep a big free-buffer pool (VoiceNotes lesson)
+
+END = re.compile(r"[.!?…)\n]")
+# other screens kept warm (2026-11-01, Andrii: "it takes a long time to start often"): going back to a chat reads
+# nothing again. Each holds one prompt, ~0.15 GB at 1,300 tokens for Qwen3 1.7B.
+SPARE = int(os.environ.get("DRAFTER_SPARE_CACHES", "2"))
+# his-writing layer merged into a copy of the layers it touches (2026-11-13, bench/speed.py): unmerged, each of the
+# 112 LoRA layers adds two small matmuls per token, 19.5 ms a token against 6.8 merged (M4 Pro, Qwen3 1.7B 4-bit);
+# the merged copies cost ~0.43 GB. The plain layers stay for chips and rewrites (layer off). 0 = the old way.
+FUSE = os.environ.get("DRAFTER_LORA_FUSE", "1") == "1"
+# the next-token distribution kept beside the cache (round four, 2026-11-14, Codex review): inside a half word the
+# prompt ids stay the same from key to key (the typed letters are healed, not fed), so the model's first step was
+# being run again on the same tokens. With the distribution after those ids kept, the cache is cut back to them and
+# the first token comes from it without a forward pass; bench/dist_check.py shows the choices stay identical.
+SETTLE = os.environ.get("DRAFTER_SETTLE", "1") == "1"   # round five: stop once the ghost can no longer change
+DIST = os.environ.get("DRAFTER_DIST", "1") == "1"   # bench/dist_check.py 2026-11-14: same choices on 1,080 keys; DRAFTER_DIST=0 turns it off
+# logit bias / steering vectors (weights round, 2026-11-14, engine/tweaks.py): a file from bench/weights/, default off
+TWEAKS = os.environ.get("DRAFTER_TWEAKS", "")
+
+
+class Model:
+    def __init__(self, repo, adapter=None):
+        t = time.time()
+        self.repo = repo
+        self.adapter = adapter if adapter and os.path.isdir(adapter) else None
+        # a LoRA trained on his own writing (bench/train.py) sits on top of the base model
+        self.model, self.tok = load(repo, adapter_path=self.adapter) if self.adapter else load(repo)
+        self.fused = []        # (parent module, attribute, LoRA module, merged copy): see fuse_lora
+        if self.adapter and FUSE: self.fuse_lora()
+        self.tw = self._tweak(None)
+        self.lock = threading.Lock()
+        self.cache, self.ids = None, []
+        self.rebuilds = 0
+        self.screen, self.parked, self.swaps = None, OrderedDict(), 0   # parked: screen -> (ids, cache), oldest first
+        self.snapshot = None   # (cache, ids) right after the fixed head, for caches that cannot be trimmed
+        self.head_ids, self.wake_at, self.sleeps, self.loading = [], 0.0, 0, False
+        self.retrain_sleep = False
+        self.load_s = time.time() - t
+        self.sampler = make_sampler(temp=0.0)
+        self.dist = None       # (id of the cache, ids) -> raw logits of the token after them: see DIST
+        self.dist_used = 0
+
+    def encode(self, text):
+        return self.tok.encode(text, add_special_tokens=False)
+
+    def bos(self):
+        b = getattr(self.tok, "bos_token_id", None)
+        return [b] if b is not None and "gemma" in self.repo.lower() else []
+
+    # Sleep (2026-11-01, Andrii: "not to overload the Mac, a lot of stuff is being recorded"): while a long call is read
+    # again (the voice engine may take 3.4 GB then), the text model gives its ~1.9 GB back. Typing paths answer empty
+    # meanwhile (the word finisher still speaks); a one-off can wake ordinary voice sleep, but never a retrain lease.
+    @property
+    def asleep(self):
+        return self.model is None
+
+    def sleep(self, secs, retrain=False):
+        with self.lock:
+            until = time.time() + max(0.0, secs)
+            if getattr(self, "retrain_sleep", False) and time.time() < self.wake_at:
+                until, retrain = max(until, self.wake_at), True
+            self.wake_at, self.retrain_sleep = until, retrain
+            if self.model is None: return False
+            self.model, self.fused = None, []    # the merged copies hold memory too
+            self.cache, self.ids, self.snapshot, self.dist = None, [], None, None
+            self.parked.clear(); self.screen = None
+            self._lora_mods = None; self._ru = None; self.__dict__.pop("_masks", None)
+            self.sleeps += 1
+        gc.collect(); mx.clear_cache()
+        return True
+
+    def wake(self, force=True):
+        """Load back now (force), or only if the sleep ran out. -> True when the model is there."""
+        with self.lock:
+            return self._ensure(force)
+
+    def _ensure(self, force=False):
+        """Under the lock: True when the model is loaded. After a sleep it loads back once the time ran out, or at once
+        with force; the head is read in again, so the next key costs what it did before."""
+        if self.model is None and not force and time.time() < self.wake_at: return False
+        self.wake_at, self.retrain_sleep = 0.0, False
+        if self.model is not None: return True
+        t = time.time()
+        self.loading = True        # the server answers typing from the word finisher meanwhile, never behind this
+        try:
+            self.model, _ = load(self.repo, adapter_path=self.adapter) if self.adapter else load(self.repo)
+            if self.adapter and FUSE: self.fuse_lora()
+            self.tw = self._tweak(self.tw)
+            self._warm(self.head_ids)
+        finally:
+            self.loading = False
+        self.load_s = time.time() - t
+        return True
+
+    def _switch(self, screen):
+        """Make the cache of `screen` (app · window) the active one. A screen seen lately gets its own cache back, so
+        its chat is not read again; a new one starts from a copy of the active cache (trimmed back to the shared
+        head by _feed), or reuses the buffers of the screen parked longest."""
+        if not SPARE or screen is None or screen == self.screen or self.cache is None:
+            if screen is not None: self.screen = screen
+            return
+        if screen in self.parked:
+            ids, cache = self.parked.pop(screen)
+            self.swaps += 1
+        elif len(self.parked) >= SPARE:
+            ids, cache = self.parked.popitem(last=False)[1]
+        else:
+            ids, cache = list(self.ids), copy.deepcopy(self.cache)
+        if self.screen is not None: self.parked[self.screen] = (self.ids, self.cache)
+        self.ids, self.cache, self.screen, self.dist = ids, cache, screen, None
+
+    def _feed(self, ids):
+        """Make the cache hold exactly ids[:-1] and return the tail to feed (at least one token)."""
+        if self.cache is not None:
+            n = 0
+            for a, b in zip(self.ids, ids):
+                if a != b: break
+                n += 1
+            n = min(n, len(ids) - 1)
+            drop = len(self.ids) - n
+            if drop == 0 or (can_trim_prompt_cache(self.cache) and trim_prompt_cache(self.cache, drop) == drop):
+                self.ids = self.ids[:n]
+                return ids[n:]
+        self.rebuilds += 1
+        snap = self.snapshot
+        if snap and ids[: len(snap[1])] == snap[1] and len(ids) > len(snap[1]):
+            self.cache, self.ids = copy.deepcopy(snap[0]), list(snap[1])
+            return ids[len(snap[1]):]
+        self.cache, self.ids = make_prompt_cache(self.model), []
+        return ids
+
+    def _reuse(self, raw_ids):
+        """The distribution after exactly raw_ids, when it is kept and the cache can be cut back to them: then the cache
+        holds raw_ids and the raw logits come back (the caller feeds nothing); else None and nothing changes."""
+        d = self.dist
+        if not DIST or d is None or self.cache is None or d[0] != (id(self.cache), tuple(raw_ids)): return None
+        n = len(raw_ids)
+        if n == 0 or self.ids[:n] != list(raw_ids) or getattr(self.cache[0], "offset", -1) != len(self.ids): return None
+        drop = len(self.ids) - n
+        if drop and not (can_trim_prompt_cache(self.cache) and trim_prompt_cache(self.cache, drop) == drop): return None
+        self.ids = list(raw_ids)
+        self.dist_used += 1
+        return d[1]
+
+    def _steps(self, raw_ids, fed, procs, max_tokens, raw0=None, prefill_step=512):
+        """mlx_lm generate_step (0.32) for the main cache, with the distribution after raw_ids kept (self.dist), and
+        with `raw0` (from _reuse) the first token taken from it without a forward pass. Same greedy choices, same
+        logits processors (they see the fed tokens first), every yielded token already inside the cache."""
+        tokens, key, kept = None, (id(self.cache), tuple(raw_ids)), [False]
+
+        def step(inp, raw=None):
+            nonlocal tokens
+            with mx.stream(generation_stream):
+                logits = raw if raw is not None else self.model(inp[None], cache=self.cache)[:, -1, :]
+                if not kept[0]:
+                    kept[0] = True
+                    self.dist = (key, logits) if DIST else None
+                tokens = mx.concat([tokens, inp]) if tokens is not None else inp
+                for proc in procs: logits = proc(tokens, logits)
+                lp = logits - mx.logsumexp(logits, keepdims=True)
+                return self.sampler(lp), lp.squeeze(0)
+        prompt = mx.array(fed)
+        with mx.stream(generation_stream):
+            if raw0 is None:
+                while len(prompt) > 1:
+                    k = min(prefill_step, len(prompt) - 1)
+                    self.model(prompt[:k][None], cache=self.cache)
+                    mx.eval([c.state for c in self.cache])
+                    tokens = mx.concat([tokens, prompt[:k]]) if tokens is not None else prompt[:k]
+                    prompt = prompt[k:]
+                    mx.clear_cache()
+            y, lp = step(prompt, raw0)
+            mx.async_eval(y, lp)
+            n = 0
+            while True:
+                if n != max_tokens:
+                    ny, nlp = step(y)
+                    mx.async_eval(ny, nlp)
+                if n == 0: mx.eval(y)
+                if n == max_tokens: break
+                yield y.item(), lp
+                y, lp = ny, nlp
+                n += 1
+
+    def pieces(self):
+        """Every token as text, indexed by first character, for token healing. Built once (1-3 s)."""
+        if getattr(self, "_by_first", None) is None:
+            n = len(self.tok._tokenizer) if hasattr(self.tok, "_tokenizer") else self.tok.vocab_size
+            by = {}
+            for i in range(n):
+                t = self.tok.decode([i])
+                if t and "\ufffd" not in t: by.setdefault(t[0], []).append((i, t))
+            self._by_first = by
+        return self._by_first
+
+    def mask(self, left, shape):
+        """Additive mask allowing only tokens that fit `left`; kept per string (a space alone allows ~1/3 of the vocab)."""
+        cache = self.__dict__.setdefault("_masks", {})
+        m = cache.get(left)
+        if m is None or m.shape != shape:
+            ok = [i for i, t in self.pieces().get(left[0], []) if t.startswith(left) or left.startswith(t)]
+            if not ok: return None
+            m = mx.full(shape, -float("inf")); m[..., mx.array(ok)] = 0
+            mx.eval(m)
+            if len(cache) > 12: cache.clear()
+            cache[left] = m
+        return m
+
+    def russian_mask(self, shape):
+        """Tokens with letters only Russian has (ы э ъ ё): never offered; his text is Ukrainian or English."""
+        m = getattr(self, "_ru", None)
+        if m is None or m.shape != shape:
+            bad = [i for lst in self.pieces().values() for i, t in lst if any(c in "ыэъёЫЭЪЁ" for c in t)]
+            m = mx.zeros(shape); m[..., mx.array(bad)] = -float("inf"); mx.eval(m)
+            self._ru = m
+        return m
+
+    def healer(self, need, n_prompt):
+        """Logits processor: the first tokens must spell `need` (the half-typed word or space cut from the prompt)."""
+        state = {"left": need, "seen": 0}
+
+        def proc(tokens, logits):
+            left = state["left"]
+            if not left: return logits
+            new = tokens[n_prompt + state["seen"]:].tolist() if tokens.size > n_prompt + state["seen"] else []
+            for t in new:
+                s = self.tok.decode([t]); state["seen"] += 1
+                left = left[len(s):] if left.startswith(s) else ""
+                if not left: break
+            state["left"] = left
+            if not left: return logits
+            m = self.mask(left, logits.shape)
+            return logits if m is None else logits + m
+        return proc
+
+    def booster(self, cands, n_prompt, lam):
+        """Logits processor (2026-11-01, Andrii: "guess the words I actually use often"): his own next words
+        (words.dist) mixed into the model's at the word level, P = (1 - lam) model + lam his. Each of his words is a
+        token path; each step mixes the model's token probabilities with the share of his words still on that path,
+        so a word he writes often after these words gets the boost all the way through, and nothing else moves.
+        cands: [(text the model should write, p)], the text starting with the healed half word. None when idle."""
+        seqs = [(self.encode(t), p) for t, p in cands if t and p > 0]
+        if not seqs or lam <= 0: return None
+        st = {"pm": 1.0, "lp": None, "n": 0, "off": False, "ended": 0.0}
+
+        def proc(tokens, logits):
+            if st["off"]: return logits
+            gen = tokens[n_prompt:].tolist() if tokens.size > n_prompt else []
+            if len(gen) > st["n"] and st["lp"] is not None:
+                st["ended"] *= math.exp(float(st["lp"][0, gen[-1]]))
+                st["pm"] *= math.exp(float(st["lp"][0, gen[-1]]))     # the model's own p of the token just taken
+            st["n"] = k = len(gen)
+            nxt = {}
+            ended = 0.0
+            for seq, p in seqs:
+                if len(seq) == k and seq == gen: ended += p
+                if len(seq) > k and seq[:k] == gen:
+                    nxt[seq[k]] = nxt.get(seq[k], 0.0) + p
+            # Once a candidate ends, its mass follows the base continuation rather
+            # than transferring to a longer candidate sharing its prefix.
+            st["ended"] += ended
+            if not nxt:
+                st["off"] = True; return logits
+            lp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            st["lp"] = lp
+            pm = max(st["pm"], 1e-30)
+            base = (1 - lam) * pm + lam * st["ended"]
+            denom = base + lam * sum(nxt.values())
+            ids = list(nxt)
+            idx = mx.array(ids)
+            mine = lp[..., idx].reshape(-1).tolist()
+            vals = [math.log(max(1e-30, base * math.exp(x) + lam * nxt[t]) / denom) for t, x in zip(ids, mine)]
+            out = lp + math.log(max(1e-30, base) / denom)
+            out[..., idx] = mx.array(vals, dtype=out.dtype)
+            return out
+        return proc
+
+    class Cancelled(Exception):
+        pass
+
+    def fuse_lora(self):
+        """Merge the LoRA into a quantized copy of each layer it touches and put the copies in place (typing runs on
+        them); the plain quantized layers stay inside each LoRA module for `lora(False)`. Same requantization as
+        `mlx_lm fuse` (data/fused). -> number of layers merged."""
+        from mlx_lm.tuner.lora import LoRALinear
+        self.fused = []
+        for _, mod in self.model.named_modules():
+            for name, child in list(mod.children().items()):
+                if isinstance(child, LoRALinear):
+                    self.fused.append((mod, name, child, child.fuse()))
+        for mod, name, _, merged in self.fused: setattr(mod, name, merged)
+        mx.eval([m.parameters() for *_, m in self.fused])
+        return len(self.fused)
+
+    def _tweak(self, tw):
+        if not TWEAKS: return None
+        import tweaks
+        return tweaks.attach(self.model, tw or TWEAKS)
+
+    def tweak_kind(self, app):
+        """Bias and steering for this app's kind (ai / chat / all): read on every call, nothing reloads."""
+        if getattr(self, "tw", None):
+            import tweaks
+            with self.lock: self.tw.kind, self.dist = tweaks.kind_of(app), None
+
+    def lora(self, on):
+        """His-writing layer (LoRA) on for suggestions, off for instructions (chips, rewrites): training on plain text
+        took the model's instruction-following away (2026-10-19), the base model still has it."""
+        if getattr(self, "tw", None): self.tw.on, self.dist = on, None
+        if not self.adapter: return
+        self.dist = None
+        if self.fused:
+            for mod, name, lora_mod, merged in self.fused: setattr(mod, name, merged if on else lora_mod.linear)
+            return
+        mods = getattr(self, "_lora_mods", None)
+        if mods is None:
+            mods = self._lora_mods = [(m, m.scale) for m in self.model.modules() if type(m).__name__.startswith("LoRA") and hasattr(m, "scale")]
+        for m, sc in mods: m.scale = sc if on else 0.0
+
+    def oneshot(self, ids, max_tokens=60, stop=None, cancelled=lambda: False):
+        """A one-off prompt (chip fields, rewrites) on its own small cache, so the warm head stays where it is, with the
+        base model (his-writing layer off). Stops (raises Cancelled) as soon as a newer request arrives."""
+        with self.lock:
+            if not self._ensure(force=not getattr(self, "retrain_sleep", False)): return ""
+            self.lora(False)
+            try:
+                return self._oneshot(ids, max_tokens, stop, cancelled)
+            finally:
+                self.lora(True)
+
+    def _oneshot(self, ids, max_tokens, stop, cancelled):
+        cache, out = make_prompt_cache(self.model), []
+        eos = set(getattr(self.tok, "eos_token_ids", None) or [self.tok.eos_token_id])
+        for tok, _ in generate_step(mx.array(ids), self.model, max_tokens=max_tokens, sampler=self.sampler,
+                                    prompt_cache=cache, prefill_step_size=512):
+            if int(tok) in eos: break
+            out.append(int(tok))
+            if stop and stop.search(self.tok.decode(out)): break
+            if cancelled():
+                del cache; mx.clear_cache(); raise Model.Cancelled()
+        del cache
+        mx.clear_cache()
+        return self.tok.decode(out)
+
+    BARS = (0.3, 0.45, 0.6)   # finishing the typed word, a first new word, each further word (bench/replay.py, setup E)
+
+    def complete(self, prompt, max_tokens=12, stop=END, cancelled=lambda: False, raw_ids=None, heal="", min_p=0.0, max_words=0, bars=None, soft=0.0, soft_from=2, screen=None):
+        """Greedy continuation. With `heal`, the output first re-spells it and only the rest is returned.
+        Returns (text, first_token_ms, total_ms)."""
+        with self.lock:
+            if cancelled(): raise Model.Cancelled()
+            ids = raw_ids if raw_ids is not None else self.bos() + self.encode(prompt)
+            if self.model is None:     # asleep: typing never loads it (the wake timer or /wake does)
+                self.hit_limit, self.last_p, self.sure_len = False, [], None
+                return "", 0, 0
+            t0 = time.perf_counter()
+            self._switch(screen)
+            if cancelled(): raise Model.Cancelled()
+            raw0 = self._reuse(ids) if DIST else None
+            tail = list(ids[-1:]) if raw0 is not None else self._feed(ids)
+            out, first, n, healed_at = [], None, 0, None
+            eos = set(getattr(self.tok, "eos_token_ids", None) or [self.tok.eos_token_id])
+            self.hit_limit = False
+            procs = ([self.healer(heal, len(tail))] if heal else []) + [lambda toks, logits: logits + self.russian_mask(logits.shape)]
+            self.last_p = []
+            sure = ""          # the text up to the last token the model was sure of (min_p): Clef's idea, decide by probability
+            # a lighter tail (2026-10-21, Cotypist's few words): after two sure words, further words above `soft` still
+            # come, and self.sure_len says where the sure part ends (the app draws the rest lighter)
+            strict_end = None
+            self.sure_len = None
+            if cancelled(): raise Model.Cancelled()
+            steps = (self._steps(ids, tail, procs, max_tokens + (6 if heal else 0), raw0) if DIST else
+                     generate_step(mx.array(tail), self.model, max_tokens=max_tokens + (6 if heal else 0), sampler=self.sampler,
+                                   prompt_cache=self.cache, prefill_step_size=512, logits_processors=procs))
+            for tok, lp in steps:
+                tok = int(tok)
+                if first is None: self.ids = list(ids)  # tail was fed before the first yield
+                self.ids.append(tok)   # every yielded token is already inside the cache
+                if cancelled(): raise Model.Cancelled()
+                if first is None: first = (time.perf_counter() - t0) * 1000
+                if tok in eos: break
+                p = float(mx.exp(lp[tok])) if min_p else 1.0
+                self.last_p.append(round(p, 3))
+                out.append(tok); n += 1
+                full = self.tok.decode(out)
+                # Cotypist-like (2026-10-19): finishing the word being typed needs little certainty, a new word more,
+                # each further word the full min_p
+                piece = self.tok.decode([tok])
+                new_word = not piece[:1].isalnum() and piece[:1] not in ("'", "’", "-")
+                words_so_far = len((full[len(heal):] if heal else full).split())
+                bw, bn, bf = bars or self.BARS
+                bar = 0 if not min_p else (bw if not new_word else (bn if words_so_far <= 1 else bf))
+                soft_ok = bool(soft) and words_so_far >= soft_from and p >= soft and (new_word or strict_end is not None)
+                if min_p and p < bar and soft_ok and strict_end is None:
+                    strict_end = len(sure)
+                if min_p and p < bar and not soft_ok:
+                    # unsure from here on: keep what came before, cut back to a whole word
+                    text = sure
+                    piece = self.tok.decode([tok])
+                    if text and piece[:1].isalnum() and not text[-1:].isspace():
+                        text = text[: max(text.rfind(" "), 0)] if " " in text.strip() else ("" if not heal else text)
+                    self.hit_limit = False
+                    text = text.rstrip()
+                    self.sure_len = min(strict_end, len(text)) if strict_end is not None else None
+                    return text, first, (time.perf_counter() - t0) * 1000
+                if heal and len(full) <= len(heal):
+                    if cancelled(): raise Model.Cancelled()
+                    continue
+                if healed_at is None: healed_at = n - 1 if heal else 0   # tokens before only re-spelled the cut
+                text = full[len(heal):] if heal else full
+                sure = text
+                if max_words and len(text.split()) > max_words:
+                    text = " ".join(text.split(" ")[: max_words + (1 if text.startswith(" ") else 0)])
+                    self.hit_limit = False
+                    self.sure_len = min(strict_end, len(text)) if strict_end is not None else None
+                    return text, first, (time.perf_counter() - t0) * 1000
+                m = stop.search(text) if stop else None
+                if m:
+                    text = text[: m.end()].rstrip("\n")
+                    self.sure_len = min(strict_end, len(text)) if strict_end is not None else None
+                    return text, first, (time.perf_counter() - t0) * 1000
+                if n - healed_at >= max_tokens:
+                    self.hit_limit = True
+                    if strict_end is not None:   # cut a half word off the light tail
+                        cut = text.rfind(" ")
+                        text = text[:cut] if cut > strict_end else text
+                        self.sure_len = min(strict_end, len(text))
+                    return text, first, (time.perf_counter() - t0) * 1000
+                if cancelled(): break
+            full = self.tok.decode(out)
+            text = full[len(heal):] if heal and full.startswith(heal) else ("" if heal else full)
+            return text, first or 0.0, (time.perf_counter() - t0) * 1000
+
+    def complete_gated(self, raw_ids, heal, decide, more=0.5, max_words=3, max_tokens=10, cancelled=lambda: False, screen=None,
+                       boost=None, lam=0.0, min_letters=0, grow=None, grow_words=6, tail=None, tail_words=8, on_part=None):
+        """Greedy continuation decided by the gate (2026-10-31, engine/gatecore.py): as soon as the first word is whole,
+        `decide(toks)` says yes or no; on no it stops at once (nothing shown, no tokens wasted), on yes further words
+        come while each token stays >= `more`. toks: [text after the half word, p, p2]. Returns
+        (text, gate p or None, first_token_ms, total_ms).
+        min_letters / grow (2026-11-13): while the sure words add fewer than min_letters, the words after them go on at
+        the lower bar `grow`, up to grow_words words (gatecore.grow); the server hides what stays short.
+        tail / tail_words (round two, 2026-11-13): past those words, more words while each token is >= `tail`, up to
+        tail_words words in all; they are the lighter part, and `self.last_sure` says where it starts.
+        on_part(text, sure_len): called as soon as the gate said yes and whole words exist, and again each time the
+        ghost grows by a whole word, so the app can draw the first words before the rest is written (two-step ghost).
+        Each part starts with the one before it; the returned text starts with the last part."""
+        import gatecore
+        tl = time.perf_counter()
+        with self.lock:
+            if cancelled(): raise Model.Cancelled()
+            if self.model is None: return "", None, 0, 0
+            t0 = time.perf_counter()
+            # where the time goes (round three, live 48-91 ms against 51 ms on the bench): waiting for the model
+            # (a look-ahead or another request holds it), switching screens, tokens read anew, first token, first part
+            self.timing = {"lock": round((t0 - tl) * 1000, 1)}
+            self._switch(screen)
+            self.timing["switch"] = round((time.perf_counter() - t0) * 1000, 1)
+            if cancelled(): raise Model.Cancelled()
+            raw0 = self._reuse(raw_ids) if DIST else None
+            fed = list(raw_ids[-1:]) if raw0 is not None else self._feed(raw_ids)
+            self.timing["fed"] = 0 if raw0 is not None else len(fed)
+            eos = set(getattr(self.tok, "eos_token_ids", None) or [self.tok.eos_token_id])
+            procs = ([self.healer(heal, len(fed))] if heal else []) + [lambda toks, logits: logits + self.russian_mask(logits.shape)]
+            bp = self.booster(boost, len(fed), lam) if boost else None
+            if bp: procs.append(bp)
+            toks, out, first, g, n = [], [], None, None, 0
+            ms = lambda: (time.perf_counter() - t0) * 1000
+            sent = [""]       # the last part given to on_part
+            self.last_sure = None
+            self.last_raw = ""   # what the model wrote after the half word, shown or not (server branch letters)
+
+            def shape(toks):
+                """-> (the ghost the recorded tokens make now, how many characters of it are the sure part)"""
+                return gatecore.shape(toks, more, max_words, grow, grow_words, min_letters, tail, tail_words)
+            if cancelled(): raise Model.Cancelled()
+            steps = (self._steps(raw_ids, fed, procs, max_tokens + (6 if heal else 0), raw0) if DIST else
+                     generate_step(mx.array(fed), self.model, max_tokens=max_tokens + (6 if heal else 0), sampler=self.sampler,
+                                   prompt_cache=self.cache, prefill_step_size=512, logits_processors=procs))
+            for tok, lp in steps:
+                tok = int(tok)
+                if first is None: self.ids = list(raw_ids)
+                self.ids.append(tok)
+                if cancelled(): raise Model.Cancelled()
+                if first is None: first = ms(); self.timing["first"] = round(first, 1)
+                if tok in eos: break
+                top = mx.topk(lp, 2)
+                p = float(mx.exp(lp[tok])); vals = sorted(top.tolist(), reverse=True)
+                p2 = float(math.exp(vals[1])) if len(vals) > 1 else 0.0
+                out.append(tok)
+                full = self.tok.decode(out)
+                text = full[len(heal):] if heal and len(full) >= len(heal) and full.startswith(heal) else ("" if heal else full)
+                toks.append([text, round(p, 4), round(p2, 4)])
+                self.last_raw = text
+                if not text:
+                    if cancelled(): raise Model.Cancelled()
+                    continue
+                n += 1
+                if g is None and (gatecore.word_done(text) or END.search(text)):
+                    g = decide(toks)
+                    if g is None or g is False: return "", None, first, ms()
+                if g is not None:
+                    now = shape(toks)
+                    if on_part is not None:
+                        whole, sure = gatecore.whole_words(*now)
+                        if whole and len(whole) > len(sent[0]) and whole.startswith(sent[0]):
+                            sent[0] = whole; on_part(whole, sure)
+                            self.timing.setdefault("part", round(ms(), 1))
+                    if END.search(text): break
+                    # round five: the ghost can no longer change (a whole word after it was turned down): stop here,
+                    # the same text, sooner (bench/settle.py); the tokens after it were only waiting for a low one
+                    if SETTLE and gatecore.settled(text, now[0], min_letters if grow is not None else 0):
+                        self.timing["settled"] = n; break
+                    short = grow is not None and min_letters and gatecore.letters(
+                        gatecore.extend(toks, gatecore.next_word(text), more, max_words)) < min_letters
+                    bars = [more] + ([grow] if short else []) + ([tail] if tail is not None else [])
+                    words = max([max_words] + ([grow_words] if short else []) + ([tail_words] if tail is not None else []))
+                    if tail is None and short and (p < grow or len(text.split()) > grow_words): break
+                    if tail is None and not short and (p < more or len(text.split()) > max_words): break
+                    if tail is not None and (p < min(bars) or len(text.split()) > words): break
+                if n >= max_tokens or cancelled(): break
+            if g is None:   # the reply ended inside the first word (end of text or token limit): decide on that
+                g = decide(toks) if toks and toks[-1][0] else None
+                if not g: return "", None, first or 0.0, ms()
+            text, self.last_sure = shape(toks)
+            return text, g, first or 0.0, ms()
+
+    def score(self, raw_ids, heal, text, cancelled=lambda: False, screen=None):
+        """How likely his own model (LoRA on) finds `text` right after the caret, read in one forward pass (2026-11-01,
+        the Claude gate: Codex review). The half word `heal` is re-spelled first, with the healer's mask, so the
+        letters he already typed are given, not judged. -> [(word as in text, [p of each token in it])], or None."""
+        cont = self.encode(heal + text)
+        if not cont or not text.strip(): return None
+        with self.lock:
+            if cancelled() or self.model is None: return None
+            self._switch(screen)
+            tail = self._feed(raw_ids)          # the cache holds raw_ids[:-1]; tail ends with the caret's token
+            feed = list(tail) + cont
+            logits = self.model(mx.array(feed)[None], cache=self.cache)[0, -(len(cont) + 1):-1, :]
+            self.ids = list(raw_ids) + cont
+            logits = logits + self.russian_mask(logits.shape)
+            # rows still spelling the half word: only tokens that fit what is left of it count
+            left, rows = heal, []
+            for i, t in enumerate(cont):
+                row = logits[i]
+                if left:
+                    m = self.mask(left, row.shape)
+                    if m is not None: row = row + m
+                    piece = self.tok.decode([t])
+                    left = left[len(piece):] if left.startswith(piece) else ""
+                rows.append(row)
+            lp = mx.stack(rows)
+            lp = lp - mx.logsumexp(lp, axis=-1, keepdims=True)
+            ps = mx.exp(mx.take_along_axis(lp, mx.array(cont)[:, None], axis=-1)).squeeze(-1).tolist()
+        # characters each token covers in heal + text; a token counts for every word it touches past the half word
+        spans, acc = [], ""
+        for i in range(len(cont)):
+            piece = self.tok.decode(cont[: i + 1]).rstrip("\ufffd")   # a token may end inside a Cyrillic letter
+            spans.append((len(acc), max(len(acc), len(piece)), ps[i])); acc = piece if len(piece) > len(acc) else acc
+        out, h = [], len(heal)
+        for m in re.finditer(r"\s*\S+", text):
+            a, b = m.start() + h, m.end() + h
+            out.append((m.group(0), [p for (x, y, p) in spans if y > a and x < b and y > h]))
+        return out
+
+    def prefill(self, ids, screen=None):
+        """Read ids into the cache now (on focus, before he types), so the first suggestion only adds a few tokens."""
+        with self.lock:
+            if self.model is None: return 0
+            self._switch(screen)
+            tail = self._feed(ids)
+            self.ids = list(ids)
+            if tail:
+                steps = (self._steps(ids, tail, [], 0, prefill_step=256) if DIST else
+                         generate_step(mx.array(tail), self.model, max_tokens=0, prompt_cache=self.cache, prefill_step_size=256))
+                for _ in steps: pass
+            return len(tail)
+
+    def warm(self, head_ids):
+        """Prefill the fixed head once and keep a copy of the cache at that point (asleep: read in when it wakes)."""
+        with self.lock:
+            self.head_ids = list(head_ids or [])
+            if self.model is not None: self._warm(self.head_ids)
+
+    def _warm(self, head_ids):
+        self.snapshot, self.dist = None, None
+        self.parked.clear(); self.screen = None   # a new head: every parked prompt starts with the old one
+        if getattr(self, "tw", None): self.tw.start = len(head_ids or [])   # the head is never steered, so it serves every kind
+        self.cache, self.ids = make_prompt_cache(self.model), []
+        if not head_ids: return   # "bare" prompts (a model trained on his writing needs no examples up front)
+        for _ in generate_step(mx.array(head_ids), self.model, max_tokens=0, prompt_cache=self.cache, prefill_step_size=256): pass
+        mx.eval([c.state for c in self.cache])
+        self.ids = list(head_ids)
+        # a copy costs memory; only caches that cannot be trimmed back (Gemma's sliding window) need one
+        self.snapshot = None if can_trim_prompt_cache(self.cache) else (copy.deepcopy(self.cache), list(head_ids))
+        mx.clear_cache()
+
+    def memory_gb(self):
+        return mx.get_active_memory() / 2**30, mx.get_peak_memory() / 2**30

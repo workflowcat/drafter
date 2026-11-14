@@ -1,0 +1,48 @@
+{
+ "name": "Saggar",
+ "job": "Sample skin for Saggar, a made-up kiln booking and firing log for shared pottery studios: smoke grey and carbon from saggar firing, one manganese accent, Alegreya headings over Ysabeau Office, round corners on what you press. Made with frontend-design to show what a skin can change.",
+ "light": {
+  "ground": "#eceae7",
+  "raised": "#f7f6f4",
+  "soft": "#e1deda",
+  "ink": "#1f1b19",
+  "quiet": "#554e4a",
+  "faint": "#665f5a",
+  "accent": "#6b2d5e",
+  "good": "#2e6b3c",
+  "bad": "#a42a1c",
+  "waiting": "#875705",
+  "mix": "#1f1b19"
+ },
+ "dark": {
+  "ground": "#1c1917",
+  "raised": "#252120",
+  "soft": "#2f2a28",
+  "ink": "#eee8e2",
+  "quiet": "#b8aea6",
+  "faint": "#9d938c",
+  "accent": "#d9a2cb",
+  "good": "#7cc48b",
+  "bad": "#f28b7b",
+  "waiting": "#e2b34f",
+  "mix": "#f5eee8"
+ },
+ "fonts": {
+  "display": "\"Alegreya\", Georgia, \"Times New Roman\", serif",
+  "body": "\"Ysabeau Office\", -apple-system, \"Segoe UI\", system-ui, sans-serif",
+  "link": "https://fonts.googleapis.com/css2?family=Alegreya:wght@500..800&family=Ysabeau+Office:wght@400..700&display=swap"
+ },
+ "numbers": "tabular",
+ "corners": [
+  0,
+  6,
+  12,
+  18
+ ],
+ "edge": {
+  "light": 52,
+  "dark": 38
+ },
+ "shadow": "0 1px 0 rgb(31 27 25 / .10), 0 10px 24px -8px rgb(31 27 25 / .32)",
+ "sprites": false
+}

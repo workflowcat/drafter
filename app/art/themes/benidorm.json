@@ -1,0 +1,47 @@
+{
+ "name": "Benidorm",
+ "job": "Preview skin for Rental Benidorm, a holiday-apartment manager in Finestrat: white and warm sand, their coral as the one accent, Source Sans 3 for every word. Made to show them Ojo Gestión in a look close to their own booking site.",
+ "light": {
+  "ground": "#ffffff",
+  "raised": "#ffffff",
+  "soft": "#f7f1ed",
+  "ink": "#2a2321",
+  "quiet": "#5b514d",
+  "faint": "#6e6460",
+  "accent": "#c2451f",
+  "good": "#2f7a3e",
+  "bad": "#b42318",
+  "waiting": "#93560a",
+  "mix": "#2a2321"
+ },
+ "dark": {
+  "ground": "#191413",
+  "raised": "#221c1a",
+  "soft": "#2c2522",
+  "ink": "#f4ede9",
+  "quiet": "#c4b8b2",
+  "faint": "#a69892",
+  "accent": "#ff8a6e",
+  "good": "#6fd08a",
+  "bad": "#ff8a80",
+  "waiting": "#f2c14e",
+  "mix": "#ffffff"
+ },
+ "fonts": {
+  "display": "\"Source Sans 3\", -apple-system, \"Segoe UI\", system-ui, sans-serif",
+  "body": "\"Source Sans 3\", -apple-system, \"Segoe UI\", system-ui, sans-serif",
+  "link": "https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400..700&display=swap"
+ },
+ "numbers": "tabular",
+ "edge": {
+  "light": 52,
+  "dark": 38
+ },
+ "corners": [
+  0,
+  6,
+  10,
+  14
+ ],
+ "sprites": true
+}

@@ -1,0 +1,39 @@
+"""Execute real Swift control flow with inert focus, keys, paste and queue doubles."""
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class AppGuard(unittest.TestCase):
+    def test_return_refinement_and_editor_replacement(self):
+        source = (ROOT / 'app/Voice.swift').read_text()
+        replacement = source.split('extension Focus {', 1)[1].split('\n}\n', 1)[0]
+        draft = source.split('    private var sendDraft', 1)[1].split('    private var sending', 1)[0]
+        predicates = source.split('    var canSend:', 1)[1].split('    /// Right Option', 1)[0]
+        callback = source.split('VoiceEngine.shared.careful { slow in', 1)[1].split('\n                }\n            }', 1)[0]
+        live_draft = source.split('    private func liveDraft', 1)[1].split('    /// What the current run should hold', 1)[0]
+        talk = ('final class Talk {\n'
+                'enum State { case idle, listening }; var state = State.listening\n'
+                'var sending = false, long = false, samples = 16000, peak: Float = 0.1, started = 1\n'
+                'private var sendDraft' + draft + 'var canSend:' + predicates +
+                'func draft(_ s: String) { lastDraft = s }\n'
+                'var live = true, prevWords: [Substring] = [], still = 0, lastClean = ""\n'
+                'var landedWords = 0, steadyWords = 0, steadyText = "", meter = LiveType.Meter(); var now: Double { 0 }\n'
+                'func liveStep() {}\n'
+                'func liveDraft' + live_draft +
+                'func finish(_ s: String) -> String { s }\n'
+                'func offer(_ slow: String, text: String, mine: Int) {' + callback + '}\n}\n')
+        with tempfile.TemporaryDirectory(prefix='drafter-voice-pure-') as directory:
+            path = Path(directory)
+            (path / 'extracted.swift').write_text('import Foundation\nextension Focus {' + replacement + '\n}\n' + talk)
+            command = ['swiftc', '-module-cache-path', str(path / 'cache'),
+                       str(path / 'extracted.swift'), str(ROOT / 'app/Rules.swift'), str(ROOT / 'app/LiveType.swift'),
+                       str(ROOT / 'tests/voice_app_guard.swift'), '-o', str(path / 'check')]
+            built = subprocess.run(command, capture_output=True, text=True, timeout=60)
+            self.assertEqual(built.returncode, 0, built.stderr)
+            checked = subprocess.run([str(path / 'check')], capture_output=True, text=True, timeout=10)
+            self.assertEqual(checked.returncode, 0, checked.stderr)
+            self.assertIn('PASS', checked.stdout)
