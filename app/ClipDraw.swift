@@ -79,11 +79,7 @@ extension Entry {
         e.clip = (r["kind"] as? String).flatMap(ClipKind.init(rawValue:)) ?? (r["image"] != nil ? .image : .text)
         e.clipTitle = r["title"] as? String ?? ""; e.bytes = r["bytes"] as? Int ?? 0; e.picture = r["clip"] as? String ?? ""
         if !e.picture.isEmpty { e.ocr = History.clipText(e.picture) }
+        if let id = r["shot"] as? String, ShotJournalRules.validId(id) { e.shot = id }
         return e
-    }
-    /// The same row as the Quick panel sees it, for its keys (open, markdown, reveal, copy text, save).
-    var quickItem: QuickItem {
-        QuickItem(kind: .copied, text: text, app: app, at: when.timeIntervalSince1970, image: clip == .image, clip: clip,
-                  title: clipTitle, bytes: bytes, picture: picture, ocr: ocr)
     }
 }

@@ -128,10 +128,16 @@ def pack(exclude=(), fresh=False):
 
 BEFORE_CHARS, AFTER_CHARS, SCREEN_CHARS = 3000, 600, 2500   # Claude reads earlier sentences too (2026-10-31)
 
-def _user(before, app, title, context, since=0.0, after=""):
+def notes_line(notes):
+    """His writing instructions (Settings > Typing, global and this app's) as one line for a Claude prompt; "" = none."""
+    n = " ".join((notes or "").split())[:300]
+    return f"His writing instructions (follow them): {n}\n" if n else ""
+
+
+def _user(before, app, title, context, since=0.0, after="", notes=""):
     now = datetime.now().strftime("%H:%M")
     where = " · ".join(x for x in (app, title) if x)
-    t = f"App: {where or 'unknown'}\nTime: {now}\n"
+    t = f"App: {where or 'unknown'}\nTime: {now}\n" + notes_line(notes)
     fresh = _typed_since(since) if since else ""
     if fresh: t += "He sent these in the last minutes:\n" + fresh + "\n"
     if context.strip(): t += "On screen above the field:\n" + context.strip()[-SCREEN_CHARS:] + "\n"
@@ -411,11 +417,11 @@ def _worker(model, lane="pause"):
 
 
 def complete(before, app="", title="", context="", model="sonnet", cancelled=lambda: False, known=lambda w: False,
-             lane="pause", after=""):
+             lane="pause", after="", notes=""):
     """-> {"text", "raw", "first_ms", "ms", "model"} or None (no Claude, busy, error)."""
     if not Path(CLI).exists() or time.time() - _state["fail_at"] < 20: return None
     w = _worker(model, lane)
-    r = w.ask(_user(before, app, title, context, since=_state.get("pack_used", 0), after=after), cancelled)
+    r = w.ask(_user(before, app, title, context, since=_state.get("pack_used", 0), after=after, notes=notes), cancelled)
     if r is None:
         if not w.alive(): _state["fail_at"] = time.time()
         return None
@@ -433,22 +439,23 @@ _early = {"want": None, "busy": False, "running": None, "done": None, "asked": 0
 _early_lock = threading.Lock()
 
 
-def _where(app, title, context, after, model, field=0):
+def _where(app, title, context, after, model, field=0, notes=""):
     """Which field and chat an answer belongs to (Codex review, 2026-10-31): the same words typed in another chat,
-    or with a new message on screen, never take an answer asked for somewhere else."""
+    or with a new message on screen, never take an answer asked for somewhere else (nor one asked with other
+    writing instructions)."""
     import hashlib
     h = lambda t: hashlib.sha1(t.encode()).hexdigest()[:12]
-    return (app, title, h(context[-800:]), h(after[:300]), model, field)
+    return (app, title, h(context[-800:]), h(after[:300]), model, field) + ((h(notes),) if notes else ())
 
 
-def early(before, app="", title="", context="", model="sonnet", known=lambda w: False, after="", field=0):
+def early(before, app="", title="", context="", model="sonnet", known=lambda w: False, after="", field=0, notes=""):
     """Ask ahead for this caret (a word just ended). -> True when queued."""
     if not Path(CLI).exists() or time.time() - _state["fail_at"] < 20: return False
-    where = _where(app, title, context, after, model, field)
+    where = _where(app, title, context, after, model, field, notes)
     with _early_lock:
         d = _early["done"]
         if _early["running"] == (before, where) or (d and (d["before"], d["where"]) == (before, where)): return False
-        _early["want"] = (before, app, title, context, model, known, after, where)
+        _early["want"] = (before, app, title, context, model, known, after, where, notes)
         if _early["busy"]: return True
         _early["busy"] = True
     threading.Thread(target=_early_loop, daemon=True).start()
@@ -464,11 +471,11 @@ def _early_loop():
             if job is None or len(_early["times"]) >= EARLY_PER_MIN:
                 _early["busy"] = False; _early["running"] = None
                 return
-        before, app, title, context, model, known, after, where = job
+        before, app, title, context, model, known, after, where, notes = job
         with _early_lock:
             _early["times"].append(now); _early["asked"] += 1; _early["running"] = (before, where)
         r = None
-        try: r = complete(before, app, title, context, model=model, known=known, lane="early", after=after)
+        try: r = complete(before, app, title, context, model=model, known=known, lane="early", after=after, notes=notes)
         except Exception as e: print("early:", e, flush=True)
         with _early_lock:
             _early["running"] = None
@@ -485,10 +492,10 @@ def _fit(d, before, where):
 
 
 def answer(before, app="", title="", context="", model="sonnet", cancelled=lambda: False, known=lambda w: False,
-           after="", deadline=6.0, field=0):
+           after="", deadline=6.0, field=0, notes=""):
     """At a pause: the early answer when it fits, else a fresh one. -> complete()'s dict plus "early", or None."""
     t0 = time.time()
-    where = _where(app, title, context, after, model, field)
+    where = _where(app, title, context, after, model, field, notes)
     with _early_lock: d, running = _early["done"], _early["running"]
     hit = _fit(d, before, where)
     if hit is not None:
@@ -508,7 +515,7 @@ def answer(before, app="", title="", context="", model="sonnet", cancelled=lambd
     # fresh, while an early one for an earlier caret may still come back first and fit
     box = {}
     th = threading.Thread(target=lambda: box.update(r=complete(before, app, title, context, model=model, cancelled=cancelled,
-                                                                  known=known, after=after)), daemon=True)
+                                                                  known=known, after=after, notes=notes)), daemon=True)
     th.start()
     while th.is_alive() and time.time() - t0 < deadline + 1:
         if cancelled(): return None

@@ -164,13 +164,14 @@ enum QuickRules {
     /// One list: pins first (newest pin first), then every row newest first. The same text of the same kind shows
     /// once, at its newest time (a repeated copy moves to the top).
     static func merge(_ rows: [QuickItem], pins: [QuickPin]) -> [QuickItem] {
-        var newest: [String: Int] = [:]            // kind+text -> index of its newest row
+        // keys as UTF-8 bytes: hashing a long non-ASCII String normalises it each time (speed round: 28 ms of 3,000 rows)
+        var newest: [[UInt8]: Int] = [:]           // kind+text -> index of its newest row
         for (i, r) in rows.enumerated() {
-            let k = r.kind.rawValue + "\u{1}" + r.text
+            let k = Array((r.kind.rawValue + "\u{1}" + r.text).utf8)
             if let j = newest[k], rows[j].at >= r.at { continue }
             newest[k] = i
         }
-        let pinKeys = Set(pins.map { $0.kind.rawValue + "\u{1}" + $0.text })
+        let pinKeys = Set(pins.map { Array(($0.kind.rawValue + "\u{1}" + $0.text).utf8) })
         var out: [QuickItem] = pins.map { p in
             var it = QuickItem(kind: p.kind, text: p.text, app: p.app, at: p.at)
             it.pinned = true
@@ -291,6 +292,101 @@ enum QuickRules {
         switch id { case "plain": return plain(s); case "oneline": return oneLine(s); case "quote": return quote(s); default: return nil }
     }
 
+    /// The shown form of a clip: 0 is the text as copied, 1...forms its written forms; ← and → wrap.
+    static func stepForm(_ i: Int, by d: Int, forms n: Int) -> Int {
+        guard n > 0 else { return 0 }
+        return ((i + d) % (n + 1) + (n + 1)) % (n + 1)
+    }
+
+    // MARK: the picker (picker round, 15 November 2026): one window for ⌃⌥V (full) and ⌘⇧V held (quick)
+
+    /// The quick form's rows (⌘⇧V held), as indices into `items`: the newest copies, never a picture or a pin (a
+    /// tap-and-release puts the newest text copy in, as the switcher did).
+    static func quickRows(_ items: [QuickItem], count: Int) -> [Int] {
+        Array(items.indices.filter { items[$0].kind == .copied && !items[$0].image && !items[$0].pinned }.prefix(count))
+    }
+    /// A step through the quick form's rows: V and → go on, ← back, both wrap.
+    static func wrap(_ i: Int, by d: Int, count n: Int) -> Int {
+        guard n > 0 else { return 0 }
+        return ((i + d) % n + n) % n
+    }
+
+    /// What the chosen row is, for its buttons.
+    struct PickerRow: Equatable {
+        var clip = ClipKind.text
+        var target: ClipKind? = nil      // a text holding a link or a path
+        var forms = 0                    // written forms besides the text as copied (FoundRules.quickForms)
+        var image = false
+        var picture = false              // a picture row with its stored file
+        var pinned = false
+    }
+    /// One glyph button on the picker's foot: the key small under the glyph, the word its tip and VoiceOver name.
+    struct PickerButton: Equatable {
+        let id: String, glyph: String, key: String, word: String
+        var primary = false
+    }
+
+    /// The chosen row's buttons, in groups (hairlines between). Every button is a key the picker already has; the pill
+    /// only shows them. quick: the held chord (⌘ let go puts, V next, ← → forms, a letter searches, esc).
+    static func buttons(_ r: PickerRow?, quick: Bool, rework: Bool = false, result: Bool = false) -> [[PickerButton]] {
+        if quick {
+            var step = [PickerButton(id: "next", glyph: "chevron-down", key: "V", word: "Next copy")]
+            if (r?.forms ?? 0) > 0 { step.append(PickerButton(id: "form", glyph: "arrows-left-right", key: "← →", word: "Written form")) }
+            return [[PickerButton(id: "put", glyph: "corner-down-left", key: "⌘", word: "Let go to paste", primary: r != nil)], step,
+                    [PickerButton(id: "search", glyph: "search", key: "A–Z", word: "Search everything"),
+                     PickerButton(id: "close", glyph: "close", key: "esc", word: "Close")]]
+        }
+        if rework {
+            let back = PickerButton(id: "back", glyph: "arrow-back-up", key: "⌫", word: "Back to the text")
+            let list = PickerButton(id: "list", glyph: "arrow-left", key: "esc", word: "Back to the list")
+            if result {
+                return [[PickerButton(id: "put", glyph: "corner-down-left", key: "↵", word: "Paste the new text", primary: true),
+                         PickerButton(id: "copy", glyph: "copy", key: "⌘C", word: "Copy the new text")], [back, list]]
+            }
+            return [[PickerButton(id: "run", glyph: "sparkle", key: "↵", word: "Rewrite", primary: true)], [list]]
+        }
+        guard let r else { return [[PickerButton(id: "close", glyph: "close", key: "esc", word: "Close")]] }
+        let keep = [PickerButton(id: "pin", glyph: "bookmark", key: "⌘P", word: r.pinned ? "Unpin" : "Pin"),
+                    PickerButton(id: "remove", glyph: "trash", key: "⌘⌫", word: "Remove from history")]
+        if r.image && !r.picture { return [keep] }   // only its size was kept: nothing to put
+        var out: [[PickerButton]] = []
+        switch r.clip {
+        case .image:
+            out.append([PickerButton(id: "put", glyph: "corner-down-left", key: "↵", word: "Paste", primary: true),
+                        PickerButton(id: "withText", glyph: "text", key: "⇧↵", word: "Paste with its text"),
+                        PickerButton(id: "copy", glyph: "copy", key: "⌘C", word: "Copy")])
+        case .file:
+            out.append([PickerButton(id: "put", glyph: "corner-down-left", key: "↵", word: "Paste file", primary: true)])
+        default:
+            out.append([PickerButton(id: "put", glyph: "corner-down-left", key: "↵", word: "Paste", primary: true),
+                        PickerButton(id: "copy", glyph: "copy", key: "⌘C", word: "Copy")])
+            var change: [PickerButton] = []
+            if r.forms > 0 { change.append(PickerButton(id: "form", glyph: "arrows-left-right", key: "← →", word: "Written form")) }
+            change.append(PickerButton(id: "rewrite", glyph: "sparkle", key: "⇥", word: "Rewrite"))
+            if r.clip == .text { change.append(PickerButton(id: "pick", glyph: "scissors", key: "⌘E", word: "Pick parts")) }
+            out.append(change)
+        }
+        let own = r.clip == .text ? r.target.map { ClipRules.actions(.text, target: $0) } ?? [] : ClipRules.actions(r.clip)
+        let kind = own.filter { $0.id != "paste" && $0.id != "withText" }.map { PickerButton(id: $0.id, glyph: actionGlyph($0.id), key: $0.key, word: $0.word.prefix(1).uppercased() + $0.word.dropFirst()) }
+        if !kind.isEmpty { out.append(kind) }
+        out.append(keep)
+        return out
+    }
+    /// The line glyph of a row's own action (ClipRules.actions ids).
+    static func actionGlyph(_ id: String) -> String {
+        switch id {
+        case "open": return "external"; case "markdown": return "markdown"; case "untracked": return "filter"
+        case "reveal": return "folder"; case "path": return "clipboard"; case "text": return "clipboard"; case "save": return "download"
+        default: return "more"
+        }
+    }
+
+    /// The second line of a row: the app it came from and how long ago ("Safari · 4m"), then what only that kind has
+    /// (a link's host, a file's size and folder, a picture's size).
+    static func meta(app: String, at: Double, now: Double, extra: [String] = []) -> String {
+        ([app.isEmpty ? "" : app, ago(at, now: now)] + extra).filter { !$0.isEmpty }.joined(separator: " · ")
+    }
+
     // MARK: row parts
 
     /// "now", "4m", "3h", "2d" up to 99 days, then "12.10".
@@ -375,6 +471,7 @@ enum QuickKeyAction: Equatable {
     case toPanel(Int)                // a letter or digit (key code) while the switcher is held: into the panel with it
     case voiceAgain                  // ⌃⌥R (keys round): the last voice take in again
     case swap                        // ⌘⇧V again right after a switcher paste: the next older copy replaces it
+    case form(Int)                   // wire round: ← → step through the chosen clip's written forms before the paste
 }
 
 /// Which key does what. Before 14 November the switcher was marked open only once the main queue ran `open()`: a
@@ -393,6 +490,11 @@ struct QuickKeys {
     /// Until when ⌘⇧V swaps the text a switcher paste just put in (0 = not armed). Armed by the app after a paste of
     /// text with an older text copy behind it; any other key, a click, the time or the swap itself ends it.
     private(set) var swapUntil = 0.0
+
+    /// Wire round (15 November 2026): how many written forms the chosen clip has (FoundRules.quickForms; set by the
+    /// app when the choice changes). With forms, ← and → step through them in the panel and in the switcher (the
+    /// switcher's V still moves to the next copy); without, the keys do what they did.
+    var forms = 0
 
     mutating func armSwap(until t: Double) { swapUntil = t }
     mutating func disarmSwap() { swapUntil = 0 }
@@ -421,6 +523,7 @@ struct QuickKeys {
             case .down:
                 if !held(e) { switching = false; return [.put] + route(e) }   // the release was missed: put, then read the key
                 if e.autorepeat { return [.swallow] }
+                if forms > 0, e.code == 124 || e.code == 123 { return [.form(e.code == 124 ? 1 : -1)] }
                 if e.code == switchKey?.code || e.code == 124 { return [.step(1)] }
                 if e.code == 123 { return [.step(-1)] }
                 if e.code == 53 { switching = false; return [.cancel] }
@@ -436,6 +539,7 @@ struct QuickKeys {
         swapUntil = 0
         if Self.exact(e, panelKey) { return [e.autorepeat ? .swallow : .togglePanel] }
         if Self.exact(e, againKey) { return [e.autorepeat ? .swallow : .voiceAgain] }
+        if panelOpen, forms > 0, e.code == 124 || e.code == 123, !e.ctrl, !e.alt, !e.cmd, !e.shift { return [.form(e.code == 124 ? 1 : -1)] }
         if !panelOpen, Self.exact(e, switchKey) {
             if e.autorepeat { return [.swallow] }
             switching = true

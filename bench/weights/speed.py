@@ -30,6 +30,11 @@ def worker_fuse(a):
     runpy.run_module("mlx_lm.fuse", run_name="__main__")
 
 
+def per_token_ms(total_ms, first_ms, made):
+    """Decode time per token after the first, over the tokens really made (not the asked maximum)."""
+    return (total_ms - first_ms) / max(made - 1, 1)
+
+
 def _setup():
     os.environ.setdefault("DRAFTER_CAP_GB", "3.6")
     sys.path.insert(0, str(C.ROOT / "engine"))
@@ -49,14 +54,16 @@ def worker_measure(a):
     b = Builder(m, "raw")
     t = time.perf_counter(); m.warm(b.head_ids); head_ms = (time.perf_counter() - t) * 1000
     n_tok = 8 if a.smoke else 32
-    per_token, first = [], []
+    per_token, first, tokens = [], [], []
     for app, text in PROMPTS:
         ids, heal = b.ids(text, app)
         out, f, total = m.complete("", max_tokens=n_tok, stop=None, raw_ids=ids, heal=heal)
         first.append(out[:40])
-        per_token.append((total - f) / max(n_tok - 1, 1))
+        made = len(m.last_p)                   # tokens really made: an end-of-text token stops the loop early
+        per_token.append(per_token_ms(total, f, made))
+        tokens.append(made)
     res = {"how": a.how, "load_s": round(load_s, 2), "loaded_gb": round(loaded_gb, 3), "head_tokens": len(b.head_ids),
-           "head_prefill_ms": round(head_ms, 1), "ms_per_token": round(sorted(per_token)[len(per_token) // 2], 2),
+           "head_prefill_ms": round(head_ms, 1), "ms_per_token": round(sorted(per_token)[len(per_token) // 2], 2), "tokens_made": tokens,
            "footprint_gb": round(guard.footprint_gb(), 3), "peak_gb": round(mx.get_peak_memory() / 2**30, 3),
            "lora_merged": len(m.fused), "first_words_digest": __import__("hashlib").sha1("|".join(first).encode()).hexdigest()[:10]}
     Path(a.out).write_text(json.dumps(res))

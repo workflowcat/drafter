@@ -17,14 +17,14 @@ import common as C
 VARIANTS = {"all-1.0": ("all", 1.0), "kind-1.0": ("kind", 1.0), "all-0.5": ("all", 0.5)}
 
 
-def fit(npz, kinds):
+def fit(npz, kinds, min_positions=500):
     import numpy as np
     import biasfit
     z = np.load(npz)
     out, report = {}, {}
     for kind in kinds:
         m = np.ones(len(z["y"]), bool) if kind == "all" else z["kind"] == kind
-        if m.sum() < 500: continue
+        if m.sum() < min_positions: continue
         d = biasfit.pack(z["cand"], z["cand_lp"][m], z["y"][m], z["y_lp"][m])
         r = biasfit.choose(d)
         b = r["b"]
@@ -66,7 +66,8 @@ def main():
                               log=C.RESULTS / "logs" / f"bias-collect{tag}.log")
         if code: raise SystemExit(f"collect failed ({code}): {out[-1:]}")
         collect_s = round(time.time() - t)
-        biases, report = fit(npz, ("all", "ai", "chat"))
+        biases, report = fit(npz, ("all", "ai", "chat"), 20 if a.smoke else 500)   # a smoke run has ~300 positions
+        if "all" not in biases: raise SystemExit(f"too few positions to fit a bias: {report}")
         print(f"fit: {json.dumps(report)}", flush=True)
         import numpy as np
         for name in names:

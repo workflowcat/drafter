@@ -26,6 +26,7 @@ def model():
     exec(compile(ast.Module(body=methods, type_ignores=[]), str(source), 'exec'), ns)
     m = types.SimpleNamespace(lock=threading.Lock(), model=object(), _switch=Mock(), _feed=Mock(return_value=[0]),
                               cache=[], sampler=None, ids=[], BARS=(0, 0, 0), healer=Mock(),
+                              snapshot=None, marks={}, screen=None, rebuilds=0,   # _feed's fields (big-model round)
                               bos=lambda: [], encode=lambda _: [0],
                               tok=types.SimpleNamespace(eos_token_id=9, decode=lambda ids: 'a' * len(ids)))
     return ns, m, Cancelled
@@ -64,7 +65,7 @@ class Cancellation(unittest.TestCase):
                       trim_prompt_cache=lambda c, n: (c.__delitem__(slice(len(c)-n, None)) or n))
             exec(compile(ast.Module(body=[feed], type_ignores=[]), str(source), 'exec'), ns)
             m.ids, m.cache = [8, 9], [8, 9]
-            m._feed = lambda ids: ns['_feed'](m, ids)
+            m._feed = lambda ids, stable=None: ns['_feed'](m, ids, stable)
             calls = [0]
             def cancelled():
                 calls[0] += 1

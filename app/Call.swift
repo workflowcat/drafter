@@ -360,12 +360,20 @@ enum Offer {
     static var until = Date.distantPast
     static var action: (() -> Void)?
     static var app: String?          // a call offer's app: ⇧Esc turns offers off there
+    /// The copy chip's further forms (wire round): index 1 is the second form (key 2), 2 the third (key 3).
+    static var picks: [Int: () -> Void] = [:]
     static var active: Bool { Date() < until && action != nil }
+    /// A digit picked a further form (CopyChip.digit): it runs, the offer goes.
+    static func pick(_ i: Int) {
+        guard active, let p = picks[i] else { return }
+        dismiss("pick \(i + 1)")
+        p()
+    }
 
     /// Esc (or he types on): the offer goes, nothing starts (2026-11-01, Andrii: "I'm not sure how to dismiss it").
     static func dismiss(_ why: String) {
         guard active else { return }
-        action = nil; until = .distantPast; app = nil
+        action = nil; until = .distantPast; app = nil; picks = [:]
         Pill.shared.hide()
         log("offer dismissed (\(why))")
     }
@@ -373,7 +381,7 @@ enum Offer {
     /// rows: the question, who or why, what happens. The keys are buttons too: `accept` (Tab), Dismiss (Esc) and, for a
     /// call app, Turn off offers there (⇧Esc).
     static func show(_ rows: [String], kind: String, side: String = "", accept label: String, seconds: Double, app: String? = nil, _ act: @escaping () -> Void) {
-        until = Date().addingTimeInterval(seconds); action = act; self.app = app
+        until = Date().addingTimeInterval(seconds); action = act; self.app = app; picks = [:]
         var keys = [StripButton(label, key: "tab", style: .primary) { Offer.accept() }, StripButton("Dismiss", key: "esc") { Offer.dismiss("click") }]
         if let app { keys.append(StripButton("Turn off offers in \(CallWatch.name(app))", key: "⇧esc", style: .quiet) { CallWatch.turnOff(app) }) }
         Pill.shared.offer(rows, kind: kind, side: side, controls: keys, seconds: seconds)
@@ -381,7 +389,7 @@ enum Offer {
 
     static func accept() {
         guard active else { return }       // it ran out: nothing starts late
-        let a = action; action = nil; until = .distantPast; app = nil
+        let a = action; action = nil; until = .distantPast; app = nil; picks = [:]
         a?()
     }
 }
@@ -401,13 +409,13 @@ enum CallWatch {
     }
     static func turnOff(_ app: String) {
         Offer.dismiss("off in \(app)")
-        if !Drafter.shared.settings.callOff.contains(app) { Drafter.shared.settings.callOff.append(app); Drafter.shared.settings.save() }
+        if !Drafter.shared.settings.callOff.contains(app) { Drafter.shared.change { $0.callOff.append(app) } }
         // undo right there for 5 s; Settings › Calls keeps the switch after that
         Pill.shared.flash("Offers off in \(name(app))", button: StripButton("Undo", key: "", style: .primary) { turnOn(app) })
         log("call: offers off in \(app)")
     }
     static func turnOn(_ app: String) {
-        Drafter.shared.settings.callOff.removeAll { $0 == app }; Drafter.shared.settings.save()
+        Drafter.shared.change { $0.callOff.removeAll { $0 == app } }
         Pill.shared.flash("Offers back on in \(name(app))")
         log("call: offers on again in \(app)")
     }
@@ -576,7 +584,7 @@ enum CallWatch {
 
     /// Tab on the offer.
     static func accept() {
-        Offer.until = .distantPast; Offer.action = nil
+        Offer.until = .distantPast; Offer.action = nil; Offer.picks = [:]
         callApp = offeredFor
         Talk.shared.beginCall()
     }

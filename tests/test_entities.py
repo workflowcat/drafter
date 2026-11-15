@@ -207,7 +207,10 @@ class Cast(unittest.TestCase):
         self.assertIn('Ганна Ткач', who('ht'))
         self.assertIn('Lantern Labs', who('lantern labs'))
         self.assertNotIn('labs', s)                         # an ordinary word alone never marks
-        self.assertNotIn('base', s)
+        # a thing whose own name is an ordinary word is kept, but marked: it counts only when the context decides
+        self.assertTrue(store['surface_flags']['base']['ordinary'] and store['surface_flags']['base']['needs_context'])
+        self.assertTrue(store['surface_flags']['іван']['shared'])
+        self.assertNotIn('lantern labs', store['surface_flags'])   # a two-word name needs nothing
         self.assertNotIn('owner sample', s)                 # his own name
         self.assertEqual(len(who('іван')), 2)               # a first name shared by two: ambiguous
 

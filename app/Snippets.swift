@@ -266,9 +266,14 @@ enum Snippets {
                 settled { expand(old: match.old, new: match.new, key: match.key, expected: s) }
                 return
             }
+            if let w = Typography.decide(s, key: " ") {   // " - " -> " — ", N грн -> N ₴, і в у з а о + no-break space
+                settled { Typography.write(w, key: " ", at: s, t0: t0) }
+                return
+            }
             let st = Drafter.shared.settings
             if st.autocorrect || st.layoutFix, !IsSecureEventInputEnabled(),
-               let fix = Autocorrect.check(s.before, layout: st.layoutFix, typos: st.autocorrect, typosUk: st.autocorrectUk) {
+               let fix = Autocorrect.check(s.before, layout: st.layoutFix, typos: st.autocorrect, typosUk: st.autocorrectUk, ranked: st.typoEngine == "ranked",
+                                           app: s.app.bundleIdentifier ?? "", appKind: AppKind.of(s.app.bundleIdentifier ?? "", title: s.title, ai: Keys.aiApps, chats: Keys.chatApps, browsers: Keys.browsers, aiTitle: Keys.aiTitle)) {
                 settled { Autocorrect.apply(fix, at: s) }
                 return
             }

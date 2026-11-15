@@ -269,10 +269,27 @@ class Pack:
         except (OSError, ValueError, KeyError, TypeError, AttributeError): pass  # retain last valid pack
 
     def snapshot(self):
+        """This request's view. With the names reference beside the pack (data/names.json, engine/names.py, 2026-11-15)
+        the word finisher and booster read that instead; DRAFTER_NAMES=0 keeps this pack."""
+        names = self.names_view()
+        if names is not None: return names
         self.reload()
         view = Pack()
         view.entries, view.stamp = self.entries, self.stamp
         return view
+
+    def names_view(self):
+        if self.path is None or os.environ.get('DRAFTER_NAMES') == '0': return None
+        path = self.path.with_name('names.json')
+        now = time.monotonic()   # whether the file is there: looked up at most every 30 s, not on every request
+        if now - getattr(self, '_names_checked', -1e9) > 30:
+            self._names_checked, self._names_there = now, os.path.exists(path)
+        if not self._names_there: return None
+        if getattr(self, '_names', None) is None or self._names.path != path:
+            import names
+            self._names = names.Pack(path)
+        view = self._names.snapshot()
+        return view if view.entries else None
 
     def finish(self, before, own_counts=None, prefix_totals=None):
         self.reload()
@@ -334,7 +351,8 @@ if __name__ == '__main__':
     # the entity store next to it (engine/entities.py): its own failure never fails this build
     try:
         import entities
-        store = entities.build(contacts=people or None, lines=entities.sent_rows(ROOT / 'data/typed.jsonl'))
+        store = entities.build(contacts=people or None, lines=entities.sent_rows(ROOT / 'data/typed.jsonl'),
+                               chats=entities.chat_lines(ROOT / 'data/people.json'))
         print(f"entities: {len(store['records'])} records" + (f", kept the last {', '.join(store['failed'])}" if store['failed'] else ''))
     except Exception as e:
         print(f"entities: not built ({type(e).__name__})")

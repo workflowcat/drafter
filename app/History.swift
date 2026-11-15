@@ -27,7 +27,10 @@ enum History {
 
     static func read(_ url: URL, last n: Int) -> [[String: Any]] {
         guard let s = (n <= 20 ? tail(url, bytes: 512_000) : nil) ?? (try? String(contentsOf: url, encoding: .utf8)) else { return [] }
-        return s.split(separator: "\n").suffix(n).reversed().compactMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
+        let rows = s.split(separator: "\n").suffix(n).reversed().compactMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
+        // rows listed in data/drafts-hidden.json (scripts/hide_bad_drafts.py) are not listed; the files stay as they are
+        guard url == typedFile || url == draftsFile else { return rows }
+        return DraftHide.drop(rows, kind: url == draftsFile ? "draft" : "sent", hidden: DraftHide.load(hiddenFile))
     }
 
     /// The file's last `bytes`, from the start of a line (a row is at most ~20 KB): a look at the last row never
@@ -96,8 +99,20 @@ enum History {
     static let typedFile = Home.data.appendingPathComponent("typed.jsonl")     // lines he sent (Return), written by the engine
     static let draftsFile = Home.data.appendingPathComponent("drafts.jsonl")   // text he typed and left without sending
 
-    static func draft(_ text: String, app: String) {
-        queue.async { append(draftsFile, ["t": Date().timeIntervalSince1970, "text": text, "app": app]) }
+    static let hiddenFile = Home.data.appendingPathComponent("drafts-hidden.json")   // rows the window skips
+
+    /// `t`: his last key in this text (DraftCaptureRules.stamps), `started` ("t0"): his first key, so the window shows
+    /// how long it took; nil keeps the row as before. `replacing`: the t of the row this draft continues
+    /// (DraftCaptureRules.record); that row goes, this one is added. `est`: his keys did not explain the field's text,
+    /// this is the estimate ("est": true; absent on other rows).
+    static func draft(_ text: String, app: String, at t: Double = Date().timeIntervalSince1970, started: Double? = nil, est: Bool = false, replacing: Double? = nil) {
+        var row: [String: Any] = ["t": t, "text": text, "app": app]
+        if let started, started <= t { row["t0"] = started }
+        if est { row["est"] = true }
+        queue.async {
+            if let replacing { drop(draftsFile) { ($0["t"] as? NSNumber)?.doubleValue == replacing } }
+            append(draftsFile, row)
+        }
     }
 
     // MARK: clipboard
@@ -142,6 +157,7 @@ enum History {
                    !t.isEmpty, t != s { row["title"] = String(t.prefix(300)) }
             } else if ClipRules.rich(types) { row["rich"] = true }
             Clip.copied(s, from: front?.bundleIdentifier ?? "")
+            if Drafter.shared.settings.pickOffer, ClipRules.link(s) == nil { PickPanel.offerAfterCopy(s) }
         }
         let text = row["text"] as? String ?? "", clip = row["clip"] as? String
         if let last = read(clipFile, last: 1).first,
@@ -155,14 +171,31 @@ enum History {
         }
     }
 
+    // MARK: picked parts (app/PickPanel.swift, 15 November 2026)
+
+    /// A pick kept as its own clip: a text row in clipboard.jsonl like a copy, plus `from` (the source's id),
+    /// `picked` (its ranges) and `via` = "pick" (PickRecord.row). The source row is never touched. A clipboard row is
+    /// never learned as his writing (the corpus uses copies only to leave lines out); `mine` marks a pick from his own
+    /// draft, take or sent line. `remove`: its Undo, that one row. Read side: `PickRecord.read(row)`.
+    static func keepPick(_ rec: PickRecord, app: String, remove: Bool = false, file: URL = clipFile) {
+        let row = rec.row(app: app)
+        if !remove, file == clipFile { Quick.shared.copied(row) }
+        queue.async {
+            if remove { drop(file) { PickRules.isRow($0, of: rec) } } else { PickRules.append(file, row) }
+            if remove, file == clipFile { DispatchQueue.main.async { Quick.shared.refresh() } }
+        }
+    }
+
     // MARK: copied pictures (data/clips/)
 
     /// A captured picture (app/Capture.swift) as an image row, like a copied one: stored, read once, on the tape.
     @discardableResult
-    static func addPicture(_ png: Data, width w: Int, height h: Int, app: String) -> [String: Any] {
+    /// `shot`: the shot pack's id (data/shots/<id>/, app/ShotStore.swift), so the journal finds its note and marks.
+    static func addPicture(_ png: Data, width w: Int, height h: Int, app: String, shot: String? = nil) -> [String: Any] {
         let name = ClipRules.clipName(png)
         var row: [String: Any] = ["t": Date().timeIntervalSince1970, "app": app, "kind": "image", "text": ClipRules.imageText(w, h),
                                   "image": [w, h], "via": "capture"]
+        if let shot { row["shot"] = shot }
         let keep = Drafter.shared.settings.clipTotalMB > 0
         if keep { row["clip"] = name; row["bytes"] = png.count }
         Quick.shared.copied(row)

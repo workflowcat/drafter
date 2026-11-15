@@ -89,6 +89,8 @@ def replay(items, rows, policy, gap_ms=None, tab_cost=1, only=None):
                         if text[at:].startswith(w) or (w is ws[-1] and text[at:].startswith(w.rstrip())): k += 1; at += len(w)
                         else: break
                     rb = s["run"][bucket(n)]; rb[0] += 1; rb[1] += len(ws); rb[2] += k >= 2; rb[3] += k >= 3; rb[4] += len(ws) - k
+                    # long round: each ghost's words right in a row and words shown, with what the policy says of it
+                    s.setdefault("ghosts", []).append((k, len(ws), n, getattr(policy, "info", None)))
             if ghost:
                 w = next_word(ghost)
                 if w.strip() and text[pos:].startswith(w):

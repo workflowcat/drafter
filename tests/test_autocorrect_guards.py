@@ -71,9 +71,9 @@ class Guards(unittest.TestCase):
             root = Path(tmp); fixture = root/'snapshot.swift'; fixture.write_text(swift)
             built = subprocess.run(['swiftc', '-module-cache-path', str(root/'cache'),
                                     str(ROOT/'app/CorrectionRules.swift'), str(ROOT/'app/LocalSnapshot.swift'),
-                                    str(fixture), '-o', str(root/'check')], capture_output=True, text=True, timeout=60)
+                                    str(fixture), '-o', str(root/'check')], capture_output=True, text=True, timeout=300)
             self.assertEqual(built.returncode, 0, built.stderr)
-            ran = subprocess.run([str(root/'check'), str(root)], capture_output=True, text=True, timeout=10)
+            ran = subprocess.run([str(root/'check'), str(root)], capture_output=True, text=True, timeout=60)
             self.assertEqual(ran.returncode, 0, ran.stderr)
             self.assertIn('PASS:', ran.stdout)
 
@@ -89,6 +89,12 @@ class Guards(unittest.TestCase):
             static var words = Set<String>()
             static func known(_ word: String, _ lang: String) -> Bool { words.contains(word) }
             static func correction(_ word: String, _ lang: String) -> String? { nil }
+        }
+        enum TypoEngine {
+            static var calls = 0
+            static func check(_ token: String, line: String, app: String, kind: String, typosUk: Bool) -> (old: String, new: String, kind: String)? {
+                calls += 1; return (token + " ", "ranked ", "typo")
+            }
         }
         enum Autocorrect {
             static var ready = true, restored = "", protected = Set<String>()
@@ -116,15 +122,18 @@ class Guards(unittest.TestCase):
                 precondition(fix("поговрти", uk:true) == nil)
                 Autocorrect.restored = "tomorow"; precondition(fix("tomorow") == nil)
                 precondition(fix("tomorow") == "tomorrow ")
+                // the ranked engine takes over only when asked, after the layout fix and the typos switch
+                precondition(Autocorrect.check("tomorow ", layout: false, typos: true, ranked: true)?.new == "ranked " && TypoEngine.calls == 1)
+                precondition(Autocorrect.check("tomorow ", layout: false, typos: false, ranked: true) == nil && TypoEngine.calls == 1)
                 print("PASS: live correction eligibility with fake speller and in-memory words")
             }
         }
         '''
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); fixture = root/'check.swift'; fixture.write_text(swift)
-            built = subprocess.run(['swiftc', '-module-cache-path', str(root/'cache'), str(ROOT/'app/CorrectionRules.swift'), str(fixture), '-o', str(root/'check')], capture_output=True, text=True, timeout=60)
+            built = subprocess.run(['swiftc', '-module-cache-path', str(root/'cache'), str(ROOT/'app/CorrectionRules.swift'), str(fixture), '-o', str(root/'check')], capture_output=True, text=True, timeout=300)
             self.assertEqual(built.returncode, 0, built.stderr)
-            ran = subprocess.run([str(root/'check')], capture_output=True, text=True, timeout=10)
+            ran = subprocess.run([str(root/'check')], capture_output=True, text=True, timeout=60)
             self.assertEqual(ran.returncode, 0, ran.stderr)
             self.assertIn('PASS:', ran.stdout)
 

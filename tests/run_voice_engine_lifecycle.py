@@ -27,5 +27,7 @@ while True:
 ''')
     binary = scratch / 'checks'
     subprocess.run(['swiftc', '-swift-version', '5', str(scratch / 'VoiceEngine.swift'),
-                    str(root / 'tests/voice_engine_lifecycle.swift'), '-o', str(binary)], check=True)
-    subprocess.run([str(binary), str(scratch), sys.executable], check=True, timeout=20)
+                    str(root / 'tests/voice_engine_lifecycle.swift'),
+                    str(root / 'app/VoiceFlowRules.swift'),   # WakeBuffer: the audio kept while the engine starts
+                    '-o', str(binary)], check=True)
+    subprocess.run([str(binary), str(scratch), sys.executable], check=True, timeout=90)

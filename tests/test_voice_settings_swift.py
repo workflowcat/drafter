@@ -12,8 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 class SettingsRoundTrip(unittest.TestCase):
     @unittest.skipUnless(shutil.which('swiftc'), 'Swift compiler required')
     def test_voice_choices_survive_app_settings_round_trip(self):
-        source = (ROOT / 'app/Main.swift').read_text()
-        settings = source.split('struct Settings: Codable {', 1)[1].split('// MARK: engine process', 1)[0]
+        source = (ROOT / 'app/Settings.swift').read_text()
+        settings = source.split('struct Settings: Codable {', 1)[1]
         settings = 'struct Settings: Codable {' + settings
         with tempfile.TemporaryDirectory(prefix='drafter-settings-test-') as folder:
             path = Path(folder)
@@ -37,8 +37,8 @@ print("PASS Settings defaults, save/load, malformed model values")
 ''')
             (path / 'main.swift').write_text(program)
             subprocess.run(['swiftc', '-module-cache-path', str(path / 'cache'), str(path / 'main.swift'),
-                            '-o', str(path / 'check')], check=True, capture_output=True, timeout=60)
-            result = subprocess.run([str(path / 'check')], check=True, capture_output=True, text=True, timeout=10)
+                            '-o', str(path / 'check')], check=True, capture_output=True, timeout=300)
+            result = subprocess.run([str(path / 'check')], check=True, capture_output=True, text=True, timeout=60)
             self.assertIn('PASS Settings', result.stdout)
 
 

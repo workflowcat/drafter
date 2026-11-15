@@ -22,6 +22,9 @@ enum Autocorrect {
     /// came within the same or the next second; the log has no finer times, so this is a judgement, logged per take-back).
     static let fastBackspace = 0.5
     static var last: Fix?
+    /// Words he put back after a fix this run (take-back, undo chip): never a typo for the typo hold (TypoHold), even
+    /// before the keep list counts them. Memory only.
+    static var spared = Set<String>()
     private static var mine = Set<String>(), names = Set<String>(), keep = Set<String>()
     private static var counts: [String: Int] = [:]
     private static var ownIndex = CorrectionRules.Index([:]), restored = ""
@@ -77,7 +80,7 @@ enum Autocorrect {
     static let russian = CharacterSet(charactersIn: "ыэъёЫЭЪЁ")
 
     /// `before` ends with the space just typed: (what to replace, with what, kind) for the word before it.
-    static func check(_ given: String, layout: Bool, typos: Bool, typosUk: Bool = false) -> (old: String, new: String, kind: String)? {
+    static func check(_ given: String, layout: Bool, typos: Bool, typosUk: Bool = false, ranked: Bool = false, app: String = "", appKind: String = "other") -> (old: String, new: String, kind: String)? {
         // Chromium rich boxes keep a typed space at the end as a no-break space (2026-11-01: no fixes there at all)
         let before = given.replacingOccurrences(of: "\u{A0}", with: " ")
         guard before.hasSuffix(" "), !before.hasSuffix("  ") else { return nil }
@@ -90,6 +93,8 @@ enum Autocorrect {
         restored = ""
         if layout, let f = KeyLayout.fix(token, known: known) { return (f.old + " ", f.new + " ", f.toUk ? "layout uk" : "layout en") }
         guard typos else { return nil }
+        // 15 November 2026: the ranked fix (app/TypoEngine.swift) instead of the macOS-only one below
+        if ranked { return TypoEngine.check(token, line: line, app: app, kind: appKind, typosUk: typosUk) }
         // the word without quotes and brackets in front and punctuation after it
         let lead = token.prefix { "(\"«'„“".contains($0) }, rest = token.dropFirst(lead.count)
         let core = String(rest.reversed().drop { ",.!?;:)»\"”".contains($0) }.reversed())
@@ -124,13 +129,14 @@ enum Autocorrect {
         Focus.typeText(f.new)
         if f.kind == "layout uk" { KeyLayout.select(uk: true) } else if f.kind == "layout en" { KeyLayout.select(uk: false) }
         last = Fix(old: f.old, new: f.new, kind: f.kind, revision: Keys.shared.editRevision, el: s.el, at: Date(), wasUk: wasUk)
-        log("autocorrect \(f.kind) \(f.old.count) -> \(f.new.count) chars")
+        log("autocorrect \(f.kind) \(f.old.count) -> \(f.new.count) chars" + TypoEngine.tail(f.new))
         FixMarks.shared.add(new: f.new, old: f.old, kind: f.kind, wasUk: wasUk, el: s.el, pid: s.app.processIdentifier, markers: s.viaMarkers)
     }
 
     /// A fix at a word end: offered as "→ word" (Tab takes it), or in "replace" mode put in at once.
     static func apply(_ f: (old: String, new: String, kind: String), at s: Spot) {
-        if Drafter.shared.settings.autocorrectMode != "replace" { Fixer.offer(old: f.old, new: f.new, kind: f.kind, at: s); return }
+        // "sure" mode: the ranked fix goes in by itself only when its gate is past `fixAt`, else it is offered
+        if Drafter.shared.settings.autocorrectMode != "replace" && !TypoEngine.sure(f.new) { Fixer.offer(old: f.old, new: f.new, kind: f.kind, at: s); return }
         replace(f, at: s)
     }
 
@@ -154,6 +160,7 @@ enum Autocorrect {
             let word = String(f.old.dropLast())
             restored = word.trimmingCharacters(in: .punctuationCharacters).lowercased()   // the next space leaves it alone
             Fixer.refused = word.lowercased()
+            spared.insert(restored)
             log("autocorrect taken back (\(f.kind)) \(ms)ms" + (f.deliberate ? " after tab" : ""))
             keepIfStands(word, el: f.el)
         }

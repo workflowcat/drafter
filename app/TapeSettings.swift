@@ -138,6 +138,8 @@ extension SettingsView {
                     Color.clear.frame(width: G.cloud + 12, height: 1)
                 }
             }
+            stripRow
+            journalRows
             ForEach(Array(ThemeStore.refused.sorted { $0.key < $1.key }), id: \.key) { id, reasons in
                 line {
                     VStack(alignment: .leading, spacing: 2) {
@@ -152,6 +154,69 @@ extension SettingsView {
                 }
             }
         }
+    }
+}
+
+extension SettingsView {
+    /// The journal's two choices: how tall its rows are (`tapeDensity`) and which sessions start folded (`journalFold`).
+    @ViewBuilder var journalRows: some View {
+        lookRow("Journal view", [("gallery", "Gallery"), ("list", "List")], m.settings.journalView,
+                "Gallery: cards by kind in a grid (⌥⌘1). List: one row each (⌥⌘2)") { v in m.setView(v) }
+        lookRow("Journal list look", [("soft", "Soft"), ("grid", "Grid")], m.settings.journalLook,
+                "Soft: rounded rows, no lines. Grid: the earlier rows with hairlines and the tag column (the list only)") { v in m.save { $0.journalLook = v }; m.tapeTick += 1 }
+        lookRow("Card size", [("0", "Small"), ("1", "Medium"), ("2", "Large")], "\(m.settings.cardSize)",
+                "How big the gallery's cards are (⌘+ ⌘-)") { v in m.setCardSize((Int(v) ?? 1) - m.settings.cardSize) }
+        line {
+            HStack(spacing: 0) {
+                Color.clear.frame(width: G.toggle, height: 1)
+                Text("Journal rows").font(PKFont.text(16)).frame(maxWidth: .infinity, alignment: .leading)
+                WordPicker(choices: [("compact", "Compact"), ("comfortable", "Roomy")], value: m.settings.tapeDensity) { v in
+                    m.save { $0.tapeDensity = v }; m.tapeTick += 1
+                }.help("Compact: 28 pt rows, about 20 to a screen. Roomy: 36 pt rows")
+                Color.clear.frame(width: G.cloud + 12, height: 1)
+            }
+        }
+        line {
+            HStack(spacing: 0) {
+                Color.clear.frame(width: G.toggle, height: 1)
+                Text("Journal sessions start").font(PKFont.text(16)).frame(maxWidth: .infinity, alignment: .leading)
+                WordPicker(choices: [("none", "Open"), ("older", "Open today"), ("all", "Folded")], value: m.settings.journalFold) { v in
+                    m.save { $0.journalFold = v }; m.opens = m.opens.filter { !$0.key.hasPrefix("s|") }; m.reflow()
+                }.help("Which sessions show their items at first: all, only today's, or none (← → fold one)")
+                Color.clear.frame(width: G.cloud + 12, height: 1)
+            }
+        }
+    }
+
+    func lookRow(_ title: String, _ choices: [(String, String)], _ value: String, _ tip: String, _ set: @escaping (String) -> Void) -> some View {
+        line {
+            HStack(spacing: 0) {
+                Color.clear.frame(width: G.toggle, height: 1)
+                Text(title).font(PKFont.text(16)).frame(maxWidth: .infinity, alignment: .leading)
+                WordPicker(choices: choices, value: value, pick: set).help(tip)
+                Color.clear.frame(width: G.cloud + 12, height: 1)
+            }
+        }
+    }
+}
+
+/// A few words to pick one from, the chosen one on the soft lift (as the light / dark choice).
+struct WordPicker: View {
+    let choices: [(String, String)]
+    let value: String
+    let pick: (String) -> Void
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(choices, id: \.0) { id, name in
+                Button { pick(id) } label: {
+                    Text(name).font(PKFont.text(13)).foregroundStyle(value == id ? UIInk.ink : UIInk.muted)
+                        .padding(.horizontal, 10).frame(height: 26)
+                        .background(RoundedRectangle(cornerRadius: PK.corner(2)).fill(value == id ? UIInk.soft : .clear))
+                        .contentShape(Rectangle())
+                }.buttonStyle(.plain).accessibilityAddTraits(value == id ? .isSelected : [])
+            }
+        }
+        .padding(2).overlay { RoundedRectangle(cornerRadius: PK.corner(2) + 2).strokeBorder(UIInk.line, lineWidth: 1) }
     }
 }
 

@@ -20,7 +20,8 @@ import common as C
 import recency
 
 # the 14 November every-source mix (docs/rounds/2026-11-13-typing.md, round three): chats sampled at 0.1 so 60,000
-# Beeper lines do not drown his prompts; takes left out (they add fillers). corpus.WEIGHTS (the nightly's) is different.
+# Beeper lines do not drown his prompts; takes left out (they add fillers). corpus.WEIGHTS (the nightly) is the
+# same mix since 14 November (tests/test_corpus.py checks it).
 MIX = {"typed": 2, "cc": 1, "codex": 1, "vnotes": 0.5, "fb": 0.5, "vault": 0.5, "beeper": 0.1}
 LIVE = {"fine_tune_type": "lora", "rank": 8, "scale": 20.0, "num_layers": 16, "lr": 1e-4, "iters": 1500, "batch": 4}
 
@@ -81,6 +82,23 @@ def train(name, r, data_dir, smoke):
     return {"seconds": round(time.time() - t), "cap_gb": cap, **C.peak_and_loss(lines), "adapter": str(out.relative_to(C.ROOT))}
 
 
+def record_target(name, r):
+    """(model folder or repo, adapter) to record a trained variant with. The engine's in-memory merge
+    (Model.fuse_lora) knows only LoRA layers: a DoRA layer would run unmerged, about 3x slower a token (the 14 November
+    run reached 17 % of the set in 85 min). So DoRA is fused on disk first (mlx_lm fuse) and recorded with no adapter."""
+    if r["fine_tune_type"] == "dora":
+        return str(C.OUT / f"{name}-fused"), None
+    return C.BASE, C.OUT.relative_to(C.ROOT) / name
+
+
+def fuse(name):
+    dst = C.OUT / f"{name}-fused"
+    if (dst / "config.json").exists(): return
+    code, lines = C.guarded("-m", ["mlx_lm", "fuse", "--model", C.BASE, "--adapter-path", C.OUT / name, "--save-path", dst],
+                            4.0, log=C.RESULTS / "logs" / f"fuse-{name}.log")
+    if code or not (dst / "config.json").exists(): raise RuntimeError(f"{name}: fuse failed ({code}): {lines[-1:]}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--smoke", action="store_true")
@@ -89,6 +107,7 @@ def main():
     ap.add_argument("--set", default=None)
     ap.add_argument("--weights", default=None)
     ap.add_argument("--sleep-engine", action="store_true")
+    ap.add_argument("--reuse", action="store_true", help="a variant already trained in bench/out/weights: record it only")
     a = ap.parse_args()
     if a.list:
         for n in VARIANTS: print(f"{n:12} {VARIANTS[n] or 'the live recipe'}")
@@ -112,9 +131,15 @@ def main():
                 info = recency.build(data_dir, weights, cut, is_held, r.get("half_life"))
                 (data_dir / "info.json").write_text(json.dumps(info))
             info = json.loads((data_dir / "info.json").read_text())
-            tr = train(name, r, data_dir, a.smoke)
+            if a.reuse and (C.OUT / name / "adapters.safetensors").exists():
+                tr = {"reused": True, "adapter": str((C.OUT / name).relative_to(C.ROOT)),
+                      **C.peak_and_loss((C.RESULTS / "logs" / f"train-{name}.log").read_text().splitlines())}
+            else:
+                tr = train(name, r, data_dir, a.smoke)
+            if r["fine_tune_type"] == "dora": fuse(name)
             label = f"weights-{name}" + ("-smoke" if a.smoke else "")
-            rec = C.record(label, adapter=C.OUT.relative_to(C.ROOT) / name, set_path=set_path, smoke=a.smoke)
+            repo, adapter = record_target(name, r)
+            rec = C.record(label, repo=repo, adapter=adapter, set_path=set_path, smoke=a.smoke)
             s = C.score(rec, set_path, a.smoke)
             res = {"variant": name, "recipe": r, "mix": weights, "data": {k: v for k, v in info.items() if k != "per_source"},
                    "lines_per_source": info.get("per_source"), "train": tr, "score": s, "live": live, "vs_live": C.versus(s, live),

@@ -44,6 +44,7 @@ def guarded(script, args, cap_gb, timeout=7200, env=None, min_free=25, log=None)
     -> (exit code, stdout lines). Refuses to start when the system has under `min_free` % memory free."""
     if free_pct() < min_free:
         raise SystemExit(f"system free memory under {min_free}%: not starting {script} (another model running?)")
+    WORK.mkdir(parents=True, exist_ok=True)        # workers write their numbers there (speed.py, bias.py, steer.py)
     cmd = [PY, "-B", str(ROOT / "bench/weights/guarded.py"), str(cap_gb), str(script), *map(str, args)]
     e = {**os.environ, "HF_HUB_OFFLINE": os.environ.get("HF_HUB_OFFLINE", "1"), **(env or {})}
     t = time.time()
@@ -63,7 +64,12 @@ def gate_boost():
 def held_set(path=None):
     """The held-out set every score here uses: the retrain's (data/replay-fresh.json) unless --set names another."""
     p = Path(path) if path else DATA / "replay-fresh.json"
-    return p if p.is_absolute() else ROOT / p
+    p = p if p.is_absolute() else ROOT / p
+    if not path:        # the default set can be the 8 November draw with no chat lines: refuse it, name another
+        from retrain import missing_kinds
+        missing = missing_kinds(json.loads(p.read_text()))
+        if missing: raise SystemExit(f"{p.name} has no {', '.join(missing)} lines: pass --set (e.g. data/bench/weights/held-137.json)")
+    return p
 
 
 def held_lines(set_path):
@@ -167,7 +173,9 @@ def write(name, result):
 
 def peak_and_loss(lines):
     """Numbers from mlx_lm training output: last validation loss, peak memory (GB), iterations/second."""
-    val = [float(m.group(1)) for l in lines for m in [re.search(r"Val loss ([\d.]+)", l)] if m]
+    lines = [re.sub(r"\x1b\[[0-9;]*m", "", l) for l in lines]      # mlx-lm 0.32 colours its table
+    val = [float(m.group(1) or m.group(2)) for l in lines
+           for m in [re.search(r"Val loss ([\d.]+)|^\s*\d+\s+val ([\d.]+)", l)] if m]
     peak = [float(m.group(1)) for l in lines for m in [re.search(r"Peak mem ([\d.]+) GB", l)] if m]
     its = [float(m.group(1)) for l in lines for m in [re.search(r"It/sec ([\d.]+)", l)] if m]
     return {"val_loss": val[-1] if val else None, "val_loss_first": val[0] if val else None,

@@ -12,7 +12,9 @@
 // picks one and `rework` is on, else the local model). The result shows below; ⏎ puts it, ⌫ goes back to his text.
 // One tape (look round "Tape", 14 November): the chosen row unfolds in place to its text and its keys; rewrite unfolds
 // under it. Drawing in QuickView below and app/TapeDraw.swift.
-// The paste switcher (⌘⇧V, QuickSwitch below) is the lighter way in: copies only, hold and tap, let go to put.
+// ⌘⇧V held opens the same picker in its quick form (the extension "the quick form" below): the newest copies, hold
+// and tap, let go to put; a letter turns it into the full form (picker round, 15 November 2026: one window for both,
+// drawn in app/QuickView.swift).
 //
 // Putting text: AX insert or paste through Focus (the paste puts his clipboard back and is never kept as a copy).
 // Never into skipped apps, password fields or under secure input: there the text goes to the clipboard instead.
@@ -23,6 +25,8 @@ import Carbon
 final class Quick {
     static let shared = Quick()
     enum Mode { case list, rework }
+    /// full: ⌃⌥V, search, list and actions; quick: ⌘⇧V held, the newest copies and the held-chord step-through.
+    enum Look { case full, quick }
     enum Run { case menu, working, result, failed }
     struct Cmd { let id: String; let name: String; var hint: String; let cloud: Bool }
 
@@ -36,12 +40,17 @@ final class Quick {
     private var pins: [QuickPin] = []
     private(set) var uses = QuickUses()           // data/quick-stats.json: when he put which item in (ids and times)
     private var stamps: [String] = []
+    private let search = QuickSearch()            // the search core over the items (QuickSearch.swift)
     private var loading = false, reloadAgain = false
     private var gone: (item: QuickItem, until: DispatchWorkItem)?   // removed, still undoable
 
     // what he sees
     private(set) var isOpen = false
-    var held = false                              // opened by the switcher while ⌘⇧ are still down
+    var held = false                              // turned full from the quick form while ⌘⇧ are still down
+    var look = Look.full
+    /// The quick form's last put (row, text, app) and its rows then, for ⌘⇧V again within 2 s (switchSwap).
+    var lastPut: (row: Int, text: String, pid: pid_t)?
+    var swapRows: [QuickItem] = []
     var query = ""
     var kind: QuickKind?
     var sel = 0, top = 0
@@ -53,20 +62,20 @@ final class Quick {
     var custom = ""
     var run = Run.menu
     var result = "", resultName = "", resultBy = "", ms = 0
-    private var seq = 0
-    private var origin: NSRunningApplication?
+    var seq = 0
+    var origin: NSRunningApplication?
     var now = Date().timeIntervalSince1970
 
     let panel: NSPanel
     let view = QuickView()
 
     init() {
-        panel = NSPanel(contentRect: NSRect(origin: .zero, size: QuickView.size), styleMask: [.nonactivatingPanel, .borderless],
+        panel = NSPanel(contentRect: NSRect(origin: .zero, size: QuickView.fullFrame), styleMask: [.nonactivatingPanel, .borderless],
                         backing: .buffered, defer: false)
-        panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = true
+        panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = false   // the view draws the one float shadow
         panel.level = .popUpMenu; panel.ignoresMouseEvents = true; panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
-        view.frame = NSRect(origin: .zero, size: QuickView.size)
+        view.frame = NSRect(origin: .zero, size: QuickView.fullFrame)
         view.model = self
         panel.contentView = view
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
@@ -76,12 +85,45 @@ final class Quick {
 
     var current: QuickItem? { sel < shown.count ? items[shown[sel]] : nil }
 
+    // MARK: the chosen clip's written forms (wire round, 15 November 2026)
+
+    /// A text clip that IS one thing (a date, an amount, an IBAN...) has written forms for where it goes
+    /// (FoundRules.quickForms); ← and → step through them on the chosen row, ↵ and ⌘C take the form shown.
+    /// 0 is the text as copied. Kept per chosen row: another row starts again (on a stored rule's form, if any).
+    private(set) var formIx = 0
+    var formsFor: (id: String, at: Double, kind: String, forms: [FormatVariant])?
+    func forms(_ it: QuickItem) -> (kind: String, forms: [FormatVariant]) {
+        if let f = formsFor, f.id == it.id, f.at == it.at { return (f.kind, f.forms) }
+        var r: (kind: String, forms: [FormatVariant], ruled: Bool) = ("", [], false)
+        if it.clip == .text, !it.image, it.text.count <= 200 {
+            let b = origin?.bundleIdentifier ?? ""
+            let kind = AppKind.of(b, title: "", ai: Keys.aiApps, chats: Keys.chatApps, browsers: Keys.browsers, aiTitle: Keys.aiTitle)
+            r = FoundRules.quickForms(it.text, written: Date(timeIntervalSince1970: it.at), dest: FoundRules.dest(bundle: b, kind: kind), memory: ClipForms.memory)
+        }
+        formsFor = (it.id, it.at, r.kind, r.forms); formIx = r.ruled ? 1 : 0
+        return (r.kind, r.forms)
+    }
+    /// The form on the chosen row: nil = the text as copied.
+    func shownForm(_ it: QuickItem) -> FormatVariant? {
+        let f = forms(it).forms
+        return formIx > 0 && formIx <= f.count ? f[formIx - 1] : nil
+    }
+    /// What ↵ and ⌘C take from the chosen row.
+    func chosenText(_ it: QuickItem) -> String { shownForm(it)?.text ?? it.text }
+    private func stepForm(_ d: Int) {
+        guard mode == .list, let it = current else { return }
+        let n = forms(it).forms.count
+        guard n > 0 else { return }
+        formIx = QuickRules.stepForm(formIx, by: d, forms: n)
+        view.needsDisplay = true
+    }
+
     // MARK: the event tap
 
     /// Both keys as one state (QuickRules.QuickKeys, tested with made-up event sequences).
     var keys = QuickKeys()
     private var keyNames = ("", "", "")
-    private var captureName = "\u{0}", captureKey: QuickHotkey?
+    private var captureNames: [String] = ["\u{0}"], captureKeys: [QuickHotkey] = []
 
     /// From Keys.handle, for every event before anything else looks at it. true = swallowed.
     func tap(_ type: CGEventType, _ event: CGEvent) -> Bool {
@@ -91,10 +133,11 @@ final class Quick {
             keys.panelKey = QuickRules.hotkey(st.quickKey); keys.switchKey = QuickRules.hotkey(st.switchKey)
             // never the same chord as another of Drafter's keys
             let again = QuickRules.hotkey(st.againKey)
-            keys.againKey = [keys.panelKey, keys.switchKey, QuickRules.hotkey(st.captureKey)].contains { $0 != nil && $0 == again } ? nil : again
+            keys.againKey = ([keys.panelKey, keys.switchKey] + Capture.keys.map { QuickRules.hotkey($0) }).contains { $0 != nil && $0 == again } ? nil : again
         }
         if type == .leftMouseDown || type == .rightMouseDown { keys.disarmSwap() }   // a click: the caret may have moved
         keys.panelOpen = isOpen
+        keys.forms = isOpen && mode == .list ? (current.map { forms($0).forms.count } ?? 0) : 0
         // quick capture (app/Capture.swift): its key, and every key while the screen is dimmed
         if type == .keyDown, MarkupEditor.shared.isOpen || CaptureNote.shared.isOpen {   // markup, then the strip after a capture
             let code = Int(event.getIntegerValueField(.keyboardEventKeycode)), fl = event.flags
@@ -113,15 +156,21 @@ final class Quick {
             return true
         }
         if type == .keyDown {
-            if captureName != st.captureKey { captureName = st.captureKey; captureKey = ShotRules.allowed(st.captureKey) ? QuickRules.hotkey(st.captureKey) : nil }
+            let names = Capture.keys   // ⌘⇧5 joins ⌃⌥S once macOS lets it go (ShotRules.keys)
+            if captureNames != names { captureNames = names; captureKeys = names.compactMap { QuickRules.hotkey($0) } }
             let f = event.flags
             var c = QuickKeyEvent(kind: .down); c.code = Int(event.getIntegerValueField(.keyboardEventKeycode))
             c.ctrl = f.contains(.maskControl); c.alt = f.contains(.maskAlternate); c.cmd = f.contains(.maskCommand); c.shift = f.contains(.maskShift)
-            if QuickKeys.exact(c, captureKey) {
+            if captureKeys.contains(where: { QuickKeys.exact(c, $0) }) {
                 if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 { DispatchQueue.main.async { Capture.shared.open() } }
                 return true
             }
+            if QuickKeys.exact(c, PickPanel.chord) {      // ⌃⌥P: Pick parts on what is on the clipboard
+                if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 { DispatchQueue.main.async { PickPanel.openClipboard() } }
+                return true
+            }
         }
+        keys.panelOpen = isOpen && look == .full   // the quick form is the held chord's: route reads it while switching
         if held, type == .flagsChanged, !event.flags.contains(.maskCommand) { held = false }
         let f = event.flags
         var e = QuickKeyEvent(kind: type == .keyDown ? .down : type == .flagsChanged ? .flags : .up)
@@ -136,12 +185,13 @@ final class Quick {
                 case .pass: passOn = true
                 case .swallow: swallowed = true
                 case .togglePanel: swallowed = true; DispatchQueue.main.async { self.toggle() }
-                case .openSwitch: swallowed = true; DispatchQueue.main.async { QuickSwitch.shared.open() }
-                case .step(let n): swallowed = true; DispatchQueue.main.async { QuickSwitch.shared.step(n) }
-                case .put: DispatchQueue.main.async { QuickSwitch.shared.finish() }
-                case .cancel: swallowed = true; DispatchQueue.main.async { QuickSwitch.shared.close("esc") }
+                case .openSwitch: swallowed = true; DispatchQueue.main.async { self.openQuick() }
+                case .step(let n): swallowed = true; DispatchQueue.main.async { self.stepQuick(n) }
+                case .put: DispatchQueue.main.async { self.finishQuick() }
+                case .cancel: swallowed = true; DispatchQueue.main.async { if self.look == .quick { self.close("esc") } }
                 case .voiceAgain: swallowed = true; DispatchQueue.main.async { self.voiceAgain() }
-                case .swap: swallowed = true; DispatchQueue.main.async { QuickSwitch.shared.swap() }
+                case .swap: swallowed = true; DispatchQueue.main.async { self.swap() }
+                case .form(let d): swallowed = true; DispatchQueue.main.async { self.stepForm(d) }
                 case .toPanel(let code):
                     swallowed = true
                     var n = 0; var u = [UniChar](repeating: 0, count: 4)
@@ -150,15 +200,19 @@ final class Quick {
                     if ch.unicodeScalars.first.map({ CharacterSet.controlCharacters.contains($0) }) ?? true {
                         ch = QuickRules.codes.first { $0.value == code }?.key.lowercased() ?? ""
                     }
-                    DispatchQueue.main.async { QuickSwitch.shared.intoPanel(ch) }
+                    DispatchQueue.main.async { self.intoFull(ch) }
                 }
             }
             if swallowed && !passOn { return true }
             if type == .flagsChanged { return false }
         }
         guard isOpen else { return false }
-        if type == .leftMouseDown || type == .rightMouseDown { DispatchQueue.main.async { self.close("click") }; return false }
-        guard type == .keyDown else { return false }
+        if type == .leftMouseDown || type == .rightMouseDown {
+            if look == .quick { keys.cancelSwitch() }   // a click while holding: nothing goes in on the release
+            DispatchQueue.main.async { self.close("click") }; return false
+        }
+        // the quick form takes keys only through route (while held); a key after a missed release goes to the app
+        guard look == .full, type == .keyDown else { return false }
         var n = 0; var u = [UniChar](repeating: 0, count: 4)
         event.keyboardGetUnicodeString(maxStringLength: 4, actualStringLength: &n, unicodeString: &u)
         let mods = event.flags.intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift])
@@ -171,11 +225,11 @@ final class Quick {
 
     func open(typed: String = "", held: Bool = false, choose: QuickItem? = nil, near: NSRect? = nil) {
         guard !isOpen else { return }
-        self.held = held
+        self.held = held; look = .full
         if IsSecureEventInputEnabled() { Pill.shared.flash("Quick panel is off while secure input is on"); return }
         let t0 = Date()
         origin = NSWorkspace.shared.frontmostApplication
-        query = typed; kind = nil; sel = 0; top = 0; mode = .list; notice = ""; custom = ""; run = .menu; seq += 1
+        query = typed; kind = nil; sel = 0; top = 0; mode = .list; notice = ""; custom = ""; run = .menu; seq += 1; formsFor = nil
         now = Date().timeIntervalSince1970
         refilter()
         if let c = choose, let i = shown.firstIndex(where: { items[$0].same(c) }) { sel = i }
@@ -186,6 +240,8 @@ final class Quick {
         isOpen = true
         refresh()
         log("quick: open, \(items.count) rows, \(Int(Date().timeIntervalSince(t0) * 1000)) ms")
+        // the next main-queue pass, close to the first frame (docs/rounds/2026-11-15-speed.md)
+        DispatchQueue.main.async { log("quick: first draw \(Int(Date().timeIntervalSince(t0) * 1000)) ms") }
     }
 
     func close(_ why: String) {
@@ -196,14 +252,15 @@ final class Quick {
         log("quick: closed (\(why))")
     }
 
-    /// The caret's screen (the focused element's, else the mouse's), centred, in the upper third.
-    private func place(near: NSRect? = nil) {
+    /// The caret's screen (the focused element's, else the mouse's), centred, in the upper third. near: the quick
+    /// form's card, which the full form grows from (the same top-left corner, kept on its screen).
+    func place(near: NSRect? = nil) {
+        let p = QuickView.pad
         if let near, let scr = NSScreen.screens.first(where: { $0.frame.intersects(near) }) {
-            // in place of the switcher's strip: the same top-left corner, kept on its screen
-            let vis = scr.visibleFrame, size = QuickView.size
-            let x = min(max(near.minX, vis.minX + 8), vis.maxX - size.width - 8)
-            let y = min(max(near.maxY - size.height, vis.minY + 8), vis.maxY - size.height - 8)
-            panel.setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: false)
+            let vis = scr.visibleFrame, size = QuickView.frameSize(self)
+            let x = min(max(near.minX - p, vis.minX + 8 - p), vis.maxX - size.width - 8 + p)
+            let y = min(max(near.maxY + p - size.height, vis.minY + 8 - p), vis.maxY - size.height - 8 + p)
+            panel.setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: true)
             return
         }
         var scr: NSScreen?
@@ -218,9 +275,9 @@ final class Quick {
         let mouse = NSEvent.mouseLocation
         let s = scr ?? NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main
         let vis = s?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let size = QuickView.size
+        let size = QuickView.frameSize(self)
         let midY = vis.maxY - vis.height / 3
-        let y = min(max(midY - size.height / 2, vis.minY + 8), vis.maxY - size.height - 8)
+        let y = min(max(midY - size.height / 2, vis.minY + 8 - p), vis.maxY - size.height - 8 + p)
         panel.setFrame(NSRect(x: vis.midX - size.width / 2, y: y, width: size.width, height: size.height), display: false)
     }
 
@@ -228,7 +285,6 @@ final class Quick {
 
     /// At start: pins and rows, off the main thread.
     func warm() {
-        _ = QuickSwitch.shared   // its panel made now, not on his first ⌘⇧V
         DispatchQueue.global(qos: .utility).async {
             let p = Self.loadPins()
             let u = (try? Data(contentsOf: Self.statsFile)).flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }.map(QuickUses.init) ?? QuickUses()
@@ -260,6 +316,7 @@ final class Quick {
 
     /// Reads the history files again when one changed (size, time); the panel keeps showing the rows it has meanwhile.
     func refresh() {
+        if let k = search.takeKeyStats() { log(String(format: "quick: keys %d, p50 %.1f ms, max %.1f ms (filter, since the last open)", k.n, k.p50, k.max)) }
         if loading { reloadAgain = true; return }
         loading = true
         let st = Drafter.shared.settings
@@ -272,77 +329,30 @@ final class Quick {
             }.joined(separator: "|") }
             var changed: [Int] = []
             for i in fresh.indices where have.count != fresh.count || have[i] != fresh[i] {
-                self.readPart(i, max: st.quickMax, days: st.quickDays, secrets: QuickRules.secretRules(st.quickSecret))
+                self.reader.read(i, max: st.quickMax, days: st.quickDays, secrets: QuickRules.secretRules(st.quickSecret))
                 changed.append(i)
             }
-            let rows = self.parts.flatMap { $0 }, folded = self.folded
+            let rows = self.reader.parts.flatMap { $0 }, folded = self.reader.folded
             if !changed.isEmpty {
                 log("quick: read \(changed.map { ["copied", "typed", "voice"][$0] }.joined(separator: "+")), \(rows.count) rows in \(Int(Date().timeIntervalSince(t0) * 1000)) ms")
             }
             DispatchQueue.main.async {
                 self.loading = false
-                if !changed.isEmpty { self.raw = rows; self.drafts = folded; self.stamps = fresh; self.rebuild() }
+                if !changed.isEmpty {
+                    let t1 = Date()
+                    self.raw = rows; self.drafts = folded; self.stamps = fresh; self.rebuild()
+                    log("quick: rebuild \(Int(Date().timeIntervalSince(t1) * 1000)) ms, \(self.items.count) rows\(self.isOpen ? ", open" : "")")
+                }
                 if self.reloadAgain { self.reloadAgain = false; self.refresh() }
             }
         }
     }
 
-    // Touched only on the loading queue (one read at a time): each source's rows, and rows already built (folding the
-    // text for search is most of the cost), so a new copy re-reads the clipboard file only and builds one new row.
+    // Touched only on the loading queue (one read at a time): each source's rows (QuickRead.swift: only the bytes
+    // appended since the last read are read; rows already built are kept).
     private static let sources = [[History.clipFile, History.clipsDir], [History.typedFile, History.draftsFile], [History.takesFile]]
-    private var parts: [[QuickItem]] = [[], [], []]
-    private var folded: [String: [String]] = [:]
-    private var built: [String: QuickItem] = [:]
-    private func item(_ kind: QuickKind, _ text: String, _ app: String, _ at: Double, image: Bool = false) -> QuickItem {
-        let k = "\(kind.rawValue)|\(at)|\(app)|\(text)"
-        if let it = built[k] { return it }
-        let it = QuickItem(kind: kind, text: text, app: app, at: at, image: image)
-        built[k] = it
-        return it
-    }
-
-    /// Clipboard (trimmed as History keeps it), typed messages (drafts folded in), voice takes with words.
-    private func readPart(_ i: Int, max: Int, days: Double, secrets: [NSRegularExpression]) {
-        if built.count > 4 * max { built.removeAll() }
-        switch i {
-        case 0:
-            let clipRows = History.read(History.clipFile, last: max)
-            let pairs: [(t: Double, text: String)] = clipRows.reversed().map {
-                ($0["t"] as? Double ?? 0, ClipRules.dedupeKey(text: $0["text"] as? String ?? "", clip: $0["clip"] as? String))
-            }
-            let keep = QuickRules.keepClips(pairs, now: Date().timeIntervalSince1970, max: max, days: days) { QuickRules.isSecret($0, secrets) }
-            parts[0] = keep.map { k in clipItem(clipRows[clipRows.count - 1 - k]) }
-        case 1:
-            var f: [String: [String]] = [:]
-            parts[1] = TypedList.build(sent: History.read(History.typedFile, last: max), drafts: History.read(History.draftsFile, last: max / 2))
-                .filter { !$0.text.contains("⟦drafter-test⟧") }
-                .map { e in
-                    if !e.drafts.isEmpty { f[e.text] = e.drafts }
-                    return item(.typed, e.text, e.app, (e.touched ?? e.when).timeIntervalSince1970)
-                }
-            folded = f
-        default:
-            parts[2] = History.read(History.takesFile, last: max).compactMap { r in
-                guard let t = r["text"] as? String, !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-                return item(.voice, t, r["app"] as? String ?? "", r["t"] as? Double ?? 0)
-            }
-        }
-    }
-
-    /// One clipboard.jsonl row as a row on the tape (kind, title, size, the stored picture and its read text).
-    /// Off the main thread, except for a new copy (no read text yet then).
-    private func clipItem(_ r: [String: Any], read: Bool = true) -> QuickItem {
-        let text = r["text"] as? String ?? "", app = r["app"] as? String ?? "", at = r["t"] as? Double ?? 0
-        let pic = r["clip"] as? String ?? ""
-        let ocr = read && !pic.isEmpty ? History.clipText(pic) : ""
-        let k = "c|\(at)|\(app)|\(pic)|\(ocr.count)|\(text)"
-        if let it = built[k] { return it }
-        let it = QuickItem(kind: .copied, text: text, app: app, at: at, image: r["image"] != nil,
-                           clip: (r["kind"] as? String).flatMap(ClipKind.init(rawValue:)), title: r["title"] as? String ?? "",
-                           bytes: r["bytes"] as? Int ?? 0, picture: pic, ocr: ocr, rich: r["rich"] as? Bool ?? false)
-        built[k] = it
-        return it
-    }
+    private let reader = QuickReader(.init(clip: History.clipFile, typed: History.typedFile, drafts: History.draftsFile,
+                                           takes: History.takesFile, hidden: History.hiddenFile), clipText: History.clipText)
 
     /// A new copy (its clipboard.jsonl row), straight from History.watchClipboard: on the list at once, no file read.
     func copied(_ row: [String: Any]) {
@@ -363,11 +373,22 @@ final class Quick {
         var rows = raw
         if let g = gone?.item { rows.removeAll { $0.same(g) } }
         items = QuickRules.merge(rows, pins: pins.filter { p in gone.map { !($0.item.kind == p.kind && $0.item.text == p.text) } ?? true })
+        // the index for these rows, off the main thread (previews: at once); a query typed meanwhile gets its order then
+        search.inline = stamps == ["preview"]
+        search.rebuild(items, uses: uses, now: Date().timeIntervalSince1970) { [weak self] in
+            guard let self, self.isOpen, !self.query.isEmpty, !self.search.inline else { return }
+            self.refilter(keep: self.current)
+        }
         refilter(keep: keep)
     }
 
     func refilter(keep: QuickItem? = nil) {
-        shown = QuickRules.filter(items, query: query, kind: kind, uses: uses, now: Date().timeIntervalSince1970)
+        shown = look == .quick ? QuickRules.quickRows(items, count: Self.quickCount)
+            : search.filter(items, query: query, kind: kind, uses: uses, now: Date().timeIntervalSince1970)
+        if look == .quick, isOpen, stamps != ["preview"] {   // a copy came in while held: the card grows, its top stays
+            let size = QuickView.frameSize(self), f = panel.frame
+            if f.size != size { panel.setFrame(NSRect(x: f.minX, y: f.maxY - size.height, width: size.width, height: size.height), display: true) }
+        }
         if let keep, let i = shown.firstIndex(where: { items[$0].same(keep) }) { sel = i } else { sel = min(sel, max(0, shown.count - 1)) }
         if keep == nil { sel = 0 }
         scroll()
@@ -384,6 +405,7 @@ final class Quick {
         // opened from the paste switcher with ⌘⇧ still held: those keys are typing until he lets go
         let mods = held ? mods0.subtracting([.maskCommand, .maskShift]) : mods0
         let cmd = mods.contains(.maskCommand), plain = mods.subtracting(.maskShift).isEmpty
+        if cmd, code == 14, mode == .list, let it = current { DispatchQueue.main.async { self.close("pick"); PickPanel.open(it) }; return true }   // ⌘E: Pick parts
         // round three: the chosen row's own keys (⌘O open, ⌘M markdown, ⌘T no tracking / copy text, ⌘R reveal, ⌘S save,
         // ⌘C copy path for a file)
         if cmd, mode == .list, !mods.contains(.maskControl), let it = current,
@@ -407,18 +429,20 @@ final class Quick {
         case 125: move(1)
         case 116: move(-Self.visibleRows)
         case 121: move(Self.visibleRows)
-        case 36, 76 where mods.contains(.maskShift) && current?.clip == .image:   // ⇧↵ a picture with its read text
+        // (a `where` binds only the last pattern of a case: before the picker round ↵ fell into this case on every row
+        // and the digits 1 2 3 picked a kind instead of being typed)
+        case 36 where mods.contains(.maskShift) && current?.clip == .image, 76 where mods.contains(.maskShift) && current?.clip == .image:   // ⇧↵ a picture with its read text
             if let it = current { DispatchQueue.main.async { self.act("withText", it) } }
-        case 36, 76: if let it = current { let keep = cmd; DispatchQueue.main.async { self.put(it, it.text, keep: keep) } }
+        case 36, 76: if let it = current { let keep = cmd, t = chosenText(it); DispatchQueue.main.async { self.put(it, t, keep: keep) } }
         case 48: if plain, let it = current { openRework(it) }
         case 51:
             if cmd { remove() }
             else if mods.contains(.maskAlternate) { dropWord() }
             else if !query.isEmpty { query.removeLast(); refilter() }
         case 6 where cmd: undo()
-        case 8 where cmd: if let it = current { copy(it, it.text) }
+        case 8 where cmd: if let it = current { copy(it, chosenText(it)) }
         case 35 where cmd: pin()
-        case 18, 19, 20, 21 where cmd:
+        case 18 where cmd, 19 where cmd, 20 where cmd, 21 where cmd:
             kind = [nil, .copied, .typed, .voice][Int(code - 18)]; sel = 0; top = 0; refilter()
         case 123, 124, 115, 119: break
         default:
@@ -551,13 +575,7 @@ final class Quick {
     }
 
     /// ⌘V into the front app, marked as Drafter's own so the tap lets it through.
-    static func commandV() {
-        let src = CGEventSource(stateID: .hidSystemState)
-        for down in [true, false] {
-            let e = CGEvent(keyboardEventSource: src, virtualKey: 9, keyDown: down)
-            e?.flags = .maskCommand; e?.setIntegerValueField(.eventSourceUserData, value: Focus.mark); e?.post(tap: .cghidEventTap)
-        }
-    }
+    static func commandV() { Focus.commandV() }   // counted for the draft budget (DraftCaptureRules)
 
     private func copy(_ it: QuickItem, _ text: String) {
         if it.image && it.picture.isEmpty { notice = "Only the size of this image was kept"; view.needsDisplay = true; return }
@@ -675,7 +693,9 @@ final class Quick {
         run = .working
         let mine = seq, t0 = Date()
         // the text leaves the Mac only here, after he picked; engine: Claude through claude_on("rework"), else local
-        Engine.shared.post("/rework", ["text": it.text, "cmd": id, "custom": id == "custom" ? custom : "", "app": it.app, "from": "quick"], timeout: 45) { j in
+        // writing instructions: the global one (a clipboard row knows the app's name, not its bundle id)
+        let notes = WritingNotes.forApp("", global: Drafter.shared.settings.writingNote, perApp: [:])
+        Engine.shared.post("/rework", ["text": it.text, "cmd": id, "custom": id == "custom" ? custom : "", "app": it.app, "from": "quick", "notes": notes], timeout: 45) { j in
             guard mine == self.seq, self.isOpen, self.mode == .rework else { return }
             let out = (j?["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             self.ms = Int(Date().timeIntervalSince(t0) * 1000)
@@ -687,106 +707,83 @@ final class Quick {
     }
 }
 
-// MARK: the paste switcher
+// MARK: the quick form (picker round, 15 November 2026)
 
-/// ⌘⇧V (setting `switchKey`), like ⌘Tab for the clipboard: the first tap shows a slim strip near the caret with the
-/// five newest copies, the newest chosen; each further V (⌘⇧ still down) or → moves on (wrapping), ← goes back;
-/// letting go of ⌘ puts the chosen one in, as plain text (QuickRules.plain, so a tap-and-release does what the apps' own
-/// ⌘⇧V "paste and match style" did; setting `switchFormat` keeps the newest copy's formatting by sending the app a
-/// plain ⌘V). Esc, still holding, puts nothing in. Any other letter turns it into the Quick panel with that letter
-/// typed. Plain ⌘V is never touched. Copies only: typed and voice rows stay in the panel.
-final class QuickSwitch {
-    static let shared = QuickSwitch()
-    static let count = 5
-    private(set) var isOpen = false
-    private(set) var rows: [QuickItem] = []
-    var sel = 0
-    private var origin: NSRunningApplication?
-    let panel: NSPanel
-    let view = SwitchView()
+/// ⌘⇧V (setting `switchKey`), like ⌘Tab for the clipboard, is the same picker in its quick form: the first tap opens it
+/// under the caret with the five newest copies, the newest chosen; each further V (⌘⇧ still down) or → moves on
+/// (wrapping), ← goes back (with written forms on the chosen copy, ← → step through them instead); letting go of ⌘ puts
+/// the chosen one in, as plain text (QuickRules.plain, so a tap-and-release does what the apps' own ⌘⇧V "paste and match
+/// style" did; setting `switchFormat` keeps the newest copy's formatting by sending the app a plain ⌘V). Esc, still
+/// holding, puts nothing in. Any other letter turns the picker into its full form with that letter in search, where it
+/// stands. Plain ⌘V is never touched. Copies only: typed and voice rows wait in the full form.
+/// ⌘⇧V again within 2 s of a put (setting `switchSwap`) swaps it for the next older text copy.
+extension Quick {
+    static let quickCount = 5
 
-    init() {
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 10, height: SwitchView.H), styleMask: [.nonactivatingPanel, .borderless],
-                        backing: .buffered, defer: false)
-        panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = false   // the chosen card draws the one shadow
-        panel.level = .popUpMenu; panel.ignoresMouseEvents = true; panel.hidesOnDeactivate = false
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
-        view.model = self
-        panel.contentView = view
-    }
-
-    var chosen: QuickItem? { sel < rows.count ? rows[sel] : nil }
-
-    func open() {
-        guard !isOpen else { return }
+    func openQuick() {
+        guard !isOpen else { keys.cancelSwitch(); return }
         let t0 = Date()
-        if IsSecureEventInputEnabled() { Quick.shared.keys.cancelSwitch(); return }
-        rows = Array(Quick.shared.items.filter { $0.kind == .copied && !$0.image && !$0.pinned }.prefix(Self.count))
-        guard !rows.isEmpty else { Quick.shared.keys.cancelSwitch(); Pill.shared.flash("Nothing copied yet"); return }
+        if IsSecureEventInputEnabled() { keys.cancelSwitch(); return }
+        guard !QuickRules.quickRows(items, count: Self.quickCount).isEmpty else { keys.cancelSwitch(); Pill.shared.flash("Nothing copied yet"); return }
         origin = NSWorkspace.shared.frontmostApplication
-        sel = 0
-        isOpen = true
-        place()
+        look = .quick; held = false
+        query = ""; kind = nil; sel = 0; top = 0; mode = .list; notice = ""; custom = ""; run = .menu; seq += 1; formsFor = nil
+        now = Date().timeIntervalSince1970
+        refilter()
+        Ghost.shared.hide(); Rework.shared.close("quick")
+        placeQuick()
         view.needsDisplay = true
         panel.orderFrontRegardless()
-        Ghost.shared.hide()
-        log("switch: open, \(rows.count) copies, \(Int(Date().timeIntervalSince(t0) * 1000)) ms")
+        isOpen = true
+        log("switch: open, \(shown.count) copies, \(Int(Date().timeIntervalSince(t0) * 1000)) ms")
     }
 
-    func step(_ by: Int) {
-        guard isOpen, !rows.isEmpty else { return }
-        sel = (sel + by + rows.count) % rows.count
-        // the chosen chip is the wide one: the strip refits, its left and top stay
-        let top = panel.frame.maxY, size = view.fit()
-        panel.setFrame(NSRect(x: panel.frame.minX, y: top - size.height, width: size.width, height: size.height), display: false)
+    func stepQuick(_ by: Int) {
+        guard isOpen, look == .quick, !shown.isEmpty else { return }
+        sel = QuickRules.wrap(sel, by: by, count: shown.count)
         view.needsDisplay = true
     }
 
-    func close(_ why: String) {
-        guard isOpen else { return }
-        isOpen = false
-        panel.orderOut(nil)
-        log("switch: closed (\(why))")
+    /// He typed a letter while holding: the full form with it in search, the same copy chosen when it still matches,
+    /// grown from where the quick form stands.
+    func intoFull(_ ch: String) {
+        guard isOpen, look == .quick else { open(typed: ch, held: true); return }
+        let it = current, card = panel.frame.insetBy(dx: QuickView.pad, dy: QuickView.pad)
+        look = .full; held = true; query = ch; sel = 0; top = 0
+        refilter()
+        if let it, let i = shown.firstIndex(where: { items[$0].same(it) }) { sel = i; refilter(keep: it) }
+        place(near: card)
+        view.needsDisplay = true
+        log("switch: into the full form")
     }
 
-    /// He typed a letter while holding: the panel opens with it, the same copy chosen, where the strip was.
-    func intoPanel(_ ch: String) {
-        let it = chosen, at = panel.frame.insetBy(dx: SwitchView.pad, dy: SwitchView.pad)   // the strip itself
-        close("to panel")
-        Quick.shared.open(typed: ch, held: true, choose: it, near: at)
-    }
-
-    /// ⌘ let go: the chosen copy goes in.
-    func finish() {
-        guard isOpen, let it = chosen else { close("empty"); return }
+    /// ⌘ let go: the chosen copy goes in (the written form shown, if he stepped to one).
+    func finishQuick() {
+        guard isOpen, look == .quick, let it = current else { close("empty"); return }
+        let row = sel, rows = shown.map { items[$0] }, formed = shownForm(it)?.text, from = origin
         close("put")
-        let keepFormat = Drafter.shared.settings.switchFormat && sel == 0
+        let keepFormat = formed == nil && Drafter.shared.settings.switchFormat && row == 0
             && NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) == it.text
-        let text = keepFormat ? it.text : QuickRules.plain(it.text)
-        let how = Quick.shared.put(it, text, keep: true, from: origin, asIs: keepFormat)
-        lastPut = nil
-        if how != nil { arm(sel, text) }
+        let text = formed ?? (keepFormat ? it.text : QuickRules.plain(it.text))
+        let how = put(it, text, keep: true, from: from, asIs: keepFormat)
+        lastPut = nil; swapRows = rows
+        if how != nil { arm(row, text, pid: from?.processIdentifier) }
     }
 
-    // MARK: swap (keys round, 14 November): ⌘⇧V again within 2 s puts the next older copy in place of this one
+    private var textRows: [Bool] { swapRows.map { writer($0) == nil && !$0.image } }
 
-    /// The row just put in, what went in, and the app.
-    private var lastPut: (row: Int, text: String, pid: pid_t)?
-
-    private var textRows: [Bool] { rows.map { Quick.shared.writer($0) == nil && !$0.image } }
-
-    private func arm(_ row: Int, _ text: String) {
-        guard Drafter.shared.settings.switchSwap, let pid = origin?.processIdentifier, !text.isEmpty,
-              KeyRules.swapNext(textRows, after: row) != nil else { Quick.shared.keys.disarmSwap(); return }
+    private func arm(_ row: Int, _ text: String, pid: pid_t?) {
+        guard Drafter.shared.settings.switchSwap, let pid, !text.isEmpty,
+              KeyRules.swapNext(textRows, after: row) != nil else { keys.disarmSwap(); return }
         lastPut = (row, text, pid)
-        Quick.shared.keys.armSwap(until: Date().timeIntervalSince1970 + KeyRules.swapSeconds)
+        keys.armSwap(until: Date().timeIntervalSince1970 + KeyRules.swapSeconds)
     }
 
     /// The text just put is selected back (the caret is right after it) and the next older copy is pasted over it.
     /// Only when the field still ends with that text, in the same app, never in skipped apps, password fields or
     /// under secure input.
     func swap() {
-        Quick.shared.keys.disarmSwap()
+        keys.disarmSwap()
         guard let p = lastPut, let i = KeyRules.swapNext(textRows, after: p.row) else { lastPut = nil; return }
         lastPut = nil
         let st = Drafter.shared.settings
@@ -797,20 +794,19 @@ final class QuickSwitch {
               KeyRules.stillEnds(before: spot?.before ?? Focus.before(el) ?? "", piece: p.text) else {
             log("switch: swap skipped, text changed"); return
         }
-        let it = rows[i], text = QuickRules.plain(it.text)
-        sel = i
+        let it = swapRows[i], text = QuickRules.plain(it.text)
         Fields.left(p.text.count, shift: true)
         Focus.paste(text)
-        Quick.shared.used(it)
+        used(it)
         log("switch: swap to copy \(i + 1), \(p.text.count) → \(text.count) chars in \(front.bundleIdentifier ?? "?")")
-        arm(i, text)
+        arm(i, text, pid: p.pid)
     }
 
-    /// Under the caret (or the focused field), else in the upper third of the mouse's screen.
-    private func place() {
-        let h = NSScreen.screens.first?.frame.height ?? 0, p = SwitchView.pad
-        view.maxW = (NSScreen.main?.visibleFrame.width ?? 1400) - 16
-        let size = view.fit()
+    /// Under the caret (or the focused field), else in the upper third of the mouse's screen. The card sits 6 pt under
+    /// the caret line, or above it near the bottom; the panel round it holds the shadow's room.
+    private func placeQuick() {
+        let h = NSScreen.screens.first?.frame.height ?? 0, p = QuickView.pad
+        let size = QuickView.frameSize(self)
         var anchor: CGRect?
         if let app = origin, app.processIdentifier != getpid(), let el = Focus.focused() {
             AXUIElementSetMessagingTimeout(el, 0.08)
@@ -818,7 +814,6 @@ final class QuickSwitch {
         }
         if let a = anchor, let scr = NSScreen.screens.first(where: { $0.frame.contains(NSPoint(x: a.midX, y: h - a.midY)) }) {
             let vis = scr.visibleFrame
-            // the strip itself (inside the shadow's room `p`) sits 6 pt under the caret line, or above it near the bottom
             var y = h - a.maxY - 6 - size.height + p
             if y + p < vis.minY + 4 { y = h - a.minY + 6 - p }
             let x = min(max(a.minX - p, vis.minX - p + 4), vis.maxX - size.width + p - 4)
@@ -827,378 +822,7 @@ final class QuickSwitch {
         }
         let mouse = NSEvent.mouseLocation
         let vis = (NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main)?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        panel.setFrame(NSRect(x: vis.midX - size.width / 2, y: vis.maxY - vis.height / 3, width: size.width, height: size.height), display: false)
-    }
-}
-
-// MARK: drawing: the tape (look round "Tape", 14 November 2026; shared pieces in TapeDraw.swift). All of it here, so a
-// design round can replace these two views.
-
-final class QuickView: NSView {
-    weak var model: Quick?
-    override var isFlipped: Bool { true }
-    static let W: CGFloat = 480, G: CGFloat = 88, H: CGFloat = 438
-    static let headH: CGFloat = 36, footH: CGFloat = 8, rowH: CGFloat = 32, divH: CGFloat = 24, noticeH: CGFloat = 40
-    static var listY: CGFloat { headH + 1 }
-    static var listH: CGFloat { H - listY - footH }
-    static var size: NSSize { NSSize(width: W, height: H) }
-    static let side: CGFloat = 16
-    static var textX: CGFloat { G + side }
-    static var textW: CGFloat { W - G - side - side - 16 - 12 }
-    static var textFont: NSFont { PK.text(14) }   // asked each time: a theme can change the face
-
-    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
-    /// Whole rows in view at the last draw (the fix round measures the head with it).
-    var drawnRows = 0
-
-    // MARK: layout (only the rows in view are measured)
-
-    private func avail(_ m: Quick) -> CGFloat { Self.listH - (m.notice.isEmpty ? 0 : Self.noticeH) }
-
-    /// The hour (or day) divider above row i: only in time order (no query), never among the pins.
-    func divider(_ m: Quick, _ i: Int) -> String? {
-        guard m.query.isEmpty, i > 0, i < m.shown.count else { return nil }
-        let it = m.items[m.shown[i]], prev = m.items[m.shown[i - 1]]
-        if it.pinned { return nil }
-        return prev.pinned || TapeDraw.bucket(prev.at, now: m.now) != TapeDraw.bucket(it.at, now: m.now) ? TapeDraw.label(it.at, now: m.now) : nil
-    }
-    private func chosenH(_ m: Quick, _ it: QuickItem) -> CGFloat {
-        if m.mode == .rework { return rework(m, it, y: 0, draw: false) }
-        if it.clip != .text { return kindRow(m, it, y: 0, draw: false) }
-        let n = TapeDraw.lines(it.text, width: Self.textW, font: Self.textFont, lh: 20, max: 3)
-        return 8 + CGFloat(n) * 20 + 10 + (it.image ? 0 : TapeDraw.capH + 12)
-    }
-    static let pictureH: CGFloat = 96
-
-    /// The chosen link, file or picture row, unfolded: its line, the full address or path (a picture: the picture and
-    /// its read text), then its keys (ClipRules.actions, at most four). Returns the height.
-    @discardableResult
-    func kindRow(_ m: Quick, _ it: QuickItem, y y0: CGFloat, draw: Bool) -> CGFloat {
-        let x = Self.textX, w = Self.textW, f = Self.textFont
-        var y = y0 + 8
-        if it.clip == .image, !it.picture.isEmpty, let img = TapeDraw.thumb(History.clipURL(it.picture)) {
-            if draw { TapeDraw.picture(img, in: NSRect(x: x, y: y + 2, width: w, height: Self.pictureH)) }
-            y += 2 + Self.pictureH + 8
-        }
-        if draw { TapeDraw.clipLine(it.clip, text: it.text, title: it.title, bytes: it.bytes, ocr: "", NSRect(x: x, y: TapeDraw.lineTop(f, mid: y + 10), width: w, height: 20), font: f) }
-        y += 20
-        let more = it.clip == .image ? it.ocr.split(whereSeparator: \.isNewline).joined(separator: " ") : it.clip == .link ? it.text : (it.text as NSString).abbreviatingWithTildeInPath
-        if !more.isEmpty {
-            let f2 = PK.text(13), n = TapeDraw.lines(more, width: w, font: f2, lh: 18, max: 2)
-            if draw { TapeDraw.block(more, x: x, y: y + 2, width: w, font: f2, color: PK.muted, lh: 18, max: 2) }
-            y += 2 + CGFloat(n) * 18
-        }
-        let keys = m.actions(it)
-        if !keys.isEmpty {
-            y += 10
-            if draw { var ax = x; for a in keys.prefix(4) { ax = TapeDraw.keyWord(a.key, a.word, x: ax, y: y) } }
-            y += TapeDraw.capH + 12
-        } else { y += 10 }
-        return y - y0
-    }
-    private var chosenCache: (key: String, h: CGFloat)?
-    private func height(_ m: Quick, _ i: Int) -> CGFloat {
-        var h = Self.rowH
-        if i == m.sel {   // measured once per state of the chosen row
-            let it = m.items[m.shown[i]]
-            let key = "\(it.id)|\(m.mode)|\(m.run)|\(m.result.count)|\(m.cmds.count)|\(it.pinned)|\(it.ocr.count)"
-            if let c = chosenCache, c.key == key { h = c.h } else { h = chosenH(m, it); chosenCache = (key, h) }
-        }
-        return (divider(m, i) != nil ? Self.divH : 0) + h
-    }
-    /// The first row in view: the chosen row stays fully in view, and the view moves only when it has to (the scroll
-    /// anchor), so nothing jumps when the list changes; no empty tail at the end of the list.
-    func fitTop(_ m: Quick) -> Int {
-        let n = m.shown.count
-        guard n > 0 else { return 0 }
-        let room = avail(m)
-        var top = max(0, min(m.top, m.sel, n - 1))
-        func span(_ a: Int, _ b: Int) -> CGFloat {
-            var h: CGFloat = 0
-            for i in a...b { h += height(m, i); if h > room { break } }
-            return h
-        }
-        while top < m.sel, span(top, m.sel) > room { top += 1 }
-        while top > 0 {
-            var h = height(m, top - 1), i = top
-            while i < n, h <= room { h += height(m, i); i += 1 }
-            if h <= room { top -= 1 } else { break }
-        }
-        return top
-    }
-
-    // MARK: drawing
-
-    override func draw(_ dirty: NSRect) {
-        guard let m = model else { return }
-        let W = Self.W, G = Self.G, H = Self.H
-        TapeDraw.surface(bounds)
-        NSGraphicsContext.saveGraphicsState()
-        NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: max(0, PK.corner(3) - 1), yRadius: max(0, PK.corner(3) - 1)).addClip()
-
-        // head: the search glyph in the gutter, what he types, the four kind glyphs
-        PK.line.setFill(); NSRect(x: G - 1, y: 0, width: 1, height: H).fill()
-        TapeDraw.glyph("search", NSRect(x: G - 12 - 16, y: Self.headH / 2 - 8, width: 16, height: 16), color: PK.muted)
-        let kx = TapeDraw.kinds(right: W - 10, y: (Self.headH - 28) / 2) { k in m.kind.map { TapeKind($0) == k } ?? (k != .call) }
-        let qf = PK.text(14), qa = TapeDraw.at(qf, PK.ink, cut: .byTruncatingHead)
-        let qx = Self.textX, qw = kx - 10 - qx, qy = TapeDraw.lineTop(qf, mid: Self.headH / 2)
-        TapeDraw.line(m.query, NSRect(x: qx, y: qy, width: qw, height: 22), qa)
-        if m.mode == .list {
-            PK.blue.setFill()
-            NSRect(x: qx + min(qw, m.query.isEmpty ? 0 : TapeDraw.width(m.query, qa) + 1), y: Self.headH / 2 - 9, width: 2, height: 18).fill()
-        }
-        TapeDraw.hairline(x0: 0, x1: W, y: Self.headH)
-
-        // the tape
-        let y0 = Self.listY, room = avail(m)
-        m.top = fitTop(m)
-        NSGraphicsContext.saveGraphicsState()
-        NSRect(x: 0, y: y0, width: W, height: room).clip()
-        if m.shown.isEmpty {
-            let t = m.items.isEmpty ? "Nothing copied, typed or said yet" : "Nothing matches"
-            TapeDraw.line(t, NSRect(x: Self.textX, y: y0 + 10, width: Self.textW, height: 20), TapeDraw.at(PK.text(14), PK.muted))
-        }
-        var y = y0, i = m.top
-        drawnRows = 0
-        while i < m.shown.count, y < y0 + room {
-            if let l = divider(m, i) { drawDivider(l, y: y); y += Self.divH }
-            let it = m.items[m.shown[i]], on = i == m.sel
-            let h = on ? chosenH(m, it) : Self.rowH
-            drawRow(m, it, y: y, h: h, on: on)
-            y += h; i += 1
-            if y <= y0 + room { drawnRows += 1 }
-        }
-        if m.shown.count > i - m.top, m.shown.count > 0 {   // where the view is when the list runs longer
-            let n = CGFloat(m.shown.count), vis = CGFloat(i - m.top)
-            let th = max(18, (room - 8) * vis / n), ty = y0 + 4 + (room - 8 - th) * CGFloat(m.top) / max(1, n - vis)
-            PK.rule.setFill(); NSBezierPath(roundedRect: NSRect(x: W - 5, y: ty, width: 3, height: th), xRadius: 1.5, yRadius: 1.5).fill()
-        }
-        PK.line.setFill(); NSRect(x: G - 1, y: y0, width: 1, height: room).fill()   // the gutter's hairline, unbroken by dividers
-        NSGraphicsContext.restoreGraphicsState()
-        if !m.notice.isEmpty { drawNotice(m.notice, y: y0 + room) }
-        NSGraphicsContext.restoreGraphicsState()
-    }
-
-    private func drawDivider(_ label: String, y: CGFloat) {
-        let a = TapeDraw.at(PK.mono(11), PK.faint), f = PK.mono(11)
-        (label as NSString).draw(at: NSPoint(x: Self.G - 12 - TapeDraw.width(label, a), y: TapeDraw.lineTop(f, mid: y + Self.divH / 2)), withAttributes: a)
-        TapeDraw.hairline(x0: Self.textX, x1: Self.W - Self.side, y: y + Self.divH / 2)
-    }
-
-    private func drawRow(_ m: Quick, _ it: QuickItem, y: CGFloat, h: CGFloat, on: Bool) {
-        let W = Self.W, G = Self.G
-        if on { TapeDraw.lift.setFill(); NSRect(x: 0, y: y, width: W, height: h).fill() }
-        let gy: CGFloat = on ? 10 : (Self.rowH - 16) / 2   // the glyphs sit on the first line of text
-        TapeDraw.gutter(NSRect(x: 0, y: y, width: G, height: h), kind: TapeKind(it.kind), time: it.pinned ? nil : TapeDraw.time(it.at),
-                        mark: TapeDraw.clipMark(it.clip), chosen: on, top: gy)
-        if it.pinned { TapeDraw.glyph("bookmark", NSRect(x: G - 12 - 16 - 8 - 16, y: y + gy, width: 16, height: 16), color: on ? PK.ink : PK.muted) }
-        if let a = TapeDraw.appMark(it.app) { TapeDraw.glyph(a, NSRect(x: W - Self.side - 16, y: y + gy, width: 16, height: 16), color: on ? PK.muted : PK.faint) }
-        let x = Self.textX, w = Self.textW
-        guard on else {
-            let f = Self.textFont
-            var tx = x, tw = w
-            if it.clip == .image, !it.picture.isEmpty, let img = TapeDraw.thumb(History.clipURL(it.picture)) {
-                let r = TapeDraw.picture(img, in: NSRect(x: x, y: y + 4, width: 48, height: Self.rowH - 8))
-                tx = r.maxX + 10; tw = w - (tx - x)
-            }
-            if TapeDraw.clipLine(it.clip, text: it.text, title: it.title, bytes: it.bytes, ocr: it.ocr,
-                                 NSRect(x: tx, y: TapeDraw.lineTop(f, mid: y + Self.rowH / 2), width: tw, height: 20), font: f) { return }
-            TapeDraw.line(it.first, NSRect(x: x, y: TapeDraw.lineTop(f, mid: y + Self.rowH / 2), width: w, height: 20),
-                      TapeDraw.at(f, it.image ? PK.muted : PK.ink, cut: it.single ? .byTruncatingMiddle : .byTruncatingTail))
-            return
-        }
-        if m.mode == .rework { _ = rework(m, it, y: y, draw: true); return }
-        if it.clip != .text { kindRow(m, it, y: y, draw: true); return }
-        let n = TapeDraw.lines(it.text, width: w, font: Self.textFont, lh: 20, max: 3)
-        TapeDraw.block(it.text, x: x, y: y + 8, width: w, font: Self.textFont, color: it.image ? PK.muted : PK.ink, lh: 20, max: 3)
-        guard !it.image else { return }
-        let ay = y + 8 + CGFloat(n) * 20 + 10
-        var ax = TapeDraw.keyWord("↵", "paste", x: x, y: ay)
-        ax = TapeDraw.keyWord("⇥", "rewrite", x: ax, y: ay)
-        let extra = m.actions(it)   // a text holding a link or a path: that one's keys (four keycaps at most)
-        if extra.isEmpty { TapeDraw.keyWord("⌘P", it.pinned ? "unpin" : "pin", x: ax, y: ay) }
-        else { for a in extra.prefix(2) { ax = TapeDraw.keyWord(a.key, a.word, x: ax, y: ay) } }
-    }
-
-    private static func verb(_ c: Quick.Cmd) -> String {
-        switch c.id {
-        case "plain": return "plain"
-        case "oneline": return "one line"
-        case "quote": return "quote"
-        case "translate": return c.hint.contains("English") ? "→ EN" : c.hint.contains("Україн") ? "→ UA" : "translate"
-        default: return c.name.lowercased()
-        }
-    }
-
-    /// Rewrite, unfolded under the chosen row: his text (struck lightly above the result once one came back), the
-    /// verbs as numbered keycaps (1-3 on this Mac; below the hairline the rework list, with the cloud glyph when it
-    /// goes to Claude), the field for his own words, and what ⏎ and ⌫ do with the length change. Returns the height.
-    @discardableResult
-    func rework(_ m: Quick, _ it: QuickItem, y y0: CGFloat, draw: Bool) -> CGFloat {
-        let x = Self.textX, w = Self.textW
-        var y = y0 + 8
-        if m.run == .result {
-            let f1 = PK.text(13), n1 = TapeDraw.lines(it.text, width: w, font: f1, lh: 18, max: 2)
-            if draw { TapeDraw.block(it.text, x: x, y: y + 2, width: w, font: f1, color: PK.muted, lh: 18, max: 2, strike: PK.faint) }
-            y += 2 + CGFloat(n1) * 18 + 6
-            let f2 = PK.text(15), n2 = TapeDraw.lines(m.result, width: w, font: f2, lh: 22, max: 4)
-            if draw { TapeDraw.block(m.result, x: x, y: y, width: w, font: f2, color: PK.ink, lh: 22, max: 4) }
-            y += CGFloat(n2) * 22 + 10
-        } else {
-            let n = TapeDraw.lines(it.text, width: w, font: Self.textFont, lh: 20, max: 3)
-            if draw { TapeDraw.block(it.text, x: x, y: y, width: w, font: Self.textFont, color: PK.ink, lh: 20, max: 3) }
-            y += CGFloat(n) * 20 + 8
-            if m.run == .working || m.run == .failed {
-                let s = m.resultName.lowercased() + (m.run == .working ? " · writing…" : " · nothing new came back")
-                if draw { TapeDraw.line(s, NSRect(x: x, y: y, width: w, height: 18), TapeDraw.at(PK.text(13), PK.muted)) }
-                y += 24
-            }
-        }
-        // the verbs: four to a line, "/ own" closes the first line (the three on this Mac)
-        if draw { TapeDraw.hairline(x0: x, x1: x + w, y: y) }
-        y += 2 + 10
-        let gap: CGFloat = 8, colW = (w - 3 * gap) / 4, rowStep = TapeDraw.capH + 8
-        let cloud = m.cmds.contains { $0.cloud }
-        func cell(_ c: Int) -> (CGFloat, CGFloat) {
-            let r = c / 4
-            return (x + CGFloat(c % 4) * (colW + gap), y + CGFloat(r) * rowStep + (r > 0 ? 12 : 0))
-        }
-        let cells = m.cmds.count + 1
-        if draw {
-            for (i, c) in m.cmds.enumerated() {
-                let (cx, cy) = cell(i < 3 ? i : i + 1)
-                let ok = m.usable(c)
-                let key = i < 10 ? "\((i + 1) % 10)" : "·"
-                let kw = TapeDraw.keycap(key, x: cx, y: cy, on: i == m.rsel && m.custom.isEmpty)
-                TapeDraw.line(Self.verb(c), NSRect(x: cx + kw + 7, y: cy + 4, width: colW + gap - kw - 9, height: 18), TapeDraw.at(PK.text(13), ok ? PK.ink : PK.faint))
-            }
-            let (ox, oy) = cell(min(3, cells - 1))
-            let kw = TapeDraw.keycap("/", x: ox, y: oy, on: !m.custom.isEmpty)
-            TapeDraw.line("own", NSRect(x: ox + kw + 7, y: oy + 4, width: colW - kw - 7, height: 18), TapeDraw.at(PK.text(13), PK.ink))
-            if m.cmds.count > 3 {
-                let ry = y + rowStep + 2
-                TapeDraw.hairline(x0: x, x1: x + w - (cloud ? 24 : 0), y: ry)
-                if cloud { TapeDraw.glyph("cloud", NSRect(x: x + w - 16, y: ry - 8, width: 16, height: 16), color: PK.muted) }
-            }
-        }
-        let rows = (cells + 3) / 4
-        y += CGFloat(rows) * rowStep + (rows > 1 ? 12 : 0) - 8 + 12
-        // his own words
-        if draw {
-            let r = NSRect(x: x, y: y, width: w, height: 32)
-            let b = NSBezierPath(roundedRect: r.insetBy(dx: 0.5, dy: 0.5), xRadius: PK.corner(2), yRadius: PK.corner(2))
-            PK.card.setFill(); b.fill(); PKColors.controlEdge.setStroke(); b.lineWidth = 1; b.stroke()
-            let sa = TapeDraw.at(PK.mono(13), PK.faint), f = PK.text(14)
-            ("/" as NSString).draw(at: NSPoint(x: r.minX + 10, y: TapeDraw.lineTop(PK.mono(13), mid: r.midY)), withAttributes: sa)
-            let ta = TapeDraw.at(f, m.custom.isEmpty ? PK.faint : PK.ink, cut: .byTruncatingHead)
-            let tx = r.minX + 26, tw = r.width - 36
-            TapeDraw.line(m.custom.isEmpty ? "your own words" : m.custom, NSRect(x: tx, y: TapeDraw.lineTop(f, mid: r.midY), width: tw, height: 20), ta)
-            if m.run != .working {
-                PK.blue.setFill()
-                NSRect(x: tx + (m.custom.isEmpty ? -3 : min(tw, TapeDraw.width(m.custom, ta) + 1)), y: r.midY - 9, width: 2, height: 18).fill()
-            }
-        }
-        y += 32
-        if m.run == .result {
-            y += 10
-            if draw {
-                var ax = TapeDraw.keyWord("↵", "paste new", x: x, y: y)
-                ax = TapeDraw.keyWord("⌫", "back to old", x: ax, y: y)
-                let s = "\(it.text.count) → \(m.result.count)", a = TapeDraw.at(PK.mono(12), PK.muted)
-                (s as NSString).draw(at: NSPoint(x: x + w - TapeDraw.width(s, a), y: TapeDraw.lineTop(PK.mono(12), mid: y + 12)), withAttributes: a)
-            }
-            y += TapeDraw.capH
-        }
-        return y + 12 - y0
-    }
-
-    /// The one line that says what just happened and how to take it back.
-    private func drawNotice(_ s: String, y: CGFloat) {
-        let W = Self.W, G = Self.G, h = Self.noticeH
-        PK.card.setFill(); NSRect(x: G, y: y, width: W - G, height: h).fill()
-        TapeDraw.hairline(x0: 0, x1: W, y: y)
-        let a = TapeDraw.at(PK.text(13), PK.muted), f = PK.text(13)
-        let parts = s.components(separatedBy: " · ⌘Z ")
-        var x = Self.textX
-        let ty = TapeDraw.lineTop(f, mid: y + h / 2)
-        (parts[0] as NSString).draw(at: NSPoint(x: x, y: parts.count > 1 ? y + (h - TapeDraw.capH) / 2 + 4 : ty), withAttributes: a)
-        if parts.count > 1 {
-            x += TapeDraw.width(parts[0], a) + 12
-            TapeDraw.keyWord("⌘Z", parts[1], x: x, y: y + (h - TapeDraw.capH) / 2)
-        }
-    }
-}
-
-/// The paste switcher: five short cards in a row: the kind's glyph, the app and the time on top, the text on two lines;
-/// the chosen card is raised with the one shadow and a 2 pt edge in the kind's colour along its top.
-final class SwitchView: NSView {
-    weak var model: QuickSwitch?
-    override var isFlipped: Bool { true }
-    /// One slim strip: `stripH` high, chips of text only. The chosen chip shows up to `chosenW` of text (about 100
-    /// characters), the others about 28 characters (`otherW`). `pad` leaves room for the one float shadow.
-    static let stripH: CGFloat = 36, chipH: CGFloat = 28, inset: CGFloat = 4, gap: CGFloat = 2, side: CGFloat = 10, mark: CGFloat = 12
-    static let chosenW: CGFloat = 600, otherW: CGFloat = 172, pad: CGFloat = 16
-    static var H: CGFloat { stripH + 2 * pad }
-    static var font: NSFont { PK.text(13) }
-    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
-
-    /// The chips that fit on the screen (at least three), from the first, each with its width.
-    private(set) var chips: [(i: Int, w: CGFloat)] = []
-    var maxW: CGFloat = 1400
-
-    /// The whole text on one line (its lines joined), so a list shows more than its first item.
-    static func flat(_ it: QuickItem) -> String {
-        it.single ? it.first : it.text.prefix(600).split(whereSeparator: \.isNewline)
-            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.joined(separator: " ")
-    }
-    private func textW(_ it: QuickItem, on: Bool) -> CGFloat {
-        min(on ? Self.chosenW : Self.otherW, TapeDraw.width(Self.flat(it), TapeDraw.at(Self.font, PK.ink)))
-    }
-    private func chipW(_ it: QuickItem, on: Bool) -> CGFloat {
-        2 * Self.side + textW(it, on: on) + (on ? Self.mark + 6 : 0)
-    }
-
-    func fit() -> NSSize {
-        guard let m = model else { return .zero }
-        chips = []
-        var w = 2 * Self.pad + 2 * Self.inset - Self.gap
-        for (i, it) in m.rows.enumerated() {
-            let cw = chipW(it, on: i == m.sel)
-            if chips.count >= 3, w + cw + Self.gap > maxW, i > m.sel { break }
-            chips.append((i, cw)); w += cw + Self.gap
-        }
-        frame = NSRect(x: 0, y: 0, width: ceil(w), height: Self.H)
-        return frame.size
-    }
-
-    override func draw(_ dirty: NSRect) {
-        guard let m = model else { return }
-        let strip = NSRect(x: Self.pad, y: Self.pad, width: bounds.width - 2 * Self.pad, height: Self.stripH)
-        NSGraphicsContext.saveGraphicsState()
-        PK.floatShadow().set()
-        PK.card.setFill(); NSBezierPath(roundedRect: strip, xRadius: PK.corner(3), yRadius: PK.corner(3)).fill()
-        NSGraphicsContext.restoreGraphicsState()
-        TapeDraw.surface(strip)
-        var x = strip.minX + Self.inset
-        for c in chips {
-            let it = m.rows[c.i], on = c.i == m.sel
-            let r = NSRect(x: x, y: strip.minY + Self.inset, width: c.w, height: Self.chipH)
-            var tx = r.minX + Self.side
-            if on {
-                let box = NSBezierPath(roundedRect: r, xRadius: PK.corner(2), yRadius: PK.corner(2))
-                NSGraphicsContext.saveGraphicsState(); box.addClip()
-                TapeDraw.lift.setFill(); box.fill()
-                TapeKind(it.kind).color.setFill(); NSRect(x: r.minX, y: r.minY, width: TapeDraw.edge, height: r.height).fill()
-                NSGraphicsContext.restoreGraphicsState()
-                TapeDraw.glyph(it.single && it.first.contains("://") ? "globe" : TapeKind(it.kind).mark,
-                               NSRect(x: tx, y: r.midY - Self.mark / 2, width: Self.mark, height: Self.mark), color: PK.ink)
-                tx += Self.mark + 6
-            }
-            let a = TapeDraw.at(Self.font, on ? PK.ink : PK.muted, cut: it.single ? .byTruncatingMiddle : .byTruncatingTail)
-            let tw = textW(it, on: on)
-            TapeDraw.line(Self.flat(it), NSRect(x: tx, y: TapeDraw.lineTop(Self.font, mid: r.midY), width: tw, height: 20), a)
-            x += c.w + Self.gap
-        }
+        panel.setFrame(NSRect(x: vis.midX - size.width / 2, y: vis.maxY - vis.height / 3 - size.height / 2, width: size.width, height: size.height), display: false)
     }
 }
 
@@ -1287,11 +911,12 @@ extension Quick {
         self.now = now
         let dark = PK.dark ? "-dark" : ""
         func shot(_ name: String) throws {
+            view.frame = NSRect(origin: .zero, size: QuickView.frameSize(self))
             view.needsDisplay = true
             guard let rep = UIShots.bitmap(view), let d = rep.representation(using: .png, properties: [:]) else { throw NSError(domain: "Quick", code: 1) }
             try d.write(to: URL(fileURLWithPath: folder + "/quick-\(name)\(dark).png"))
         }
-        func reset() { query = ""; kind = nil; sel = 0; top = 0; mode = .list; notice = ""; custom = ""; run = .menu }
+        func reset() { look = .full; query = ""; kind = nil; sel = 0; top = 0; mode = .list; notice = ""; custom = ""; run = .menu; formIx = 0; formsFor = nil }
         let rows = Self.sampleRows(1000, now: now)
         load(rows, pins: [QuickPin(kind: .copied, text: "Room 4.12, second floor, the door on the left", app: "Mail", at: now - 50 * 60)])
         isOpen = true
@@ -1320,23 +945,22 @@ extension Quick {
         try kindsPreview(now: now, shot: shot, reset: reset)
         try Capture.preview(folder, dark: dark)
         load(rows, pins: [QuickPin(kind: .copied, text: "Room 4.12, second floor, the door on the left", app: "Mail", at: now - 50 * 60)])
-        // the paste switcher: just opened, the third chosen, turned into the panel by typing "r"
-        reset(); refilter()
-        try QuickSwitch.shared.preview(folder, dark: dark, from: items)
-        reset(); query = "r"; refilter(); try shot("from-switch")
+        // the quick form (⌘⇧V held): just opened, the third chosen, then turned full by typing "r"
+        reset(); look = .quick; refilter(); try shot("switch-open")
+        sel = 2; try shot("switch-third")
+        look = .full; held = true; query = "r"; refilter(); try shot("from-switch")
+        held = false
+        // written forms (← →) on a copy that is one thing: full and quick
+        let formRows = [QuickItem(kind: .copied, text: "20.11.2026", app: "Mail", at: now - 30),
+                        QuickItem(kind: .copied, text: "1 250,50 EUR", app: "Notes", at: now - 4 * 60),
+                        QuickItem(kind: .copied, text: "Room 4.12, second floor, the door on the left", app: "Mail", at: now - 50 * 60)]
+        load(formRows); reset(); refilter()
+        print("quick forms: \"\(formRows[0].text)\" has \(forms(items[shown[0]]).forms.count), \"\(formRows[1].text)\" has \(forms(items[shown[1]]).forms.count)")
+        formsFor = nil; _ = forms(items[shown[0]]); formIx = 0; try shot("forms")
+        stepForm(1); try shot("forms-next")
+        stepForm(1); try shot("forms-third")
+        look = .quick; refilter(); sel = 0; formsFor = nil; _ = forms(items[shown[0]]); formIx = 0; stepForm(1); try shot("switch-forms")
         load([]); reset(); refilter(); try shot("empty")
         isOpen = false; raw = []; items = []; shown = []; stamps = []
-    }
-}
-
-extension QuickSwitch {
-    func preview(_ folder: String, dark: String, from items: [QuickItem]) throws {
-        rows = Array(items.filter { $0.kind == .copied && !$0.image && !$0.pinned }.prefix(Self.count))
-        for (name, i) in [("switch-open", 0), ("switch-third", 2)] {
-            sel = i; _ = view.fit(); view.needsDisplay = true
-            guard let rep = UIShots.bitmap(view), let d = rep.representation(using: .png, properties: [:]) else { throw NSError(domain: "Quick", code: 2) }
-            try d.write(to: URL(fileURLWithPath: folder + "/quick-\(name)\(dark).png"))
-        }
-        rows = []
     }
 }

@@ -28,7 +28,7 @@ class SharedState(unittest.TestCase):
         gate = Mock(return_value={'boost': .3})
         path = Mock()
         path.stat.return_value = types.SimpleNamespace(st_mtime=123)
-        ns = functions('builder_for', 'gate', 'fitted', DEFAULTS=None, Builder=builder, model=object(), builders={},
+        ns = functions('builder_for', 'gate', 'gate_file', 'fitted', DEFAULTS=None, Builder=builder, model=object(), builders={},
                        BUILDERS_LOCK=threading.Lock(), GATE_LOCK=threading.Lock(), GATE={'mtime': 0},
                        gatecore=types.SimpleNamespace(load=gate))
         class Folder:

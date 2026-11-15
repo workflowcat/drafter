@@ -260,27 +260,6 @@ struct CallDoc: Identifiable, Hashable {
         return out
     }
 
-    /// A search across recordings, for an agent: the matching lines of each, and where to read the rest.
-    static func handoff(search q: String, docs: [CallDoc], perDoc: Int = 8) -> String {
-        let terms = CallDoc.terms(q)
-        let lines = docs.reduce(0) { $0 + $1.hits(terms).count }
-        var out = ["From my recorded calls and notes, search «\(q)»: \(docs.count) recording\(docs.count == 1 ? "" : "s"), \(lines) matching line\(lines == 1 ? "" : "s").", ""]
-        for d in docs {
-            out.append("## «\(d.title)» · \(d.kind.lowercased()) · \(CallDoc.day.string(from: d.started))" + (d.people.isEmpty ? "" : " · with \(d.people.joined(separator: ", "))"))
-            out.append((d.live ? "Still recording, live text so far: " + d.dir.appendingPathComponent("live.txt").path
-                        : "Everything said: " + d.dir.appendingPathComponent("brief.md").path) + (d.note.isEmpty ? "" : " · summary: " + d.note))
-            let hits = d.hits(terms)
-            if hits.isEmpty { out += d.points.prefix(3).map { "- " + $0 } }
-            for t in hits.sorted(by: { $0.id < $1.id }).prefix(perDoc) {
-                let text = t.text.count > 320 ? String(t.text.prefix(317)) + "…" : t.text
-                out.append("- " + [t.start.map { "[\(Brief.stamp($0))]" }, CallDoc.who(t.who).isEmpty ? nil : CallDoc.who(t.who) + ":", text].compactMap { $0 }.joined(separator: " "))
-            }
-            if hits.count > perDoc { out.append("- … \(hits.count - perDoc) more in the brief") }
-            out.append("")
-        }
-        return out.joined(separator: "\n")
-    }
-
     /// Rows for brief.md when the folder has none yet (a recording without screenshots, or an older one).
     var briefRows: [Brief.Row] { turns.map { Brief.Row(who: $0.who, start: $0.start ?? 0, text: $0.text) } }
 }

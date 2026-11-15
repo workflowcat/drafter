@@ -176,7 +176,7 @@ enum Proof {
                       settled({ Focus.range(el).map { $0.location == at && $0.length == e.len } ?? false }) else {
                     log("proofread: selection did not take (range)"); finish(); return
                 }
-                if !p.web, AXUIElementSetAttributeValue(el, kAXSelectedTextAttribute as CFString, e.new as CFString) == .success {
+                if !p.web, Focus.setSelectedText(el, e.new) == .success {
                     done.append(e); step(i + 1); return
                 }
             }

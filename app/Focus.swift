@@ -13,6 +13,10 @@ struct Spot {
     let rect: CGRect?          // caret, in AX (top-left) screen coordinates
     let role: String
     var viaMarkers = false     // rich editor read through text markers: insert by paste only
+    /// Mid-line (setting `midLine`, 2026-11-15): the rest of the caret's line, not blank, at a gap between words
+    /// (GhostRules.midLineOK). Empty and `mid` false everywhere else.
+    var lineAfter = ""
+    var mid = false
 }
 
 enum Focus {
@@ -240,7 +244,10 @@ enum Focus {
     }
 
     /// Nil when Drafter must stay quiet: skipped app, password field, a selection, or the caret is not at a line end.
-    static func spot(skip: [String]) -> (Spot?, String) {
+    /// `midLine`: the ghost paths in Keys pass the setting; then a caret at a gap mid-line gives a spot with `mid` set
+    /// (GhostRules.midLineOK). Native fields use their value and range; Chromium and Electron only their text markers
+    /// (their value miscounts line breaks); a web field with no markers or no caret rect stays "mid-line".
+    static func spot(skip: [String], midLine: Bool = false) -> (Spot?, String) {
         guard let app = NSWorkspace.shared.frontmostApplication else { return (nil, "no app") }
         lastApp = app
         if offLimits(pid: app.processIdentifier) { return (nil, "own app") }
@@ -257,7 +264,8 @@ enum Focus {
            let (b, a, rect) = markers(el), !(b.isEmpty && a.isEmpty) {
             if !a.isEmpty, !a.hasPrefix("\n"), !a.trimmingCharacters(in: .whitespaces).isEmpty,
                a.first.map({ !$0.isNewline }) ?? false, !(a.components(separatedBy: "\n").first ?? "").trimmingCharacters(in: .whitespaces).isEmpty {
-                return (nil, "mid-line")
+                guard midLine, let sp = midSpot(app, el, before: b, after: a, rect: rect, role: role, markers: true) else { return (nil, "mid-line") }
+                return (sp, "ok")
             }
             var sp = Spot(app: app, el: el, value: b + a, caret: (b as NSString).length, before: b, title: windowTitle(app), rect: rect, role: role)
             sp.viaMarkers = true
@@ -274,7 +282,8 @@ enum Focus {
                 // Chromium (the Claude app) counts each line break in the value but not in the caret offset, so after a
                 // break the caret reads a letter early and Drafter stayed quiet for the rest of the message (2026-11-01:
                 // «…styling of it \nl», caret before the l). The text markers give the two sides as they are.
-                if let (b, a, mrect) = markers(el), a.isEmpty || a.hasPrefix("\n") || (a.components(separatedBy: "\n").first ?? "").trimmingCharacters(in: .whitespaces).isEmpty {
+                let m = markers(el)
+                if let (b, a, mrect) = m, a.isEmpty || a.hasPrefix("\n") || (a.components(separatedBy: "\n").first ?? "").trimmingCharacters(in: .whitespaces).isEmpty {
                     let squash = { (t: String) in String(t.filter { !$0.isWhitespace }.suffix(16)) }
                     // at the very end: the plain value keeps his line breaks (markers may not), when both end alike
                     let atEnd = a.isEmpty && squash(value) == squash(b)
@@ -283,12 +292,32 @@ enum Focus {
                     sp.viaMarkers = true
                     return (sp, mrect == nil ? "no caret rect" : "ok")
                 }
+                if midLine {
+                    // markers are the truth where there are any; a web field without them is not trusted mid-line
+                    if let (b, a, mrect) = m {
+                        if let sp = midSpot(app, el, before: b, after: a, rect: mrect, role: role, markers: true) { return (sp, "ok") }
+                    } else if !isWeb(app), let sp = midSpot(app, el, before: ns.substring(to: caret), after: rest,
+                                                             rect: caretRect(el, caret, ns), role: role, markers: false, value: value, caret: caret) {
+                        return (sp, "ok")
+                    }
+                }
                 return (nil, "mid-line")
             }
         }
         let before = ns.substring(to: caret)
         let rect = caretRect(el, caret, ns)
         return (Spot(app: app, el: el, value: value, caret: caret, before: before, title: windowTitle(app), rect: rect, role: role), rect == nil ? "no caret rect" : "ok")
+    }
+
+    /// A spot for a caret mid-line, or nil (inside a word, a long rest, no caret rect: GhostRules.midLineOK).
+    private static func midSpot(_ app: NSRunningApplication, _ el: AXUIElement, before b: String, after a: String, rect: CGRect?,
+                                role: String, markers: Bool, value: String? = nil, caret: Int? = nil) -> Spot? {
+        let rest = GhostRules.lineRest(a)
+        guard let rect, GhostRules.midLineOK(before: b, rest: rest) else { return nil }
+        var sp = Spot(app: app, el: el, value: value ?? b + a, caret: caret ?? (b as NSString).length, before: b,
+                      title: windowTitle(app), rect: rect, role: role)
+        sp.viaMarkers = markers; sp.lineAfter = rest; sp.mid = true
+        return sp
     }
 
     /// The text on screen just before the field: the conversation he is answering (chat apps, Claude, mail).
@@ -400,6 +429,32 @@ enum Focus {
     // MARK: insert
 
     static let mark: Int64 = 0x7479_7069   // "typi": our own key events, the tap lets them pass
+    /// Characters put into fields other than by his letter keys (every write Drafter makes, and his ⌘V): a draft's
+    /// length may come from them (DraftCaptureRules, Keys.keepDraft). Only `wrote` adds to it; every write path in the
+    /// app goes through `setSelectedText`, `typeText` or `commandV`, which call it (tests/test_draft_writes.py).
+    private(set) static var ownChars = 0
+    static func wrote(_ n: Int) { stateLock.lock(); ownChars += n; stateLock.unlock() }
+
+    /// The one AX text write (replaces the selection, or puts text at the caret), counted.
+    @discardableResult
+    static func setSelectedText(_ el: AXUIElement, _ text: String) -> AXError {
+        if offLimits(el) { return .cannotComplete }   // never its own window off the main thread
+        let r = AXUIElementSetAttributeValue(el, kAXSelectedTextAttribute as CFString, text as CFString)
+        if r == .success { wrote(text.count) }
+        return r
+    }
+
+    /// ⌘V into the front app, marked as Drafter's own so the tap lets it through; the clipboard's text is counted.
+    static func commandV() {
+        wrote(NSPasteboard.general.string(forType: .string)?.count ?? 0)
+        let src = CGEventSource(stateID: .hidSystemState)
+        for down in [true, false] {
+            let e = CGEvent(keyboardEventSource: src, virtualKey: 9, keyDown: down)   // V
+            e?.flags = .maskCommand
+            e?.setIntegerValueField(.eventSourceUserData, value: mark)
+            e?.post(tap: .cghidEventTap)
+        }
+    }
 
     /// Electron and Chromium apps (Codex, Claude, Beeper, Slack, browsers): an AX write can show in the box while the
     /// page never hears of it (2026-10-21, Codex: the text was not really in the composer), so they always get a paste.
@@ -434,7 +489,7 @@ enum Focus {
     static func insert(_ text: String, at spot: Spot) -> String {
         // a rich editor read through markers has no value to check an AX write against: paste only
         if spot.viaMarkers || isWeb(spot.app) || offLimits(spot.el) { paste(text); return "paste" }
-        if AXUIElementSetAttributeValue(spot.el, kAXSelectedTextAttribute as CFString, text as CFString) == .success,
+        if setSelectedText(spot.el, text) == .success,
            let v: String = attr(spot.el, kAXValueAttribute), (v as NSString).length == (spot.value as NSString).length + (text as NSString).length,
            (v as NSString).substring(to: spot.caret) == spot.before {
             return "ax"
@@ -451,6 +506,7 @@ enum Focus {
         if text.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7F || $0.value == 0x85 || $0.value == 0x2028 || $0.value == 0x2029 }) {
             paste(text); return
         }
+        wrote(text.count)
         let src = CGEventSource(stateID: .hidSystemState)
         let units = Array(text.utf16)
         var i = 0
@@ -493,8 +549,11 @@ enum Focus {
     private static var owed: (items: [NSPasteboardItem], count: Int)?
 
     /// `write`: puts other types instead of the text (a picture, a file URL; round three), the same way back.
+    /// Told of each text Drafter pastes (the app sets it to PasteWatch.own; a pure test leaves it nil).
+    static var pasted: ((String) -> Void)?
     static func paste(_ text: String, restore: Bool = true, write: ((NSPasteboard) -> Void)? = nil) {
         let pb = NSPasteboard.general
+        if write == nil { pasted?(text) }   // the paste trail (soft round, PasteWatch.own): where Drafter put a text, no text kept
         // a second paste before the first one put his clipboard back (Backspace right after a rework): what is on the
         // clipboard now is Drafter's own text, so the one to give back is still the first one's (Codex review 2026-11-01)
         let saved: [NSPasteboardItem]
@@ -512,13 +571,7 @@ enum Focus {
         pb.setString("1", forType: History.ownType)   // Drafter's own: the clipboard history skips it
         let mine = pb.changeCount
         if restore { owed = (saved, mine) }
-        let src = CGEventSource(stateID: .hidSystemState)
-        for down in [true, false] {
-            let e = CGEvent(keyboardEventSource: src, virtualKey: 9, keyDown: down)   // V
-            e?.flags = .maskCommand
-            e?.setIntegerValueField(.eventSourceUserData, value: mark)
-            e?.post(tap: .cghidEventTap)
-        }
+        commandV()
         DispatchQueue.main.asyncAfter(deadline: .now() + restoreDelay) {
             guard restore, pb.changeCount == mine else { return }   // he copied something meanwhile (or another paste came): keep that
             owed = nil

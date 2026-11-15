@@ -40,6 +40,16 @@ struct TypedListChecks {
                                                       row(base + 4 * 3600, "please send the contract by friday"), row(base + 4 * 3600 + 30, "please send the contract by monday")])
         check(later.count == 2, "same words hours apart fold; an edit near the end folds: \(later.map(\.text))")
         check(later.first?.text == "please send the contract by monday" && later.first?.drafts == ["please send the contract by friday"], "the edited version stands")
+        // how long it took (window round two): from the first kept draft, or a row's first key ("t0")
+        check(first?.started?.timeIntervalSince1970 == base, "started: the first draft of the message")
+        let one = TypedList.build(sent: [["t": base + 50, "t0": base + 8, "text": "a line typed in one go here", "app": "Chat"]], drafts: [])
+        check(one.first?.started?.timeIntervalSince1970 == base + 8, "started: the row's first key")
+        check(TypedList.build(sent: [row(base, "a single line with no stamps")], drafts: []).first?.started == nil, "no stamps: nothing")
+        // the estimate mark and the sent line (soft round): carried by the row shown
+        let estRows = TypedList.build(sent: [["t": 5000.0, "text": "a sent line about the station", "app": "Mail"]],
+                                      drafts: [["t": 9000.0, "text": "the end of a long draft he left", "app": "Notes", "est": true]])
+        check(estRows.first { $0.app == "Notes" }?.est == true && estRows.first { $0.app == "Notes" }?.sent == false, "est draft")
+        check(estRows.first { $0.app == "Mail" }?.sent == true && estRows.first { $0.app == "Mail" }?.est == false, "sent line")
         print("typed list: all checks passed")
     }
 }

@@ -9,8 +9,27 @@ enum Clip {
     static let cues: Set<String> = ["link", "links", "url", "here", "here's", "heres", "лінк", "лінка", "лінку", "посилання",
                                     "ось", "от", "тут", "тримай", "тримайте", "лови", "ловіть", "глянь", "гляньте", "дивись"]
 
-    static func copied(_ text: String, from app: String) { last = (text, app, Date(), false) }
+    static func copied(_ text: String, from app: String) {
+        last = (text, app, Date(), false)
+        ClipForms.copied(text, app: app)
+    }
     static func used() { last?.used = true }
+
+    /// Clipboard context (parity round, setting `clipContext`): the fresh copy for the ghost's prompt, or nil
+    /// (ClipContext.pick). Logged once per copy, numbers and a reason word only.
+    private static var logged: Date?
+    static func forPrompt(_ before: String) -> String? {
+        let st = Drafter.shared.settings
+        let r = ClipContext.pick(last?.text, copiedAt: last?.at, from: last?.app ?? "", now: Date(), on: st.clipContext, skip: st.skip,
+                                 secret: last.map { QuickRules.isSecret($0.text, History.secretRules()) } ?? false, before: before)
+        if let at = last?.at, logged != at, r.why != .stale, r.why != .off, r.why != .pasted {
+            logged = at
+            log(r.text.map { "clip context: \($0.count) chars" } ?? "clip context: left out (\(r.why?.rawValue ?? "?"))")
+        }
+        return r.text
+    }
+    /// The copy chip put another form on the clipboard (or back the original): the caret chip offers that text.
+    static func replaced(_ text: String) { last?.text = text }
 
     static func offer(_ s: Spot) -> [String: Any]? {
         guard let c = last, !c.used, Date().timeIntervalSince(c.at) < 180, c.app != (s.app.bundleIdentifier ?? "") else { return nil }
@@ -30,4 +49,82 @@ enum Clip {
         return ["id": "snippet", "chip": "⇥ \(isLink ? "Copied link" : "Copied") · \(short)",
                 "run": ["kind": "expand", "old": "", "new": new, "key": "clip"]]
     }
+}
+
+/// The copy chip (format round, 15 November 2026; Andrii: "a bunch of autoformatting on copy for dates, numbers, IBAN
+/// account"). When the copied text IS one thing (a date, number, amount, IBAN, phone, ЄДРПОУ, link with tracking, path,
+/// colour), the strip offers its top form on Tab, a second on 2 and a third on 3 (or a click); Esc or typing on dismisses it, ⌘V pastes the
+/// original. A picked form goes to the clipboard and "Copied as: …" keeps Undo for 5 s; the original row stays in the
+/// journal (the replaced clipboard is never logged as a new copy). After the same pick three times it asks once
+/// "Always?"; a rule he confirms then applies at once, with Undo. Never for sensitive things, concealed or secret
+/// copies (History.watchClipboard stops those before Clip.copied), skipped apps, or while the strip is busy.
+/// Rules: app/FormatRules.swift (CopyChip.plan), data/format-rules.json.
+enum ClipForms {
+    static let file = Home.data.appendingPathComponent("format-rules.json")
+    static var memory: FormatMemory = FormatLearn.load(file)
+
+    static func copied(_ text: String, app: String) {
+        guard !Drafter.shared.settings.skip.contains(app), Talk.shared.state == .idle, Spool.active == nil, !Offer.active else { return }
+        let original = text
+        switch CopyChip.plan(text, memory: memory) {
+        case .nothing: return
+        case .note(let n): Pill.shared.flash(n)
+        case .apply(let kind, let v):
+            put(v.text)
+            Pill.shared.flash("Copied as: \(v.name.lowercased())", button: StripButton("Undo", key: "", style: .primary) { put(original) })
+            log("clip form: rule \(kind) \(v.id)")
+        case .offer(let kind, let vs):
+            guard let top = vs.first else { return }
+            Offer.until = Date().addingTimeInterval(8); Offer.app = nil; Offer.picks = [:]
+            Offer.action = { choose(kind, top, original: original) }
+            var keys = [StripButton(top.name, key: "tab", style: .primary) { Offer.accept() }]
+            // the second and third forms: keys 2 and 3 (Keys.swift, CopyChip.digit) or a click
+            for (i, b) in vs.enumerated().dropFirst() {
+                Offer.picks[i] = { choose(kind, b, original: original) }
+                keys.append(StripButton(b.name, key: "\(i + 1)") { Offer.pick(i) })
+            }
+            keys.append(StripButton("Dismiss", key: "esc") { Offer.dismiss("click") })
+            Pill.shared.offer(["Copy \(CopyChip.names[kind] ?? kind) as", "\(top.name): \(CopyChip.preview(top.text))"], kind: "Copy", controls: keys, seconds: 8)
+            log("clip form: offered \(kind)")
+        }
+    }
+
+    /// He picked a form: it goes to the clipboard; the third same pick asks once "Always?".
+    static func choose(_ kind: String, _ v: FormatVariant, original: String) {
+        put(v.text)
+        log("clip form: picked \(kind) \(v.id)")
+        if FormatLearn.picked(kind, dest: nil, form: v.id, in: &memory) {
+            FormatLearn.answer(kind, dest: nil, form: v.id, yes: false, in: &memory)   // asked once, whatever he answers
+            save()
+            Offer.until = Date().addingTimeInterval(8); Offer.app = nil; Offer.picks = [:]
+            Offer.action = { always(kind, v) }
+            Pill.shared.offer(["Copied as: \(v.name.lowercased())", "Always copy \(CopyChip.names[kind] ?? kind) this way?"], kind: "Copy",
+                              controls: [StripButton("Always", key: "tab", style: .primary) { Offer.accept() },
+                                         StripButton("Undo", key: "") { Offer.dismiss("undo"); put(original) },
+                                         StripButton("Not now", key: "esc") { Offer.dismiss("click") }], seconds: 8)
+        } else {
+            save()
+            Pill.shared.flash("Copied as: \(v.name.lowercased())", button: StripButton("Undo", key: "", style: .primary) { put(original) })
+        }
+    }
+
+    static func always(_ kind: String, _ v: FormatVariant) {
+        let prev = FormatLearn.answer(kind, dest: nil, form: v.id, yes: true, in: &memory) ?? nil
+        save()
+        log("clip form: rule stored \(kind) \(v.id)")
+        Pill.shared.flash("Always \(v.name.lowercased()) for \(CopyChip.names[kind] ?? kind)", button: StripButton("Undo", key: "", style: .primary) {
+            FormatLearn.undo(kind, dest: nil, previous: prev, in: &memory); save()
+            log("clip form: rule undone \(kind)")
+        })
+    }
+
+    /// The clipboard holds `text`; History skips this change, so the journal keeps the original copy only.
+    static func put(_ text: String) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+        History.skipChange(pb.changeCount)
+        Clip.replaced(text)
+    }
+    static func save() { FormatLearn.save(memory, to: file) }
 }

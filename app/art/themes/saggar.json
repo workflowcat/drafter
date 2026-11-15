@@ -44,5 +44,26 @@
   "dark": 38
  },
  "shadow": "0 1px 0 rgb(31 27 25 / .10), 0 10px 24px -8px rgb(31 27 25 / .32)",
- "sprites": false
+ "sprites": false,
+ "surface": {
+  "light": {
+   "well": 5,
+   "hover": 4.5,
+   "pick": 8.5
+  },
+  "dark": {
+   "well": 30,
+   "hover": 5,
+   "pick": 9
+  }
+ },
+ "radii": {
+  "pane": 12,
+  "card": 10,
+  "row": 8
+ },
+ "motion": {
+  "fold": 120,
+  "fade": 80
+ }
 }

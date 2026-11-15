@@ -15,7 +15,7 @@ import AppKit
 
 enum Fixer {
     struct Pending { let el: AXUIElement; let pid: pid_t; let before: String; let old: String; let new: String; let kind: String
-        var src = "word"; var rev = 0; var at = Date(); var shown = false }
+        var src = "word"; var rev = 0; var at = Date(); var shown = false; var feat = "" }
     static var pending: Pending?
     /// The fixed word, waiting for the space after it to get its visible-undo line.
     static var mark: (new: String, old: String, kind: String, wasUk: Bool, el: AXUIElement, pid: pid_t, markers: Bool)?
@@ -63,7 +63,7 @@ enum Fixer {
         Keys.shared.shownSeq = Keys.shared.seq                // an answer already on its way is older
         end("typed")
         pending = Pending(el: s.el, pid: s.app.processIdentifier, before: s.before, old: old, new: new, kind: kind,
-                          src: "space", rev: Keys.shared.inputRevision, at: Date())
+                          src: "space", rev: Keys.shared.inputRevision, at: Date(), feat: TypoEngine.tail(new))
         draw(String(new.dropLast()), old: old, rect: rect)
     }
 
@@ -94,7 +94,7 @@ enum Fixer {
     private static func end(_ how: String) {
         guard let p = pending else { return }
         pending = nil
-        if p.shown { log("fix offer \(p.src) \(p.kind) \(how) \(Int(Date().timeIntervalSince(p.at) * 1000))ms") }
+        if p.shown { log("fix offer \(p.src) \(p.kind) \(how) \(Int(Date().timeIntervalSince(p.at) * 1000))ms" + p.feat) }
     }
 
     /// Tab on "→ word": his letters out, the word in (key events, as autocorrect does).
@@ -110,7 +110,7 @@ enum Fixer {
         Focus.backspace(p.old.count)
         Focus.typeText(p.new)
         if p.kind == "layout uk" { KeyLayout.select(uk: true) } else if p.kind == "layout en" { KeyLayout.select(uk: false) }
-        log("fix offer \(p.src) \(p.kind) taken \(ms)ms")
+        log("fix offer \(p.src) \(p.kind) taken \(ms)ms" + p.feat)
         if p.src == "space" {
             // as an automatic fix: Backspace right after brings his word back, the word keeps its dotted line
             Autocorrect.last = Autocorrect.Fix(old: p.old, new: p.new, kind: p.kind, revision: Keys.shared.editRevision, el: s.el, at: Date(), wasUk: wasUk, deliberate: true)

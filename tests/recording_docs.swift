@@ -53,8 +53,6 @@ struct RecordingDocChecks {
         check(d.matches(t) && !d.matches(CallDoc.terms("бюджет")), "all words somewhere in it")
         check(d.hits(t).first?.id == 1, "the turn with both words first")
         check(CallDoc.snippet(String(repeating: "слово ", count: 40) + "акт тут", ["акт"], width: 40).hasPrefix("…"), "snippet starts near the word")
-        let h = CallDoc.handoff(search: "акт", docs: [d])
-        check(h.contains("1 recording, 2 matching lines") && h.contains("[00:09] me: Акт надішлю ввечері.") && h.contains("brief.md"), "search handoff: lines with times and where to read more")
         check(d.handoff().contains("Summary and to-dos: /n.md"), "one recording handoff points at the note")
 
         // transcript.txt without times, and a long note

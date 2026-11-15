@@ -3,18 +3,24 @@
 The prompt has a fixed head (style, dictionary, examples) and a moving tail (app, window, text before the caret).
 Consecutive keystrokes share most tokens, so the cache is trimmed back to the common part and only new tokens are fed.
 """
-import copy, gc, math, os, re, threading, time
+import copy, gc, hashlib, math, os, re, threading, time
 from collections import OrderedDict
+from pathlib import Path
 
 import mlx.core as mx
 from mlx_lm import load
 from mlx_lm.generate import generate_step, generation_stream
-from mlx_lm.models.cache import make_prompt_cache, can_trim_prompt_cache, trim_prompt_cache
+from mlx_lm.models.cache import make_prompt_cache, can_trim_prompt_cache, trim_prompt_cache, save_prompt_cache, load_prompt_cache
 from mlx_lm.sample_utils import make_sampler
 
 CAP_GB = float(os.environ.get("DRAFTER_CAP_GB", "3.6"))   # guard cap for the whole engine
 mx.set_memory_limit(int(CAP_GB * 0.92 * 2**30))          # MLX tries to stay under this (below 2.6 GB it stalls the 4B model)
 mx.set_cache_limit(64 * 2**20)                             # never keep a big free-buffer pool (VoiceNotes lesson)
+
+
+def set_limit(cap_gb):
+    """MLX's own limit for another guard cap (model catalog: a bigger model gets its cap at a switch)."""
+    mx.set_memory_limit(int(cap_gb * 0.92 * 2**30))
 
 END = re.compile(r"[.!?…)\n]")
 # other screens kept warm (2026-11-01, Andrii: "it takes a long time to start often"): going back to a chat reads
@@ -32,23 +38,39 @@ SETTLE = os.environ.get("DRAFTER_SETTLE", "1") == "1"   # round five: stop once 
 DIST = os.environ.get("DRAFTER_DIST", "1") == "1"   # bench/dist_check.py 2026-11-14: same choices on 1,080 keys; DRAFTER_DIST=0 turns it off
 # logit bias / steering vectors (weights round, 2026-11-14, engine/tweaks.py): a file from bench/weights/, default off
 TWEAKS = os.environ.get("DRAFTER_TWEAKS", "")
+# the fixed head read from a file at load and wake instead of being read by the model (big-model round, 2026-11-15;
+# bench/weights/speed.py: 335 ms of prefill became a 4 ms read, the next-token logits identical). The file is made
+# when the head (or the model, layer or tweaks) changes; a stale, broken or missing file falls back to the prefill.
+# It holds his example messages, so it lives under data/. Empty DRAFTER_HEAD_CACHE = off.
+HEAD_CACHE = os.environ.get("DRAFTER_HEAD_CACHE", str(Path(__file__).resolve().parent.parent / "data" / "cache"))
+# copies kept after the screen text, for caches that cannot be cut back (big-model round): one per screen, at most
+# SPARE + 1 (the active screen and the parked ones)
+MARKS = SPARE + 1
 
 
 class Model:
-    def __init__(self, repo, adapter=None):
+    def __init__(self, repo, adapter=None, strength=1.0, src=None):
         t = time.time()
         self.repo = repo
+        self.src = src         # a local snapshot folder to load from (catalog models), else the repo id as before
         self.adapter = adapter if adapter and os.path.isdir(adapter) else None
+        # personalization strength (parity round, 2026-11-15): his layer's scale, 0..1, applied when it is merged
+        # (fuse_lora), so a key costs the same at any strength; set_strength re-merges in place
+        self.strength = min(1.0, max(0.0, float(strength)))
         # a LoRA trained on his own writing (bench/train.py) sits on top of the base model
-        self.model, self.tok = load(repo, adapter_path=self.adapter) if self.adapter else load(repo)
+        self.model, self.tok = self._load()
         self.fused = []        # (parent module, attribute, LoRA module, merged copy): see fuse_lora
         if self.adapter and FUSE: self.fuse_lora()
         self.tw = self._tweak(None)
+        if self.adapter and not FUSE and self.strength != 1.0: self.lora(True)
         self.lock = threading.Lock()
         self.cache, self.ids = None, []
         self.rebuilds = 0
         self.screen, self.parked, self.swaps = None, OrderedDict(), 0   # parked: screen -> (ids, cache), oldest first
         self.snapshot = None   # (cache, ids) right after the fixed head, for caches that cannot be trimmed
+        self.marks = OrderedDict()   # screen -> (cache, ids) right after the screen text, same kind of cache only
+        self.head_file = None        # "read", "made" or None: how the head came in at the last warm
+        self.mark_hits = 0           # keys answered from a copy after the screen text
         self.head_ids, self.wake_at, self.sleeps, self.loading = [], 0.0, 0, False
         self.retrain_sleep = False
         self.load_s = time.time() - t
@@ -77,13 +99,56 @@ class Model:
                 until, retrain = max(until, self.wake_at), True
             self.wake_at, self.retrain_sleep = until, retrain
             if self.model is None: return False
-            self.model, self.fused = None, []    # the merged copies hold memory too
-            self.cache, self.ids, self.snapshot, self.dist = None, [], None, None
-            self.parked.clear(); self.screen = None
-            self._lora_mods = None; self._ru = None; self.__dict__.pop("_masks", None)
+            self._drop()
             self.sleeps += 1
         gc.collect(); mx.clear_cache()
         return True
+
+    def _load(self):
+        where = getattr(self, "src", None) or self.repo
+        return load(where, adapter_path=self.adapter) if self.adapter else load(where)
+
+    def _drop(self):
+        """Under the lock: the weights and every cache made from them go (sleep, and a switch before the next load)."""
+        self.model, self.fused = None, []    # the merged copies hold memory too
+        self.cache, self.ids, self.snapshot, self.dist = None, [], None, None
+        self.parked.clear(); self.screen = None; self.marks.clear()
+        self._lora_mods = None; self._ru = None; self.__dict__.pop("_masks", None)
+
+    # Model catalog (2026-11-15): another model in place of this one. engine/catalog.switch calls unload() first, so
+    # memory never holds two models, then load_as(); the caller reads the head again with the new tokenizer.
+    def unload(self):
+        with self.lock:
+            self._drop()
+            self._by_first, self.tw = None, None    # token pieces and tweaks belong to the old tokenizer
+            self.wake_at, self.retrain_sleep = 0.0, False
+        gc.collect(); mx.clear_cache(); mx.reset_peak_memory()
+
+    def load_as(self, repo, adapter=None, src=None):
+        """Load `repo` (from `src` when given) with `adapter` into this (unloaded) object. Raises when it cannot."""
+        with self.lock:
+            if self.model is not None: raise RuntimeError("unload first: one model at a time")
+            t = time.time()
+            self.repo, self.src = repo, src
+            self.adapter = adapter if adapter and os.path.isdir(adapter) else None
+            self.head_ids, self.head_file = [], None
+            self.loading = True
+            try:
+                self.model, self.tok = self._load()
+                if self.adapter and FUSE: self.fuse_lora()
+                self.tw = self._tweak(None)
+                if self.adapter and not FUSE and self.strength != 1.0: self.lora(True)
+                self.cache, self.ids = None, []
+            except Exception:
+                self._drop()
+                raise
+            finally:
+                self.loading = False
+            self.load_s = time.time() - t
+
+    def loaded_gb(self):
+        """What the loaded weights hold now (MLX active memory), 0 when nothing is loaded."""
+        return 0.0 if self.model is None else mx.get_active_memory() / 2**30
 
     def wake(self, force=True):
         """Load back now (force), or only if the sleep ran out. -> True when the model is there."""
@@ -99,9 +164,11 @@ class Model:
         t = time.time()
         self.loading = True        # the server answers typing from the word finisher meanwhile, never behind this
         try:
-            self.model, _ = load(self.repo, adapter_path=self.adapter) if self.adapter else load(self.repo)
+            where = getattr(self, "src", None) or self.repo     # a catalog model loads from its snapshot folder
+            self.model, _ = load(where, adapter_path=self.adapter) if self.adapter else load(where)
             if self.adapter and FUSE: self.fuse_lora()
             self.tw = self._tweak(self.tw)
+            if self.adapter and not FUSE and self.strength != 1.0: self.lora(True)
             self._warm(self.head_ids)
         finally:
             self.loading = False
@@ -125,8 +192,11 @@ class Model:
         if self.screen is not None: self.parked[self.screen] = (self.ids, self.cache)
         self.ids, self.cache, self.screen, self.dist = ids, cache, screen, None
 
-    def _feed(self, ids):
-        """Make the cache hold exactly ids[:-1] and return the tail to feed (at least one token)."""
+    def _feed(self, ids, stable=None):
+        """Make the cache hold exactly ids[:-1] and return the tail to feed (at least one token).
+        stable (big-model round): ids[:stable] stay put while he types on this screen (Builder.ids_stable). A cache
+        that cannot be cut back then restores its copy at that point (made here the first time) and only the typed
+        line is read again; a cache that can be cut back never comes this far, so nothing changes for it."""
         if self.cache is not None:
             n = 0
             for a, b in zip(self.ids, ids):
@@ -136,14 +206,41 @@ class Model:
             drop = len(self.ids) - n
             if drop == 0 or (can_trim_prompt_cache(self.cache) and trim_prompt_cache(self.cache, drop) == drop):
                 self.ids = self.ids[:n]
-                return ids[n:]
+                if drop == 0 and stable and self.snapshot and n < stable < len(ids) and self.marks.get(self.screen, (0, None))[1] != ids[:stable]:
+                    self._mark(ids, stable)     # the cache only grows here: make the copy on the way
+                return ids[len(self.ids):]
         self.rebuilds += 1
-        snap = self.snapshot
+        snap = self.snapshot          # only a cache that cannot be cut back has one (_warm)
+        stable = stable if snap and stable and 0 < stable < len(ids) else None
+        if stable:
+            mark = self.marks.get(self.screen)
+            if mark and mark[1] == ids[:stable]:
+                self.marks.move_to_end(self.screen)
+                self.cache, self.ids = copy.deepcopy(mark[0]), list(mark[1])
+                self.mark_hits = getattr(self, "mark_hits", 0) + 1   # getattr: tests run _feed on stand-ins
+                return ids[stable:]
         if snap and ids[: len(snap[1])] == snap[1] and len(ids) > len(snap[1]):
             self.cache, self.ids = copy.deepcopy(snap[0]), list(snap[1])
-            return ids[len(snap[1]):]
-        self.cache, self.ids = make_prompt_cache(self.model), []
-        return ids
+        else:
+            self.cache, self.ids = make_prompt_cache(self.model), []
+        if stable and len(self.ids) < stable < len(ids): self._mark(ids, stable)
+        return ids[len(self.ids):]
+
+    def _mark(self, ids, stable):
+        """Read the cache on to ids[:stable] and keep a copy there for this screen."""
+        self._read(ids[len(self.ids):stable])
+        self.ids = list(ids[:stable])
+        self.marks[self.screen] = (copy.deepcopy(self.cache), list(self.ids))
+        self.marks.move_to_end(self.screen)
+        while len(self.marks) > MARKS: self.marks.popitem(last=False)
+
+    def _read(self, ids, step=512):
+        """Read ids into the active cache (no token made)."""
+        with mx.stream(generation_stream):
+            for i in range(0, len(ids), step):
+                self.model(mx.array(ids[i:i + step])[None], cache=self.cache)
+                mx.eval([c.state for c in self.cache])
+        mx.clear_cache()
 
     def _reuse(self, raw_ids):
         """The distribution after exactly raw_ids, when it is kept and the cache can be cut back to them: then the cache
@@ -303,7 +400,13 @@ class Model:
         for _, mod in self.model.named_modules():
             for name, child in list(mod.children().items()):
                 if isinstance(child, LoRALinear):
-                    self.fused.append((mod, name, child, child.fuse()))
+                    if self.strength <= 0: merged = child.linear          # strength 0: the plain layer, no merge
+                    else:
+                        sc = child.scale
+                        child.scale = sc * self.strength
+                        try: merged = child.fuse()
+                        finally: child.scale = sc
+                    self.fused.append((mod, name, child, merged))
         for mod, name, _, merged in self.fused: setattr(mod, name, merged)
         mx.eval([m.parameters() for *_, m in self.fused])
         return len(self.fused)
@@ -331,7 +434,35 @@ class Model:
         mods = getattr(self, "_lora_mods", None)
         if mods is None:
             mods = self._lora_mods = [(m, m.scale) for m in self.model.modules() if type(m).__name__.startswith("LoRA") and hasattr(m, "scale")]
-        for m, sc in mods: m.scale = sc if on else 0.0
+        for m, sc in mods: m.scale = sc * getattr(self, "strength", 1.0) if on else 0.0
+
+    def set_strength(self, strength):
+        """His layer at another strength (0..1): the merged copies are made again in place (one model, no reload; the
+        old copies go first, so memory never holds two sets), the head is read again (its file is keyed by strength).
+        -> seconds it took, 0.0 when nothing changed."""
+        strength = min(1.0, max(0.0, float(strength)))
+        with self.lock:
+            if abs(strength - self.strength) < 1e-6 or not self.adapter: self.strength = strength; return 0.0
+            t = time.time()
+            self.strength = strength
+            if self.model is None: return 0.0            # asleep: the next load merges at the new strength
+            self.loading = True                          # typing answers from his words meanwhile, never waits here
+            try: self._restrength()
+            finally: self.loading = False
+            return time.time() - t
+
+    def _restrength(self):
+        """Under the lock: the merged copies made again at self.strength (the old ones go first), the head read again."""
+        if FUSE:
+            for mod, name, lora_mod, _ in self.fused: setattr(mod, name, lora_mod)
+            self.fused = []
+            gc.collect(); mx.clear_cache()
+            self.fuse_lora()
+        else:
+            self.lora(True)                          # _lora_mods keeps the trained scales
+        self.cache, self.ids, self.snapshot, self.dist = None, [], None, None
+        self.parked.clear(); self.screen = None; self.marks.clear()
+        self._warm(self.head_ids)
 
     def oneshot(self, ids, max_tokens=60, stop=None, cancelled=lambda: False):
         """A one-off prompt (chip fields, rewrites) on its own small cache, so the warm head stays where it is, with the
@@ -360,7 +491,7 @@ class Model:
 
     BARS = (0.3, 0.45, 0.6)   # finishing the typed word, a first new word, each further word (bench/replay.py, setup E)
 
-    def complete(self, prompt, max_tokens=12, stop=END, cancelled=lambda: False, raw_ids=None, heal="", min_p=0.0, max_words=0, bars=None, soft=0.0, soft_from=2, screen=None):
+    def complete(self, prompt, max_tokens=12, stop=END, cancelled=lambda: False, raw_ids=None, heal="", min_p=0.0, max_words=0, bars=None, soft=0.0, soft_from=2, screen=None, stable=None):
         """Greedy continuation. With `heal`, the output first re-spells it and only the rest is returned.
         Returns (text, first_token_ms, total_ms)."""
         with self.lock:
@@ -373,7 +504,7 @@ class Model:
             self._switch(screen)
             if cancelled(): raise Model.Cancelled()
             raw0 = self._reuse(ids) if DIST else None
-            tail = list(ids[-1:]) if raw0 is not None else self._feed(ids)
+            tail = list(ids[-1:]) if raw0 is not None else (self._feed(ids, stable) if stable else self._feed(ids))
             out, first, n, healed_at = [], None, 0, None
             eos = set(getattr(self.tok, "eos_token_ids", None) or [self.tok.eos_token_id])
             self.hit_limit = False
@@ -448,7 +579,8 @@ class Model:
             return text, first or 0.0, (time.perf_counter() - t0) * 1000
 
     def complete_gated(self, raw_ids, heal, decide, more=0.5, max_words=3, max_tokens=10, cancelled=lambda: False, screen=None,
-                       boost=None, lam=0.0, min_letters=0, grow=None, grow_words=6, tail=None, tail_words=8, on_part=None):
+                       boost=None, lam=0.0, min_letters=0, grow=None, grow_words=6, tail=None, tail_words=8, on_part=None,
+                       run=None, alts=0, stable=None, mid=None):
         """Greedy continuation decided by the gate (2026-10-31, engine/gatecore.py): as soon as the first word is whole,
         `decide(toks)` says yes or no; on no it stops at once (nothing shown, no tokens wasted), on yes further words
         come while each token stays >= `more`. toks: [text after the half word, p, p2]. Returns
@@ -459,8 +591,17 @@ class Model:
         tail_words words in all; they are the lighter part, and `self.last_sure` says where it starts.
         on_part(text, sure_len): called as soon as the gate said yes and whole words exist, and again each time the
         ghost grows by a whole word, so the app can draw the first words before the rest is written (two-step ghost).
-        Each part starts with the one before it; the returned text starts with the last part."""
-        import gatecore
+        Each part starts with the one before it; the returned text starts with the last part.
+        run (long round, 2026-11-14): {"mode": "phrase"|"sentence", "floor", "kind", "likely"}: after the gate's yes the
+        ghost runs to the end of the sentence or clause while the running confidence holds (gatecore.run_words) instead
+        of the per-token bars; self.last_conf holds the running chance after each later word, self.last_why what
+        ended it. alts: keep the first letters of up to this many other likely continuations (self.last_alts), for
+        the futures prepared in the gap (server.look_ahead).
+        mid (mid-line round, 2026-11-15): {"rest": first token id of the rest of the caret's line, "text": that rest,
+        "stop", "more", "words"}: the ghost ends where the gap is filled (engine/fim.py shape: the rest's first token
+        has p >= stop at a word boundary, or the text runs into the rest); nothing when the rest is likely right away
+        (nothing missing). self.last_rests holds p of the rest token at each step."""
+        import gatecore, fim
         tl = time.perf_counter()
         with self.lock:
             if cancelled(): raise Model.Cancelled()
@@ -473,7 +614,7 @@ class Model:
             self.timing["switch"] = round((time.perf_counter() - t0) * 1000, 1)
             if cancelled(): raise Model.Cancelled()
             raw0 = self._reuse(raw_ids) if DIST else None
-            fed = list(raw_ids[-1:]) if raw0 is not None else self._feed(raw_ids)
+            fed = list(raw_ids[-1:]) if raw0 is not None else (self._feed(raw_ids, stable) if stable else self._feed(raw_ids))
             self.timing["fed"] = 0 if raw0 is not None else len(fed)
             eos = set(getattr(self.tok, "eos_token_ids", None) or [self.tok.eos_token_id])
             procs = ([self.healer(heal, len(fed))] if heal else []) + [lambda toks, logits: logits + self.russian_mask(logits.shape)]
@@ -482,11 +623,23 @@ class Model:
             toks, out, first, g, n = [], [], None, None, 0
             ms = lambda: (time.perf_counter() - t0) * 1000
             sent = [""]       # the last part given to on_part
-            self.last_sure = None
+            self.last_sure, self.last_conf, self.last_why, self.last_alts = None, [], None, []
+            closed = None
             self.last_raw = ""   # what the model wrote after the half word, shown or not (server branch letters)
+            rests = self.last_rests = []
 
-            def shape(toks):
+            def mid_shape(closed=False):
+                return fim.shape(toks, rests, mid["text"], heal, mid.get("more", fim.MORE), mid.get("words", fim.WORDS),
+                                 mid.get("stop", fim.STOP), closed=closed)
+
+            def shape(toks, closed=None):
                 """-> (the ghost the recorded tokens make now, how many characters of it are the sure part)"""
+                if run:
+                    text, sure, why, conf = gatecore.run_words(toks, run.get("mode", "sentence"), run.get("floor", gatecore.RUN_FLOOR),
+                                                               closed=closed, likely=run.get("likely", gatecore.RUN_LIKELY),
+                                                               min_letters=min_letters, kind=run.get("kind", "prod"))
+                    self.last_conf, self.last_why = conf, why
+                    return text, sure
                 return gatecore.shape(toks, more, max_words, grow, grow_words, min_letters, tail, tail_words)
             if cancelled(): raise Model.Cancelled()
             steps = (self._steps(raw_ids, fed, procs, max_tokens + (6 if heal else 0), raw0) if DIST else
@@ -497,16 +650,20 @@ class Model:
                 if first is None: self.ids = list(raw_ids)
                 self.ids.append(tok)
                 if cancelled(): raise Model.Cancelled()
-                if first is None: first = ms(); self.timing["first"] = round(first, 1)
-                if tok in eos: break
+                if first is None:
+                    first = ms(); self.timing["first"] = round(first, 1)
+                    if alts: self.last_alts = self._alts(lp, heal, alts)
+                if tok in eos: closed = "eos"; break
                 top = mx.topk(lp, 2)
                 p = float(mx.exp(lp[tok])); vals = sorted(top.tolist(), reverse=True)
                 p2 = float(math.exp(vals[1])) if len(vals) > 1 else 0.0
+                if mid: rests.append(float(mx.exp(lp[mid["rest"]])) if mid.get("rest") is not None else 0.0)
                 out.append(tok)
                 full = self.tok.decode(out)
                 text = full[len(heal):] if heal and len(full) >= len(heal) and full.startswith(heal) else ("" if heal else full)
                 toks.append([text, round(p, 4), round(p2, 4)])
                 self.last_raw = text
+                if mid and len(toks) == 1 and mid_shape()[1] == "none": return "", None, first, ms()   # nothing missing
                 if not text:
                     if cancelled(): raise Model.Cancelled()
                     continue
@@ -514,6 +671,9 @@ class Model:
                 if g is None and (gatecore.word_done(text) or END.search(text)):
                     g = decide(toks)
                     if g is None or g is False: return "", None, first, ms()
+                if g is not None and mid:
+                    if mid_shape()[1] != "open" or n >= max_tokens or cancelled(): break
+                    continue
                 if g is not None:
                     now = shape(toks)
                     if on_part is not None:
@@ -521,6 +681,10 @@ class Model:
                         if whole and len(whole) > len(sent[0]) and whole.startswith(sent[0]):
                             sent[0] = whole; on_part(whole, sure)
                             self.timing.setdefault("part", round(ms(), 1))
+                    if run:
+                        if gatecore.run_settled(self.last_why): break
+                        if n >= max_tokens or cancelled(): closed = "cap"; break
+                        continue
                     if END.search(text): break
                     # round five: the ghost can no longer change (a whole word after it was turned down): stop here,
                     # the same text, sooner (bench/settle.py); the tokens after it were only waiting for a low one
@@ -537,10 +701,30 @@ class Model:
             if g is None:   # the reply ended inside the first word (end of text or token limit): decide on that
                 g = decide(toks) if toks and toks[-1][0] else None
                 if not g: return "", None, first or 0.0, ms()
-            text, self.last_sure = shape(toks)
+            if run and closed is None and n >= max_tokens: closed = "cap"
+            if mid:
+                text = mid_shape(closed=closed == "eos" or n >= max_tokens)[0]
+                self.last_sure = len(text)
+                return text, g, first or 0.0, ms()
+            text, self.last_sure = shape(toks, closed)
             return text, g, first or 0.0, ms()
 
-    def score(self, raw_ids, heal, text, cancelled=lambda: False, screen=None):
+    def _alts(self, lp, heal, k):
+        """The next letter he may type, from the first step's distribution (healer mask applied): the letter right
+        after the half word (or space) of each of the likeliest tokens, best first by summed probability."""
+        top = mx.argsort(-lp)[:48].tolist()
+        ps = mx.exp(lp[mx.array(top)]).tolist()
+        score = {}
+        for t, p in zip(top, ps):
+            s = self.tok.decode([t])
+            if not s.startswith(heal) or len(s) <= len(heal): continue
+            ch = s[len(heal)]
+            if heal == "" and ch == " " and len(s) > 1: ch = s.lstrip(" ")[:1]
+            if not ch or ch.isspace() or ch == "\ufffd": continue
+            score[ch] = score.get(ch, 0.0) + p
+        return [c for c, _ in sorted(score.items(), key=lambda x: -x[1])[:k]]
+
+    def score(self, raw_ids, heal, text, cancelled=lambda: False, screen=None, stable=None):
         """How likely his own model (LoRA on) finds `text` right after the caret, read in one forward pass (2026-11-01,
         the Claude gate: Codex review). The half word `heal` is re-spelled first, with the healer's mask, so the
         letters he already typed are given, not judged. -> [(word as in text, [p of each token in it])], or None."""
@@ -549,7 +733,7 @@ class Model:
         with self.lock:
             if cancelled() or self.model is None: return None
             self._switch(screen)
-            tail = self._feed(raw_ids)          # the cache holds raw_ids[:-1]; tail ends with the caret's token
+            tail = self._feed(raw_ids, stable) if stable else self._feed(raw_ids)   # the cache holds raw_ids[:-1]; tail ends with the caret's token
             feed = list(tail) + cont
             logits = self.model(mx.array(feed)[None], cache=self.cache)[0, -(len(cont) + 1):-1, :]
             self.ids = list(raw_ids) + cont
@@ -578,12 +762,12 @@ class Model:
             out.append((m.group(0), [p for (x, y, p) in spans if y > a and x < b and y > h]))
         return out
 
-    def prefill(self, ids, screen=None):
+    def prefill(self, ids, screen=None, stable=None):
         """Read ids into the cache now (on focus, before he types), so the first suggestion only adds a few tokens."""
         with self.lock:
             if self.model is None: return 0
             self._switch(screen)
-            tail = self._feed(ids)
+            tail = self._feed(ids, stable) if stable else self._feed(ids)
             self.ids = list(ids)
             if tail:
                 steps = (self._steps(ids, tail, [], 0, prefill_step=256) if DIST else
@@ -600,15 +784,68 @@ class Model:
     def _warm(self, head_ids):
         self.snapshot, self.dist = None, None
         self.parked.clear(); self.screen = None   # a new head: every parked prompt starts with the old one
+        self.marks.clear()                        # each copy starts with the old head
         if getattr(self, "tw", None): self.tw.start = len(head_ids or [])   # the head is never steered, so it serves every kind
         self.cache, self.ids = make_prompt_cache(self.model), []
+        self.head_file = None
         if not head_ids: return   # "bare" prompts (a model trained on his writing needs no examples up front)
-        for _ in generate_step(mx.array(head_ids), self.model, max_tokens=0, prompt_cache=self.cache, prefill_step_size=256): pass
-        mx.eval([c.state for c in self.cache])
+        if not self._head_read(head_ids):
+            for _ in generate_step(mx.array(head_ids), self.model, max_tokens=0, prompt_cache=self.cache, prefill_step_size=256): pass
+            mx.eval([c.state for c in self.cache])
+            self._head_save(head_ids)
         self.ids = list(head_ids)
         # a copy costs memory; only caches that cannot be trimmed back (Gemma's sliding window) need one
         self.snapshot = None if can_trim_prompt_cache(self.cache) else (copy.deepcopy(self.cache), list(head_ids))
         mx.clear_cache()
+
+    def head_key(self, head_ids):
+        """What the head cache depends on: the model, his layer (path, size, time), whether it is merged, the tweaks,
+        the cache classes and the head ids. Any change gives another key, so a stale file is never read."""
+        parts = [str(self.repo), str(FUSE), TWEAKS, ",".join(type(c).__name__ for c in self.cache or [])]
+        if getattr(self, "strength", 1.0) != 1.0: parts.append(f"strength={self.strength:.3f}")   # 1.0 keeps today's key
+        if self.adapter:
+            f = Path(self.adapter) / "adapters.safetensors"
+            try: st = f.stat(); parts += [str(f), str(st.st_size), str(st.st_mtime_ns)]
+            except OSError: parts += [str(f), "missing"]
+        parts.append(",".join(map(str, head_ids)))
+        return hashlib.sha1("|".join(parts).encode()).hexdigest()[:20]
+
+    def head_path(self, key):
+        return Path(HEAD_CACHE) / f"head-{key}.safetensors" if HEAD_CACHE else None
+
+    def _head_read(self, head_ids):
+        """The head's cache from its file, when the file is there and matches. -> True when read (else nothing changed)."""
+        try:
+            key = self.head_key(head_ids)
+            p = self.head_path(key)
+            if p is None or not p.exists(): return False
+            cache, meta = load_prompt_cache(str(p), return_metadata=True)
+            if meta.get("key") != key or int(meta.get("tokens", -1)) != len(head_ids) or len(cache) != len(self.cache): return False
+            if [type(c).__name__ for c in cache] != [type(c).__name__ for c in self.cache]: return False
+            if getattr(cache[0], "offset", len(head_ids)) != len(head_ids): return False
+            mx.eval([c.state for c in cache])
+            self.cache, self.head_file = cache, "read"
+            return True
+        except Exception as e:
+            print(f"head cache: not read ({type(e).__name__})", flush=True)
+            return False
+
+    def _head_save(self, head_ids):
+        """Write the head's cache once per key; old head files go (only ours, by name)."""
+        try:
+            key = self.head_key(head_ids)
+            p = self.head_path(key)
+            if p is None or p.exists(): return
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_name(p.stem + ".tmp.safetensors")
+            save_prompt_cache(str(tmp), self.cache, {"key": key, "tokens": str(len(head_ids))})
+            os.replace(tmp, p)
+            self.head_file = "made"
+            olds = sorted((q for q in p.parent.glob("head-*.safetensors") if q != p and ".tmp." not in q.name),
+                          key=lambda q: q.stat().st_mtime)
+            for q in olds[:-8]: q.unlink(missing_ok=True)    # a few kept: switching back (another catalog model, another strength) reads it
+        except Exception as e:
+            print(f"head cache: not saved ({type(e).__name__})", flush=True)
 
     def memory_gb(self):
         return mx.get_active_memory() / 2**30, mx.get_peak_memory() / 2**30

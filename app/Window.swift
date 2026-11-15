@@ -13,6 +13,7 @@ final class AppWindow: NSObject, NSWindowDelegate {
     static let shared = AppWindow()
     private var window: NSWindow?
     private var tick: Timer?
+    private var keyMonitor: Any?
     let model = WindowModel()
 
     func show() {
@@ -22,11 +23,23 @@ final class AppWindow: NSObject, NSWindowDelegate {
                              styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
             w.title = "Drafter"; w.titleVisibility = .hidden; w.titlebarAppearsTransparent = true; w.isReleasedWhenClosed = false
             w.backgroundColor = PK.paper; w.titlebarSeparatorStyle = .none
-            w.minSize = NSSize(width: 760, height: 520)
+            w.minSize = NSSize(width: JournalLayout.minWindow.w, height: JournalLayout.minWindow.h)
             w.contentViewController = NSHostingController(rootView: WindowView().environmentObject(model))
             w.center(); w.setFrameAutosaveName("DrafterWindow"); w.delegate = self
+            // the frame kept per screen (soft round): a screen of another size gets its own
+            if let v = w.screen?.visibleFrame, let f = UserDefaults.standard.string(forKey: "window.frame." + JournalLayout.screenKey(v)) {
+                w.setFrame(JournalLayout.restore(NSRectFromString(f), visible: v), display: false)
+            }
             window = w
+            model.loadPrefs()
+            // the journal's keys (TapeNav.route): before the field or the editor sees them
+            keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+                guard let self, let w = self.window, e.window === w else { return e }
+                return self.model.key(e) ? nil : e
+            }
         }
+        // the app he came from: Insert puts the text there
+        if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != getpid() { model.origin = front }
         model.reload()
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
@@ -46,9 +59,20 @@ final class AppWindow: NSObject, NSWindowDelegate {
         }
         model.engine = Engine.shared.ready ? "" : Engine.shared.info
         log("window: opened")
+        // the window as it was drawn on this pass (the rows it had; fresh ones follow from reload)
+        let t0 = Date()
+        model.openedAt = t0; model.firstAnswer = nil
+        DispatchQueue.main.async { log("window: first draw \(Int(Date().timeIntervalSince(t0) * 1000)) ms, \(self.model.rows.count) rows") }
     }
 
     func toggle() { (window?.isVisible ?? false) && NSApp.isActive ? window?.performClose(nil) : show() }
+
+    func windowDidEndLiveResize(_ n: Notification) { keepFrame() }
+    func windowDidMove(_ n: Notification) { keepFrame() }
+    private func keepFrame() {
+        guard let w = window, let v = w.screen?.visibleFrame else { return }
+        UserDefaults.standard.set(NSStringFromRect(w.frame), forKey: "window.frame." + JournalLayout.screenKey(v))
+    }
 
     func windowWillClose(_ n: Notification) {
         model.player?.stop(); model.stopPlaying(); tick?.invalidate(); tick = nil
@@ -58,7 +82,7 @@ final class AppWindow: NSObject, NSWindowDelegate {
 
 final class WindowModel: ObservableObject {
     /// Where the window is: the tape, or a page over it (Esc goes back).
-    enum Page { case tape, doc, shortcuts, settings, help }
+    enum Page { case tape, doc, names, shortcuts, settings, help }
     var preview = false
     @Published var page: Page = .tape
     // calls and long notes as documents (Recordings.swift)
@@ -70,21 +94,72 @@ final class WindowModel: ObservableObject {
     @Published var focusField = 0
     var players: [AVAudioPlayer] = []
     var playTimer: Timer?
-    @Published var query = "" { didSet { if query != oldValue { open = nil; rebuildTape() } } }
-    // the tape (TapeWindow.swift)
-    @Published var kinds: Set<TapeKind> = Set(TapeKind.allCases) { didSet { if kinds != oldValue { rebuildTape() } } }
-    @Published var rows: [TapeItem] = []
-    @Published var chosen: String?
-    @Published var open: String?
+    @Published var query = "" { didSet { if query != oldValue { open = nil; refilter() } } }
+    // the journal (TapeWindow.swift, JournalModel.swift, JournalPanes.swift)
+    @Published var rows: [TapeItem] = []          // every item, built (newest first)
+    @Published var lines: [JLine] = []            // the outline as shown: only what is unfolded
+    @Published var chosen: String?                // the chosen line (an item, a header, a session)
+    @Published var open: String?                  // the item open in place (the reader closed)
+    @Published var picked: [String] = []          // items picked with ⇧↑ ⇧↓ (Combine)
     @Published var commandMode = false
     @Published var dayTitle = ""
-    @Published var tapeTick = 0          // a redraw without new rows (a pin, playback)
+    @Published var daySub = ""
+    @Published var chunkInView = ""
+    @Published var tapeTick = 0                   // a redraw without new items (a pin, playback)
+    @Published var buildTick = 0
+    @Published var filter: TapeRules.Filter = .all
+    @Published var group: TapeRules.Group = .time
+    @Published var side: [TapeRules.Entry] = []
+    @Published var folded: Set<String> = []       // sidebar groups folded away
+    @Published var sidebarShown = true
+    @Published var sidebarWidth: CGFloat = 210
+    @Published var readerPref: Bool?              // nil: open when the window is 900 pt or wider
+    @Published var readerWidth: CGFloat = 400
+    @Published var width: CGFloat = 1040
+    @Published var nav = TapeNav.State()
+    @Published var results = 0
+    @Published var editing: String?               // the item in the editor; "new": a Combine draft
+    @Published var draft = ""
+    @Published var showOriginal = false
+    // soft round: the gallery, the peek, Go to, the slide-over reader, back and forward, the pinned order
+    @Published var peekOn = false
+    @Published var palette: String?               // Go to (⌘T) is open with this text
+    @Published var paletteIndex = 0
+    @Published var overOpen = false               // the reader as a slide-over (narrow window, or the gallery)
+    @Published var galleryReader: Bool?           // the gallery's docked reader (nil: closed, his choice kept)
+    @Published var pinOrder: [String] = []        // the pinned items in his order (display only)
+    @Published var detailsOpen = false            // the reader's Details disclosure (⌘I)
+    /// Wire round: the reader's focus on a thing found in the chosen text (⌥↓ ⌥↑), its actions list (↵), for which
+    /// item; the things found in the text the reader shows (app/JournalFound.swift).
+    @Published var foundFocus = FoundFocus()
+    var foundFocusId: String?
+    var foundCache: (id: String, sig: Int, found: [Found])?
+    var history = JournalLayout.History()
+    var historyMuted = false
+    var placeFilters: [String: TapeRules.Filter] = [:]
+    var dragIds: [String] = []
+    var previewPastes: [PasteTrail.Paste] = []      // the preview's made-up paste trail                    // items dragged out of the gallery or the list
+    var galleryCols = 1
+    weak var galleryView: GalleryView?
+    var journal = JournalBuild()
+    var opens: [String: Bool] = [:]               // headers he folded or unfolded
+    lazy var journalStore = JournalStore(url: preview ? nil : Home.data.appendingPathComponent("journal.json"))
+    weak var listView: TapeView?
+    var origin: NSRunningApplication?             // the app he came from (Insert puts the text there)
     var now = Date().timeIntervalSince1970
     /// The themes Settings offers (read again each time Settings opens).
     @Published var themes: [ThemeSpec] = []
-    private var tapeSeq = 0
-    private var gone: (item: TapeItem, until: DispatchWorkItem)?
-    private var goneIds: Set<String> = []
+    var tapeSeq = 0
+    var gone: (item: TapeItem, until: DispatchWorkItem)?
+    @Published var goneIds: Set<String> = []
+    var undos: [(name: String, run: () -> Void)] = []
+    var firstPaint: Double?
+    var previewPins: Set<String> = []
+    var previewTagFile: URL?        // the preview's tags on disk (a temporary file)
+    var previewDefer = false        // the preview measures the real path: tags after the first paint
+    var fillMs = 0.0                // how long the last fill of missing tags took
+    var outline: (tree: [TimeChunks.Node], vis: [Bool]) = ([], [])
+    var combineSources: [String] = []
     @Published var takes: [Entry] = []
     @Published var clips: [Entry] = []
     @Published var typed: [Entry] = []
@@ -109,15 +184,42 @@ final class WindowModel: ObservableObject {
     var player: AVAudioPlayer?
     private var seq = 0
 
+    // The history files as the window reads them, followed (QuickRead.swift): an open reads only what was appended
+    // since the last one. Touched only on `readQueue`.
+    private static let readQueue = DispatchQueue(label: "drafter.window-read", qos: .userInitiated)
+    private static let follow = (takes: JSONLFollow(History.takesFile, keep: 500), clips: JSONLFollow(History.clipFile, keep: 300),
+                                 typed: JSONLFollow(History.typedFile, keep: 600), drafts: JSONLFollow(History.draftsFile, keep: 600))
+    private var reloadSeq = 0
+    /// Window opened: when (for the first-draw and first-answer lines in the log).
+    var openedAt: Date?
+    var firstAnswer: (from: Date, query: String)?
+
+    /// The history and the recordings, read off the main thread (speed round, 15 November 2026: every open read the
+    /// three files whole and every recording on the main thread); the window shows what it had meanwhile.
     func reload() {
         settings = Drafter.shared.settings
-        takes = History.read(History.takesFile, last: 500).compactMap { Entry.voice($0) }
-        clips = History.read(History.clipFile, last: 300).enumerated().compactMap { i, r in Entry.clip(r, id: "c\(i)") }
-        // what he typed: one row per message, its drafts folded into it (TypedList); the files stay as they are
-        typed = TypedList.build(sent: History.read(History.typedFile, last: 600), drafts: History.read(History.draftsFile, last: 600))
-        today = ["typed": typed.filter { $0.title.isEmpty && Calendar.current.isDateInToday($0.when) }.count]
-        loadStats()
-        loadDocs()
+        reloadSeq += 1
+        let mine = reloadSeq, t0 = Date()
+        Self.readQueue.async {
+            let f = Self.follow
+            [f.takes, f.clips, f.typed, f.drafts].forEach { $0.refresh() }
+            let hidden = DraftHide.load(History.hiddenFile)
+            let takes = f.takes.newest(500).compactMap { Entry.voice($0) }
+            let clips = f.clips.newest(300).enumerated().compactMap { i, r in Entry.clip(r, id: "c\(i)") }
+            // what he typed: one row per message, its drafts folded into it (TypedList); the files stay as they are
+            let typed = TypedList.build(sent: DraftHide.drop(f.typed.newest(600), kind: "sent", hidden: hidden),
+                                        drafts: DraftHide.drop(f.drafts.newest(600), kind: "draft", hidden: hidden))
+            let docs = WindowModel.readDocs()
+            let ms = Int(Date().timeIntervalSince(t0) * 1000)
+            DispatchQueue.main.async {
+                guard mine == self.reloadSeq else { return }
+                self.takes = takes; self.clips = clips; self.typed = typed
+                self.today = ["typed": typed.filter { $0.title.isEmpty && Calendar.current.isDateInToday($0.when) }.count]
+                self.loadStats()
+                self.applyDocs(docs)
+                log("window: reload \(ms) ms off the main thread")
+            }
+        }
     }
 
     // MARK: numbers from the log, off the main thread
@@ -161,113 +263,6 @@ final class WindowModel: ObservableObject {
         }
     }
 
-    // MARK: selection and the status line
-
-    // MARK: the tape
-
-    /// Merges and filters the rows off the main thread; the newest result wins. The chosen row stays chosen (by id);
-    /// one that left the tape (a search, a filter) hands over to the first row.
-    func rebuildTape() {
-        tapeSeq += 1
-        let mine = tapeSeq
-        let (t, c, ty, d, q, k, g) = (takes, clips, typed, docs, query, kinds, goneIds)
-        let work = { TapeBuild.rows(takes: t, clips: c, typed: ty, docs: d, query: q, kinds: k, gone: g) }
-        func apply(_ r: [TapeItem]) {
-            guard mine == tapeSeq else { return }
-            rows = r
-            if let c = chosen, r.contains(where: { $0.id == c }) {} else { chosen = r.first?.id; open = nil }
-            if let o = open, !r.contains(where: { $0.id == o }) { open = nil }
-            if let o = open, let it = r.first(where: { $0.id == o }), it.doc != nil { open = nil }
-        }
-        if preview { apply(work()); return }
-        DispatchQueue.global(qos: .userInitiated).async { let r = work(); DispatchQueue.main.async { apply(r) } }
-    }
-
-    var current: TapeItem? { chosen.flatMap { c in rows.first { $0.id == c } } }
-
-    func choose(_ id: String) { if chosen != id { open = nil }; chosen = id }
-
-    func move(_ by: Int) {
-        guard page == .tape, !commandMode, !rows.isEmpty else { return }
-        let i = chosen.flatMap { c in rows.firstIndex { $0.id == c } } ?? -1
-        let j = max(0, min(rows.count - 1, i < 0 ? 0 : i + by))
-        if rows[j].id != chosen { open = nil; chosen = rows[j].id }
-    }
-
-    /// Return: a command runs; on the tape the chosen row opens or closes; a call or a long note opens as a page.
-    func enter() {
-        if commandMode { plan(); return }
-        guard let it = current else { return }
-        if let d = it.doc { openDoc(d); return }
-        open = open == it.id ? nil : it.id
-    }
-
-    /// Esc, step by step: the command, the open row, the search; on a page, back to the tape.
-    func escape() {
-        if page != .tape { back(); return }
-        if commandMode { commandMode = false; command = ""; options = []; return }
-        if open != nil { open = nil; return }
-        if !query.isEmpty { query = "" }
-    }
-
-    func back() { stopPlaying(); page = .tape; focusField += 1 }
-
-    func openDoc(_ d: CallDoc) { doc = d; page = .doc; if d.turns.isEmpty { loadWarnings(d) } }
-
-    func show(_ p: Page) { page = page == p ? .tape : p; if page == .tape { focusField += 1 } }
-
-    /// ⌘1-⌘4: that kind alone; the same key again, all of them.
-    func solo(_ k: TapeKind) { kinds = kinds == [k] ? Set(TapeKind.allCases) : [k]; page = .tape }
-
-    func startCommand() { page = .tape; commandMode = true; focusField += 1 }
-
-    func togglePin(_ it: TapeItem) {
-        guard let q = it.quick, !it.text.isEmpty else { return }
-        let was = Quick.shared.isPinned(q, it.text)
-        Quick.shared.togglePin(q, it.text, app: it.app, at: it.at)
-        status = was ? "Unpinned" : "Pinned · on top of the Quick panel"
-        tapeTick += 1
-    }
-
-    /// ⌘⌫: off the tape at once, out of the files when the undo line is gone (8 s, or the next removal).
-    func remove(_ it: TapeItem) {
-        guard it.quick != nil else { return }
-        commitGone()
-        let w = DispatchWorkItem { [weak self] in self?.commitGone() }
-        gone = (it, w); goneIds.insert(it.id)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: w)
-        if let i = rows.firstIndex(where: { $0.id == it.id }) { chosen = rows.indices.contains(i + 1) ? rows[i + 1].id : i > 0 ? rows[i - 1].id : nil }
-        open = nil
-        status = "Removed from history · ⌘Z brings it back"
-        rebuildTape()
-    }
-    var canUndoRemove: Bool { gone != nil }
-    func undoRemove() {
-        guard let g = gone else { return }
-        g.until.cancel(); gone = nil; goneIds.remove(g.item.id)
-        chosen = g.item.id; status = "Back"
-        rebuildTape()
-    }
-    private func commitGone() {
-        guard let g = gone else { return }
-        g.until.cancel(); gone = nil
-        let it = g.item
-        if let q = it.quick, !preview {
-            if Quick.shared.isPinned(q, it.text) { Quick.shared.togglePin(q, it.text, app: it.app, at: it.at) }
-            History.forget(q, it.entry?.text.isEmpty == false ? it.entry!.text : it.text, drafts: it.entry?.drafts ?? [])
-        }
-        switch it.kind {
-        case .copied: clips.removeAll { "c:\(Int($0.when.timeIntervalSince1970 * 1000)):\($0.text.count)" == it.id }
-        case .typed: typed.removeAll { "t:" + $0.id == it.id }
-        case .said: takes.removeAll { "v:" + $0.id == it.id }
-        case .call: break
-        }
-        goneIds.remove(it.id)
-        if status.hasPrefix("Removed") { status = "" }
-        rebuildTape()
-        log("window: removed a \(it.kind.name.lowercased()) row")
-    }
-
     private func settleStatus() {
         statusSeq += 1
         let mine = statusSeq
@@ -284,12 +279,7 @@ final class WindowModel: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + (status.hasPrefix("▶") ? 0.5 : 5), execute: check)
     }
 
-    func copy(_ e: Entry) { History.copy(e.text); status = "Copied: \(e.text.count) characters" }
-
-    func copyOriginal(_ e: Entry) {
-        guard !e.raw.isEmpty else { return }
-        History.copy(e.raw); status = "Copied \(e.originalLabel.lowercased()): \(e.raw.count) characters"
-    }
+    func copy(_ e: Entry) { History.copy(e.text); status = "On the clipboard · \(e.text.count) characters" }
 
     func play(_ e: Entry) {
         player?.stop()
@@ -311,8 +301,7 @@ final class WindowModel: ObservableObject {
     }
 
     func save(_ change: (inout Settings) -> Void) {
-        var st = Drafter.shared.settings; change(&st)
-        Drafter.shared.settings = st; st.save(); settings = st
+        let st = Drafter.shared.change(change); settings = st
         MicCapture.keepReady = st.keepMic && st.voice; MicCapture.prepare()
         Drafter.shared.apply(); Menu.shared.refresh()
     }
@@ -361,51 +350,34 @@ final class WindowModel: ObservableObject {
     }
 }
 
-
 struct WindowView: View {
     @EnvironmentObject var m: WindowModel
     var titlebar = false   // the preview draws the window's three dots (a borderless window has none)
     @State private var themeTick = 0   // a new theme: every view is made again with its colours and faces
     var body: some View {
         GeometryReader { g in
-            let side: CGFloat = g.size.width >= 900 ? 64 : 32
             VStack(spacing: 0) {
-                // the top: the big field (on the tape) or the way back (on a page), the three corner marks
-                HStack(spacing: 16) {
-                    if m.page == .tape { TapeField() } else { BackRow(title: pageTitle) }
-                    HStack(spacing: 2) {
-                        CornerMark(glyph: "bookmark", key: "⌘J", label: "Shortcuts", on: m.page == .shortcuts) { m.show(.shortcuts) }
-                        CornerMark(glyph: "settings", key: "⌘,", label: "Settings", on: m.page == .settings) { m.show(.settings) }
-                        CornerMark(glyph: "help", key: "⌘/", label: "Help", on: m.page == .help) { m.show(.help) }
-                    }
-                }
-                .padding(.horizontal, side).padding(.top, 40).frame(height: m.page == .tape ? 104 : 80, alignment: .bottom)
+                TopBar(title: pageTitle)
                 Group {
                     switch m.page {
                     case .tape:
-                        VStack(spacing: 0) {
-                            HStack(alignment: .lastTextBaseline) {
-                                Text(m.dayTitle).font(PKFont.display(28)).lineLimit(1)
-                                Spacer()
-                                KindMarks()
-                            }.padding(.top, 28).padding(.bottom, 12).padding(.horizontal, side)
-                            Rectangle().fill(UIInk.rule).frame(height: 1).padding(.horizontal, side)
-                            TapeList(m: m).padding(.leading, side).padding(.trailing, side - 16).padding(.trailing, 16)
-                        }
-                        .overlay(alignment: .top) { CommandOptions().padding(.top, 6).padding(.horizontal, side) }
+                        JournalPanesView(width: g.size.width)
                     case .doc:
-                        if let d = m.doc { DocView(d: d).id(d.id).padding(.horizontal, side - 32) } else { Color.clear }
-                    case .settings: SettingsView().padding(.horizontal, side - 28)
-                    case .help: HelpView().padding(.horizontal, side - 28)
-                    case .shortcuts: ShortcutsView().padding(.horizontal, side - 28)
+                        if let d = m.doc { DocView(d: d).id(d.id).padding(.horizontal, 16) } else { Color.clear }
+                    case .settings: SettingsView().padding(.horizontal, 20)
+                    case .help: HelpView().padding(.horizontal, 20)
+                    case .names: NamesView().padding(.horizontal, 20)
+                    case .shortcuts: ShortcutsView().padding(.horizontal, 20)
                     }
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
-                StatusBar().padding(.horizontal, side)
+                StatusBar()
             }
+            .onAppear { m.width = g.size.width }
+            .onChange(of: g.size.width) { _, w in m.width = w }
         }
         .overlay(alignment: .topLeading) {
             if titlebar {
-                HStack(spacing: 8) { ForEach(0..<3, id: \.self) { _ in Circle().fill(UIInk.rule).frame(width: 12, height: 12) } }.padding(.leading, 20).padding(.top, 18)
+                HStack(spacing: 8) { ForEach(0..<3, id: \.self) { _ in Circle().fill(UIInk.rule).frame(width: 12, height: 12) } }.padding(.leading, 14).padding(.top, 14)
             }
         }
         .background { WindowKeys() }
@@ -415,11 +387,12 @@ struct WindowView: View {
         .onReceive(NotificationCenter.default.publisher(for: ThemeStore.changed)) { _ in themeTick += 1; m.tapeTick += 1; m.focusField += 1 }
     }
     var pageTitle: String {
-        switch m.page { case .doc: return m.doc?.title ?? ""; case .settings: return "Settings"; case .help: return "Help"; case .shortcuts: return "Shortcuts"; case .tape: return "" }
+        switch m.page { case .doc: return m.doc?.title ?? ""; case .settings: return "Settings"; case .help: return "Help"; case .names: return "Names"; case .shortcuts: return "Shortcuts"; case .tape: return "" }
     }
 }
 
-/// The keys of the window, as hidden buttons (they work while the field has the caret).
+/// The keys of the window that work from anywhere in it, as hidden buttons. The journal's own keys (arrows, Return,
+/// Esc, Tab, ⌘C, ⌘P, ⌘⌫, ⌘Z, ⌘\, ⌘G, ⌘1-9) go through WindowModel.key and TapeNav.route (JournalModel.swift).
 struct WindowKeys: View {
     @EnvironmentObject var m: WindowModel
     func k(_ key: KeyEquivalent, _ mods: EventModifiers = .command, enabled: Bool = true, _ act: @escaping () -> Void) -> some View {
@@ -429,50 +402,16 @@ struct WindowKeys: View {
         let it = m.current, tape = m.page == .tape
         ZStack {
             k("k") { m.startCommand() }
-            k("f") { m.page = .tape; m.commandMode = false; m.focusField += 1 }
-            k("1") { m.solo(.copied) }; k("2") { m.solo(.typed) }; k("3") { m.solo(.said) }; k("4") { m.solo(.call) }
-            k("j") { m.show(.shortcuts) }; k(",") { m.show(.settings) }; k("/") { m.show(.help) }
+            k("f") { m.page = .tape; m.commandMode = false; m.nav.region = .search; m.focusField += 1 }
+            k("n", [.command, .shift]) { m.show(.names) }; k("j") { m.show(.shortcuts) }; k(",") { m.show(.settings) }; k("/") { m.show(.help) }
             k(.escape, [], enabled: !tape) { m.back() }
-            // the chosen row's keys (a call's: on its page too)
-            k("c", [.command, .shift], enabled: tape && it != nil) {
-                if let e = it?.entry { m.copy(e) } else if let d = it?.doc { m.copyNotes(d) }
-            }
-            k("c", [.command, .option], enabled: tape && it?.entry?.raw.isEmpty == false) { if let e = it?.entry { m.copyOriginal(e) } }
-            k("p", enabled: tape && it?.quick != nil) { if let it { m.togglePin(it) } }
             k("l", enabled: (tape && (it?.entry?.audio.isEmpty == false || it?.doc?.hasAudio == true)) || (m.page == .doc && m.doc?.hasAudio == true)) {
                 if m.page == .doc, let d = m.doc { m.playing == d.id ? m.stopPlaying() : m.play(d, from: 0) }
                 else if let e = it?.entry { m.play(e) }
                 else if let d = it?.doc { m.playing == d.id ? m.stopPlaying() : m.play(d, from: 0) }
             }
-            k(.delete, enabled: tape && m.open != nil && it?.quick != nil) { if let it { m.remove(it) } }
-            k("z", enabled: m.canUndoRemove) { m.undoRemove() }
             k("a", [.command, .shift], enabled: tape && it?.doc?.turns.isEmpty == false) { if let d = it?.doc { m.sendToAgent(d) } }
         }
-    }
-}
-
-/// The foot: a recording that is going (with Stop), the status line, the engine when it is not ready.
-struct StatusBar: View {
-    @EnvironmentObject var m: WindowModel
-    var body: some View {
-        HStack(spacing: 8) {
-            if let live = m.docs.first(where: \.live), !m.preview {
-                Button { m.openDoc(live) } label: {
-                    HStack(spacing: 6) {
-                        Circle().fill(UIInk.coral).frame(width: 7, height: 7)
-                        Text("Recording «\(live.title)»").font(PKFont.text(12)).lineLimit(1)
-                    }
-                }.buttonStyle(.plain).help("Open it; Stop recording is at the top")
-                Button("Stop") { m.stopRecording() }.controlSize(.small)
-            }
-            if m.options.isEmpty { Text(m.status).font(PKFont.text(12)).foregroundStyle(UIInk.muted).lineLimit(1) }   // else it is under the options
-            Spacer()
-            if !m.engine.isEmpty {
-                Circle().fill(m.engine.contains("stop") || m.engine.contains("cannot") ? UIInk.coral : UIInk.faint).frame(width: 6, height: 6)
-                Text("Engine: " + m.engine + (m.engine == "starting" || m.engine == "loading model" ? "…" : ""))
-                    .font(PKFont.mono(11)).foregroundStyle(UIInk.faint).lineLimit(1)
-            }
-        }.frame(height: 36)
     }
 }
 
@@ -538,6 +477,32 @@ struct SettingsView: View {
     static let sampleCalendars: [(id: String, title: String, source: String)] = [
         ("c1", "Work", "alex@example.com"), ("c2", "Family", "alex@example.com"),
         ("c3", "Transferred from sam@example.org", "alex@example.com"), ("c4", "Transferred from kim@example.net", "alex@example.com")]
+
+    /// The voice strip's look (setting `stripStyle`, 14 November 2026): two words, the chosen one on the soft lift, as
+    /// the light/dark choice beside the theme. It applies from the next take; a strip on screen is put away.
+    var stripRow: some View {
+        line {
+            HStack(spacing: 0) {
+                Glyph("waves", size: 16).foregroundStyle(UIInk.muted).frame(width: G.toggle, alignment: .leading)
+                Text("Strip").font(PKFont.text(16))
+                Spacer()
+                HStack(spacing: 2) {
+                    ForEach(StripStyle.allCases, id: \.self) { s in
+                        let on = m.settings.stripStyle == s.rawValue
+                        Button { m.save { $0.stripStyle = s.rawValue } } label: {
+                            Text(s.name).font(PKFont.text(13)).foregroundStyle(on ? UIInk.ink : UIInk.muted)
+                                .padding(.horizontal, 10).frame(height: 26)
+                                .background(RoundedRectangle(cornerRadius: PK.corner(2)).fill(on ? UIInk.soft : .clear))
+                                .contentShape(Rectangle())
+                        }.buttonStyle(.plain).accessibilityAddTraits(on ? .isSelected : [])
+                    }
+                }
+                .padding(2).overlay { RoundedRectangle(cornerRadius: PK.corner(2) + 2).strokeBorder(UIInk.line, lineWidth: 1) }
+                .accessibilityLabel("Strip style")
+                Color.clear.frame(width: G.cloud + 12, height: 1)
+            }
+        }
+    }
     /// His EventKit calendars, account by account.
     static func calendars() -> [(id: String, title: String, source: String)] {
         guard EKEventStore.authorizationStatus(for: .event) == .fullAccess else { return [] }
@@ -557,6 +522,10 @@ struct SettingsView: View {
                     row("Suggestions while typing", !s.paused, stat: LogStats.suggest, typing: true) { $0.paused = !$1 }
                     row("Longer suggestions in AI apps", s.longGhostsAI, typing: true) { $0.longGhostsAI = $1 }
                     row("Longer suggestions in chats", s.longGhostsChats, typing: true) { $0.longGhostsChats = $1 }
+                    row("No suggestions after a typo", s.typoHold, typing: true) { $0.typoHold = $1 }
+                    row("Suggestions in the middle of a line", s.midLine, typing: true) { $0.midLine = $1 }
+                    modelRows
+                    parityRows
                     row("Claude finishes the sentence when I pause", s.claudeTyping, sends: true, typing: true) { $0.claudeTyping = $1 }
                     row("Claude writes the rest when I stop", s.claudePause, sends: true, stat: LogStats.claude, typing: true) { $0.claudePause = $1 }
                     row("Proofread the message when I rest", s.proofread, sends: true, stat: LogStats.proofread, typing: true) { $0.proofread = $1 }
@@ -569,14 +538,16 @@ struct SettingsView: View {
                     row("Fix Ukrainian typos too", s.autocorrectUk, typing: true) { $0.autocorrectUk = $1 }
                     row("Fix the word while I type it", s.fixWord, stat: LogStats.fixWord, typing: true) { $0.fixWord = $1 }
                     row("Backspace takes back the last Tab", s.tabBack, typing: true) { $0.tabBack = $1 }
+                    row("Offer \"Pick parts\" after a long copy", s.pickOffer, typing: true) { $0.pickOffer = $1 }
                     row("Esc twice pauses suggestions in a field", s.escPause, typing: true) { $0.escPause = $1 }
                     row("Fix the wrong keyboard layout", s.layoutFix, stat: LogStats.layout, typing: true) { $0.layoutFix = $1 }
-                    row("Read the screen when an app shows no text", s.screen, typing: true) { $0.screen = $1 }
+                    row("Typography as you type", s.typography, typing: true) { $0.typography = $1 }
+                    row("Read the messages on screen, on this Mac only", s.screenContext, typing: true, value: s.screenContext && !Screen.allowed ? "no access" : nil) { $0.screenContext = $1 }
                 }
                 group("Voice") {
                     row("Right Option for voice", s.voice, value: m.stats.map { "\($0["takes"]?.shown ?? 0) today" }) { $0.voice = $1 }
                     row("Keep the microphone ready", s.keepMic) { $0.keepMic = $1 }
-                    row("Insert words while I speak", s.voiceLive) { $0.voiceLive = $1 }
+                    row("Type into the field while I speak", s.voiceInsert == "live") { $0.voiceInsert = $1 ? "live" : "enter" }
                     row("Paste the last take again", !s.againKey.isEmpty, value: s.againKey.isEmpty ? nil : s.againKey) { $0.againKey = $1 ? "⌃⌥R" : "" }
                 }
                 group("Calls and long notes") {
@@ -612,7 +583,17 @@ struct SettingsView: View {
                     // copied pictures kept in data/clips/ (round three): off = only their size, as before
                     // quick capture (app/Capture.swift): its key in the gutter; off = no key
                     row("⌘⇧V again swaps the paste for an older copy", s.switchSwap) { $0.switchSwap = $1 }
-                    row("Quick capture", !s.captureKey.isEmpty, value: s.captureKey.isEmpty ? nil : s.captureKey) { $0.captureKey = $1 ? ShotRules.defaultKey : "" }
+                    // the key in use: ⌘⇧5 once macOS lets it go (ShotRules.keys), else ⌃⌥S; while macOS holds ⌘⇧5, the one step
+                    let inUse = ShotRules.keys(setting: s.captureKey, systemOn: m.preview ? true : Capture.systemKeyOn, cmdShiftS: s.captureCmdShiftS).first
+                    row("Quick capture", !s.captureKey.isEmpty, value: inUse) { $0.captureKey = $1 ? ShotRules.defaultKey : "" }
+                    // ⌘⇧S is Save As / Duplicate in many apps and the tap takes it from all of them: off gives it back
+                    if !s.captureKey.isEmpty {
+                        row("⌘⇧S starts the capture (apps lose Save As on it)", s.captureCmdShiftS) { $0.captureCmdShiftS = $1 }
+                    }
+                    if ShotRules.showSystemStep(setting: s.captureKey, systemOn: m.preview ? true : Capture.systemKeyOn) {
+                        Text("For ⌘⇧5: System Settings › Keyboard › Keyboard Shortcuts › Screenshots, untick ⌘⇧5.")
+                            .font(PKFont.text(12)).foregroundStyle(UIInk.muted).fixedSize(horizontal: false, vertical: true).padding(.top, 4)
+                    }
                     row("Keep copied pictures", s.clipTotalMB > 0, value: s.clipTotalMB > 0 ? "\(s.clipTotalMB) MB" : nil) { $0.clipTotalMB = $1 ? 300 : 0 }
                     line {
                         HStack(spacing: 16) {
@@ -658,19 +639,22 @@ struct HelpView: View {
                 Text("Drafter helps you write in any app: suggestions, dictation, notes, calls and small actions. History stays on this Mac. Parts that use Claude say so.")
                     .font(PKFont.text(13)).foregroundStyle(UIInk.muted).fixedSize(horizontal: false, vertical: true).padding(.bottom, 10)
                 part("Typing suggestions", "Words and endings from your own writing, then the model on this Mac. Ukrainian and English stay in the language you type. A suggestion never changes a word by itself.",
-                     keys: [("⇥", "accept one word"), ("⇧⇥", "accept the whole suggestion"), ("⌫", "right after ⇥: take it back"), ("esc esc", "pause suggestions in this field for 10 min"), ("keep typing", "adjust or dismiss")])
+                     keys: [("⇥", "accept one word"), ("⇧⇥", "accept the whole suggestion"), ("⌃⇥", "accept to the end of the sentence"), ("⌃⇧⇥", "show another idea"), ("⌫", "right after ⇥: take it back"), ("esc esc", "pause suggestions in this field for 10 min"), ("keep typing", "adjust or dismiss")])
+                part("Names", "Every person, project, company and place you write or say, with its forms, phone, email and how often it comes up. Typing finishes a name after 2-3 letters; voice reads the ones you use most. A fix here counts for both.",
+                     keys: [("⇧⌘N", "open"), ("↵", "fix the spelling"), ("⌘M", "merge into another"), ("⌘⌫", "hide"), ("⌘Z", "undo")])
                 part("Shortcuts and replacements", "Your email, calendar link and your own replacements work without the model. AU + Space puts in your email; ;cal + Space your calendar link. Edit them in Shortcuts.", keys: [])
                 part("Next message", "In an empty chat, a likely reply. In ChatGPT, Claude or Codex, your likely next instruction. Sends the visible conversation to Claude Haiku.",
                      keys: [("← →", "other options"), ("↓", "the whole text"), ("⇥", "insert")])
                 part("Voice", "Words show in the strip first. Ukrainian and English, your dictionary, spoken corrections and lists.",
-                     keys: [("right ⌥", "start / finish"), ("hold right ⌥", "push to talk"), ("⏎", "insert this piece, keep listening"), ("esc", "cancel a short take"), ("⌃⌥R", "paste the last take again"), ("Drafter, …", "ask your notes")],
+                     keys: [("Right Option", "start / stop"), ("hold Right Option", "push to talk"), ("Return", "Insert, keeps listening: what you said so far goes in, the note goes on"), ("Return after a stop", "insert the draft"), ("Return, nothing said", "goes to the app"), ("Esc", "stop and drop the voice note (it stays in the journal)"), ("⌃⌥R", "insert the last voice note again"), ("Drafter, …", "ask your notes")],
                      stat: m.stats.map { "today: \($0["takes"]?.shown ?? 0) takes" } ?? "")
                 part("Calls and long notes", "Audio goes to disk while it records, with screenshots when the screen changes. At the end: a transcript of both sides, a title from your calendar, people, a summary and to-dos. Calls & notes shows them as notes you can search; For agent hands one to Claude or Codex. A call is recorded only when you say so.",
-                     keys: [("⇧ right ⌥", "start / finish a note, or record the call that is on"), ("⇥", "record when the strip offers a call"), ("⇧⌘A", "copy a recording for an agent")])
+                     keys: [("⇧ Right Option", "start / finish a recording, or record the call that is on"), ("Tab", "record when the strip offers a call"), ("⇧⌘A", "copy a recording for an agent")])
                 part("Actions", "Use the field in the title bar or Aleph's ⌘Space bar: book 30 minutes tomorrow, find a free slot, task: …, ;snippet. Haiku handles requests; the model on this Mac is the fallback. Nothing runs until you click.",
                      keys: [("⌘K", "go to the field"), ("⏎", "suggest options"), ("click", "run one")])
-                part("History", "Voice takes, calls and notes, typed lines and drafts you left, and the clipboard. Voice clips are kept for 14 days. Password fields and protected clipboard items are never kept.",
-                     keys: [("⌘1-4", "the lists"), ("⌘F", "search"), ("⌘,", "settings"), ("⌃⌥V", "Quick panel"), ("⌘⇧V", "paste switcher; again within 2 s: the older copy instead")], stat: "typed today: \(t["typed"] ?? 0)")
+                part("The journal", "Everything Drafter kept, newest first, in chunks of time that grow coarser with age: Today and Yesterday by part of the day, this week and last week by day, this month by week, earlier months and years. Under them, sessions: a stretch in one app with gaps under 10 minutes. Kinds: Clips, Drafts, Voice notes, Recordings, Pictures, Links, Files. The sidebar names each place with its count; the reader on the right shows the chosen item in full. Your changes are kept beside the original; Revert brings the original back. Voice audio is kept for 14 days. Password fields and protected clipboard items are never kept.",
+                     keys: JournalKeys.all, stat: "drafts today: \(t["typed"] ?? 0)")
+                part("Elsewhere", "", keys: [("⌘,", "Settings"), ("⌘J", "Shortcuts"), ("⌃⌥V", "Quick panel"), ("⌘⇧V", "paste switcher; again within 2 s: the older copy instead")])
             }.padding(.horizontal, 28).padding(.vertical, 22).frame(maxWidth: 640, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .leading)
         }

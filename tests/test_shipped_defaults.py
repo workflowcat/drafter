@@ -39,7 +39,7 @@ class Defaults(unittest.TestCase):
 
     def test_engine_falls_back_to_them(self):
         src = (ROOT / "engine/server.py").read_text()
-        self.assertIn('p = fitted("gate.json")', src)
+        self.assertIn('fitted("gate.json")', src)     # in gate_file() since the model catalog (live keeps it)
         self.assertIn("p = fitted(name)", src)
 
 

@@ -45,7 +45,11 @@ FB = Path(local.expand(local.config()["social"].get("facebook_archive") or "") o
 MAX_CHARS = 600
 # Training weight per source (bench/make_train.py --corpus): copies of each line, a fraction is a chance. Picked on held-out
 # typed lines from AI apps (docs/rounds/2026-11-13-typing.md, round three). data/corpus-weights.json overrides.
-WEIGHTS = {"typed": 2, "take": 0.5, "cc": 1, "codex": 1, "beeper": 1, "vnotes": 0.5, "vault": 0.5, "fb": 0.5}
+# Per-source sampling for the nightly retrain's training lines (bench/make_train.py). Round three (13-14 November,
+# docs/rounds/2026-11-13-typing.md "Layers trained on other writing"): takes add fillers and cost right first words, and
+# 60,000 Beeper lines would drown his prompts, so chats 0.1 and takes 0, the mix bench/weights/train_sweep.py trains.
+# Was beeper 1 and take 0.5 until 14 November: about 60,000 of the 70,000 training lines would have been chats.
+WEIGHTS = {"typed": 2, "take": 0, "cc": 1, "codex": 1, "beeper": 0.1, "vnotes": 0.5, "vault": 0.5, "fb": 0.5}
 WORD = re.compile(r"[\w'’-]+", re.U)
 RUSSIAN = re.compile(r"[ыэъёЫЭЪЁ]")
 # Not his own words: harness wrappers, agent briefs pasted in, interrupted turns

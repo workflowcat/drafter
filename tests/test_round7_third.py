@@ -67,7 +67,7 @@ class Sleep(unittest.TestCase):
         ns = extract('engine/model.py', {'sleep', 'wake', '_ensure', 'oneshot'},
                      dict(time=time, load=load), cls='Model')
         m = types.SimpleNamespace(lock=threading.Lock(), model=None, wake_at=0, retrain_sleep=False,
-                                  repo='fake', adapter=None, head_ids=[], _warm=Mock(), lora=Mock(),
+                                  repo='fake', adapter=None, head_ids=[], parked={}, marks={}, _warm=Mock(), lora=Mock(),
                                   _oneshot=Mock(return_value='answer'), tw=None, _tweak=lambda tw: None)
         m._ensure = lambda force=False: ns['_ensure'](m, force)
         self.assertFalse(ns['sleep'](m, 3600, retrain=True))

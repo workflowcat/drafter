@@ -21,7 +21,9 @@ def load(fake_complete, latest):
               LATEST_LOCK=threading.Lock(), jobs=queue.Queue(), BRANCHES=0, re=__import__("re"), selector=lambda: None, word_first=lambda *a: "", JOB_ORDER=iter(range(1 << 30)),
               AHEAD=OrderedDict(), AHEAD_LOCK=threading.Lock(), AHEAD_TTL=30.0, AHEAD_STATS={"made": 0, "hit": 0}, AHEAD_KIND={},
               AHEAD_DAYS_FILE=Path(__import__("tempfile").mkdtemp()) / "ahead-days.json", _ahead_days=None, _ahead_saved=[0.0],
-              model=types.SimpleNamespace(asleep=False, loading=False))
+              model=types.SimpleNamespace(asleep=False, loading=False),
+              # long round: futures and the in-flight join (engine/server.py); stand-ins keep the old behaviour
+              note_gap=lambda: None, futures_k=lambda cap=None: 0, INFLIGHT={}, WANT=[""], FUT_INDEX=OrderedDict(), COSTS=[], GAPS=[])
     exec(compile(ast.Module(body=fns, type_ignores=[]), str(source), "exec"), ns)
     return ns
 
@@ -33,13 +35,13 @@ def settle():
 class Ahead(unittest.TestCase):
     def test_taking_the_text_finds_the_next_one_ready(self):
         calls = []
-        def fake(req, low=False, seq=None, pack=None):
+        def fake(req, low=False, seq=None, pack=None, **kw):
             calls.append((req["before"], low))
             return {"text": " next" if req["before"].endswith("know") else "", "src": "gate", "ms": 60}
         ns = load(fake, [5])
         req = {"before": "let me kn", "app": "Claude", "context": "", "early": True, "field": 3}
         first = {"text": "ow", "src": "gate", "ms": 60}
-        ns["_complete"] = lambda r, low=False, seq=None, pack=None: first if r["before"] == "let me kn" else fake(r, low)
+        ns["_complete"] = lambda r, low=False, seq=None, pack=None, **kw: first if r["before"] == "let me kn" else fake(r, low)
         self.assertEqual(ns["complete"](req)["text"], "ow")
         settle()
         self.assertEqual(calls, [("let me know", True)])                   # worked out at low priority
@@ -53,25 +55,27 @@ class Ahead(unittest.TestCase):
         self.assertEqual(day, {"asked": 2, "started": 2, "made": 2, "next_made": 2, "used": 1, "next_used": 1})
         self.assertTrue(ns["AHEAD_DAYS_FILE"].exists())   # first count saves at once, then at most once a minute
 
-    def test_a_newer_key_meanwhile_keeps_nothing(self):
+    def test_a_newer_key_meanwhile_still_keeps_the_finished_answer(self):
+        # long round (2026-11-14): an answer that ends a moment after his next key is the exact answer for its text,
+        # so it is kept (before, it was thrown away: one cause of the low live hit rate); the futures after it stop
         latest = [5]
-        def fake(req, low=False, seq=None, pack=None):
+        def fake(req, low=False, seq=None, pack=None, **kw):
             if low: latest[0] += 1                                            # he typed while it ran
             return {"text": "ow" if not low else " next", "src": "gate"}
         ns = load(fake, latest)
         ns["complete"]({"before": "let me kn", "app": "Claude"})
         settle()
-        self.assertEqual(len(ns["AHEAD"]), 0)
+        self.assertEqual(len(ns["AHEAD"]), 1)
 
     def test_actions_fixes_and_empty_answers_start_nothing(self):
         for res in ({"text": "", "src": "gate"}, {"text": "x", "action": {"id": "a"}}, {"text": "word", "replace": "wrod"}):
-            ns = load(lambda req, low=False, seq=None, pack=None, res=res: res, [1])
+            ns = load(lambda req, low=False, seq=None, pack=None, res=res, **kw: res, [1])
             ns["complete"]({"before": "abc", "app": "Claude"})
             settle()
             self.assertEqual(ns["AHEAD_STATS"]["made"], 0, res)
 
     def test_a_different_screen_is_a_different_request(self):
-        ns = load(lambda req, low=False, seq=None, pack=None: {"text": "x"}, [1])
+        ns = load(lambda req, low=False, seq=None, pack=None, **kw: {"text": "x"}, [1])
         a = ns["ahead_key"]({"before": "hi", "app": "Beeper", "context": "one"})
         self.assertNotEqual(a, ns["ahead_key"]({"before": "hi", "app": "Beeper", "context": "two"}))
         self.assertEqual(a, ns["ahead_key"]({"before": "hi", "app": "Beeper", "context": "one", "after": "z", "early": True}))
@@ -109,7 +113,7 @@ class Cancellation(unittest.TestCase):
         import people
         import tempfile
         source = Path(__file__).resolve().parents[1] / 'engine/server.py'
-        names = {'_complete', 'earlier'}
+        names = {'_complete', 'earlier', 'extras'}
         fns = [n for n in ast.parse(source.read_text()).body if isinstance(n, ast.FunctionDef) and n.name in names]
         with tempfile.TemporaryDirectory() as folder:
             p = people.People(Path(folder) / 'people.json')
@@ -120,7 +124,7 @@ class Cancellation(unittest.TestCase):
             p.block('\n'.join(p.chats['new']['mine'][:2]))
             parts = Mock(return_value=('hello', 'Beeper', '', old, 'Beeper'))
             ns = dict(time=time, re=re, FMT='raw', AI_APPS=(), MAX_TOKENS=8, MIN_P=.3, MAX_WORDS=3, short=lambda req, text: False,
-                      parts=parts, builder_for=lambda fmt: types.SimpleNamespace(ids=lambda *a: ([0], '')),
+                      parts=parts, builder_for=lambda fmt: types.SimpleNamespace(ids=lambda *a: ([0], ''), ids_stable=lambda *a: ([0], '', 0)),
                       snippets=types.SimpleNamespace(offer=lambda b: None),
                       phrases=types.SimpleNamespace(suggest=lambda b: ('', 0)),
                       gate=lambda: None, selector=lambda: None, word_first=lambda *a: "", people_mem=p, clean=lambda b, t: t, knowledge=know.Pack(),

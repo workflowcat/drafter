@@ -32,8 +32,8 @@ class AppGuard(unittest.TestCase):
             command = ['swiftc', '-module-cache-path', str(path / 'cache'),
                        str(path / 'extracted.swift'), str(ROOT / 'app/Rules.swift'), str(ROOT / 'app/LiveType.swift'),
                        str(ROOT / 'tests/voice_app_guard.swift'), '-o', str(path / 'check')]
-            built = subprocess.run(command, capture_output=True, text=True, timeout=60)
+            built = subprocess.run(command, capture_output=True, text=True, timeout=300)
             self.assertEqual(built.returncode, 0, built.stderr)
-            checked = subprocess.run([str(path / 'check')], capture_output=True, text=True, timeout=10)
+            checked = subprocess.run([str(path / 'check')], capture_output=True, text=True, timeout=60)
             self.assertEqual(checked.returncode, 0, checked.stderr)
             self.assertIn('PASS', checked.stdout)

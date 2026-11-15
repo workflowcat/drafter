@@ -5,6 +5,7 @@ enum Home {
     static let root = URL(fileURLWithPath: CommandLine.arguments[1])
     static let data = root.appendingPathComponent("data")
     static let python = URL(fileURLWithPath: CommandLine.arguments[2])
+    static let words = data.appendingPathComponent("words.json")   // the dictionary the engine gets as DRAFTER_WORDS
 }
 func log(_ text: String) {}
 // same as app/Main.swift: the voice log is opened for appending (log rotation, 2026-11-13)
@@ -23,6 +24,7 @@ final class Talk {
     var state = State.idle
     var failures = 0
     func engineFailed() { failures += 1; state = .idle }
+    func engineAwake() {}
 }
 @main struct LifecycleChecks {
     static func spin(_ seconds: Double) {

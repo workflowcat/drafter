@@ -14,6 +14,21 @@ enum PK {
     static let faint = PKColors.faint, line = PKColors.line, rule = PKColors.rule, soft = PKColors.soft
     static let blue = PKColors.blue, mint = PKColors.mint, violet = PKColors.violet, coral = PKColors.coral, warn = PKColors.warn
     static let selected = PKColors.selected, key = PKColors.key, keyEdge = PKColors.keyEdge
+    /// The soft surfaces (soft round, 14 November 2026): the window behind the panes, a row or card under the pointer,
+    /// the chosen one. From the theme (ThemeRules.surfaces).
+    static let well = ThemeStore.color("well"), hover = ThemeStore.color("hover"), pick = ThemeStore.color("pick")
+    /// The theme's radii: "pane", "card", "row".
+    static func radius(_ k: String) -> CGFloat { CGFloat(ThemeStore.spec.radii[k] ?? ThemeRules.defaultRadii[k] ?? 8) }
+    /// How long a motion takes, in seconds ("fold", "fade"); 0 when Reduce Motion is on.
+    static func motion(_ k: String) -> Double {
+        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : (ThemeStore.spec.motion[k] ?? ThemeRules.defaultMotion[k] ?? 0) / 1000
+    }
+    /// The interface face with even (tabular) digits: times and lengths in the soft look.
+    static func num(_ size: CGFloat, _ w: NSFont.Weight = .regular) -> NSFont { face("num", ThemeStore.spec.body, size, w, tabular: true) }
+    /// A kind's mark colour (JournalMeta.kinds: blue, mint, violet, coral, neutral).
+    static func series(_ name: String) -> NSColor {
+        switch name { case "blue": return blue; case "mint": return mint; case "violet": return violet; case "coral": return coral; default: return muted }
+    }
 
     // MARK: type
 
@@ -178,6 +193,7 @@ enum UIInk {
     static let keyEdge = Color(nsColor: PK.keyEdge), rule = Color(nsColor: PK.rule), card = Color(nsColor: PK.card)
     static let mint = Color(nsColor: PK.mint), violet = Color(nsColor: PK.violet), warn = Color(nsColor: PK.warn)
     static let primary = Color(nsColor: PKColors.primary), onPrimary = Color(nsColor: PKColors.onPrimary)
+    static let well = Color(nsColor: PK.well), hover = Color(nsColor: PK.hover), pick = Color(nsColor: PK.pick)
 }
 
 /// SwiftUI faces: Fixel for words, Fixel Display for titles, JetBrains Mono for numbers.
@@ -185,6 +201,7 @@ enum PKFont {
     static func text(_ size: CGFloat, _ w: NSFont.Weight = .regular) -> Font { Font(PK.text(size, w)) }
     static func display(_ size: CGFloat) -> Font { Font(PK.display(size)) }
     static func mono(_ size: CGFloat, _ w: NSFont.Weight = .regular) -> Font { Font(PK.mono(size, w)) }
+    static func num(_ size: CGFloat, _ w: NSFont.Weight = .regular) -> Font { Font(PK.num(size, w)) }
 }
 
 /// A PixelKit line glyph in SwiftUI, in the colour of the text around it.
@@ -248,7 +265,9 @@ enum ThemeStore {
         func m(_ d: [String: (UInt32, CGFloat)]) -> [String: RGBA] {
             d.mapValues { v in RGBA(r: Double((v.0 >> 16) & 255) / 255, g: Double((v.0 >> 8) & 255) / 255, b: Double(v.0 & 255) / 255, a: Double(v.1)) }
         }
-        return ThemeSpec(id: "pixel", name: "Pixel", light: m(PKColors.pixelLight), dark: m(PKColors.pixelDark),
+        var light = m(PKColors.pixelLight), dark = m(PKColors.pixelDark)
+        light.merge(ThemeRules.surfaces(light, mode: "light")) { a, _ in a }; dark.merge(ThemeRules.surfaces(dark, mode: "dark")) { a, _ in a }
+        return ThemeSpec(id: "pixel", name: "Pixel", light: light, dark: dark,
                          display: ["Fixel Display", "Fixel Text"], body: ["Fixel Text"], mono: ["JetBrains Mono"], tabular: false,
                          corners: [0, 4, 8, 12], shadow: (8, 24, 0.18), problems: [])
     }

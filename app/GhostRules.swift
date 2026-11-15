@@ -54,4 +54,124 @@ enum GhostRules {
     }
 
     static func norm(_ s: String) -> String { s.replacingOccurrences(of: "\u{A0}", with: " ") }
+
+    // MARK: long round (2026-11-14): sentence-length ghosts, the rolling ghost, futures and other ideas
+
+    /// Setting `ghostLength`: "word" (round five's short ghost), "phrase", "sentence" (default). Anything else reads as
+    /// the default.
+    static func lengthMode(_ s: String) -> String { ["word", "phrase", "sentence"].contains(s) ? s : "sentence" }
+
+    /// ⌃Tab: the ghost up to the end of its first sentence (. ! ? … with closing quotes and the space after), or all of
+    /// it when it has no sentence end. ⇧Tab still takes all of it, which after a roll can run past the sentence.
+    static func sentencePiece(_ ghost: String) -> String {
+        let chars = Array(ghost)
+        var i = 0
+        while i < chars.count {
+            if ".!?…".contains(chars[i]) {
+                var j = i + 1
+                while j < chars.count, ".!?…\"'»”)]".contains(chars[j]) { j += 1 }
+                // "e.g" or "3.5": a stop with a letter right after it is not a sentence end
+                if j < chars.count, !chars[j].isWhitespace { i = j; continue }
+                if j < chars.count, chars[j] == " " { j += 1 }
+                return String(chars[..<j])
+            }
+            if chars[i] == "\n" { return String(chars[..<i]) }
+            i += 1
+        }
+        return ghost
+    }
+
+    /// Words still grey: what is left of the ghost after Tab or letters typed into it.
+    static func wordsLeft(_ rest: String) -> Int { rest.split(whereSeparator: { $0 == " " || $0 == "\n" }).count }
+
+    /// The rolling ghost: once two words or fewer are left of a final ghost, the words after it are asked for (from the
+    /// engine's prepared answer for the whole ghost, so mostly at once) and added at its end, so a sentence keeps
+    /// coming while he Tabs. Once per ghost text (`askedFor` is the text the last roll asked for); never in "word"
+    /// mode, never for a chip, a fix or a next-message card.
+    static func rollWanted(rest: String, mode: String, final: Bool, plain: Bool, wanted: String, askedFor: String?) -> Bool {
+        guard lengthMode(mode) != "word", final, plain, !rest.trimmingCharacters(in: .whitespaces).isEmpty, !rest.hasSuffix("\n") else { return false }
+        return wordsLeft(rest) <= 2 && norm(wanted) != norm(askedFor ?? "")
+    }
+
+    /// The roll's answer goes on only while the field and the ghost still read as when it was asked.
+    static func rollFits(asked: String, now: String) -> Bool { norm(asked) == norm(now) }
+
+    /// The lighter tail after a roll: words added after a lighter part stay lighter; after a sure part they bring their
+    /// own split.
+    static func rollUnsure(old: Int, more: Int, moreUnsure: Int) -> Int { old > 0 ? old + more : min(more, moreUnsure) }
+
+    /// The answer prepared for the letter just typed (engine /futures, fetched once the ghost was final): shown at once,
+    /// no request, when the field before that letter is the base the futures were made for.
+    static func future(base: String, before: String, typed: String, futures: [(letter: String, text: String, unsure: String)]) -> (text: String, unsure: String)? {
+        guard !typed.isEmpty, norm(base) == norm(before) else { return nil }
+        return futures.first(where: { $0.letter == typed }).map { ($0.text, $0.unsure) }
+    }
+
+    /// Other ideas for the same spot (⌃⇧Tab): the shown ghost first, then each prepared future as its letter and its
+    /// words, none twice, none that only repeats the shown one.
+    static func ideas(shown: String, futures: [(letter: String, text: String, unsure: String)]) -> [(text: String, unsure: Int)] {
+        var out: [(text: String, unsure: Int)] = [(shown, 0)]
+        for f in futures {
+            let t = f.letter + f.text
+            guard !f.text.isEmpty, !out.contains(where: { $0.text == t }), !shown.hasPrefix(t) else { continue }
+            out.append((t, t.hasSuffix(f.unsure) ? f.unsure.count : 0))
+        }
+        return out
+    }
+
+    /// The next idea, wrapping back to the first; nil when there is no other idea to show.
+    static func cycle(index: Int, count: Int) -> Int? { count > 1 ? (index + 1) % count : nil }
+
+    // MARK: mid-line round (2026-11-15): a ghost with text after the caret on the same line (setting `midLine`)
+
+    /// The rest of the caret's line: what follows the caret up to the next line break.
+    static func lineRest(_ after: String) -> String {
+        String(after.prefix(while: { $0 != "\n" && $0 != "\r" && $0 != "\u{2028}" }))
+    }
+
+    /// A mid-line rest longer than this keeps Drafter quiet: the caret is deep inside a paragraph, not at a gap.
+    static let midRestMax = 120
+
+    /// A ghost may show with text after the caret on its line only at a gap between words: the rest starts with a space
+    /// or a punctuation mark (never a letter or digit, never an apostrophe or hyphen joining two letters, so never inside
+    /// a word), it is at most `midRestMax` characters, and the caret's line has a letter or digit before it.
+    /// `before`: the text before the caret; `rest`: the rest of its line (`lineRest`), not blank.
+    static func midLineOK(before: String, rest: String) -> Bool {
+        guard let first = rest.first, !rest.trimmingCharacters(in: .whitespaces).isEmpty, rest.count <= midRestMax else { return false }
+        if first.isLetter || first.isNumber || first == "_" || first.isNewline { return false }
+        // "don|'t", "well|-known": a joiner between two letters is inside a word
+        if "'’‘-‐".contains(first), before.last?.isLetter == true, rest.dropFirst().first?.isLetter == true { return false }
+        let line = before.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "\n" || $0 == "\r" }).last.map(String.init) ?? before
+        return line.contains(where: { $0.isLetter || $0.isNumber })
+    }
+
+    /// The text after the caret sent to the engine mid-line: the rest of the line first, then at most `midLines` more
+    /// lines, at most `midAfterMax` characters.
+    static let midLines = 2, midAfterMax = 400
+    static func midAfter(_ after: String) -> String {
+        let lines = after.split(separator: "\n", maxSplits: midLines + 1, omittingEmptySubsequences: false)
+        return String(lines.prefix(midLines + 1).joined(separator: "\n").prefix(midAfterMax))
+    }
+
+    /// A mid-line ghost as it may be drawn and put in: one line only (cut at a line break), never repeating the start of
+    /// the rest at its end (the model wrote past the gap), no trailing space when the rest starts with one. "" = none.
+    static func midText(_ ghost: String, rest: String) -> String {
+        var g = String(ghost.prefix(while: { $0 != "\n" && $0 != "\r" }))
+        let r = Array(rest)
+        var k = min(g.count, r.count, 40)
+        while k >= 2 {
+            if g.hasSuffix(String(r[..<k])) { g = String(g.dropLast(k)); break }
+            k -= 1
+        }
+        if rest.first?.isWhitespace == true { while g.last?.isWhitespace == true { g.removeLast() } }
+        return g
+    }
+
+    /// The long round's two keys, only while a plain ghost shows (never a chip, a fix or a card): ⌃Tab takes up to the
+    /// end of the sentence, ⌃⇧Tab shows the next idea. Without a ghost both go to the app (a browser's tab switch).
+    enum LongKey: Equatable { case sentence, cycle, none }
+    static func longKey(code: Int, control: Bool, shift: Bool, option: Bool, command: Bool, ghost: Bool, plain: Bool) -> LongKey {
+        guard code == 48, control, !option, !command, ghost, plain else { return .none }
+        return shift ? .cycle : .sentence
+    }
 }

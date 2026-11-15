@@ -21,8 +21,13 @@ enum TapeKind: CaseIterable {
     var color: NSColor {
         switch self { case .copied: return PK.blue; case .typed: return PK.mint; case .said: return PK.violet; case .call: return PK.coral }
     }
+    /// The kind's name for people: a noun (Andrii, 14 November: no past-tense verbs as names).
     var name: String {
-        switch self { case .copied: return "Copied"; case .typed: return "Typed"; case .said: return "Said"; case .call: return "Calls and notes" }
+        switch self { case .copied: return "Clips"; case .typed: return "Drafts"; case .said: return "Voice notes"; case .call: return "Recordings" }
+    }
+    /// The stored kind value the journal's rules use (TapeRules): copied, typed, spoken, call.
+    var word: String {
+        switch self { case .copied: return "copied"; case .typed: return "typed"; case .said: return "spoken"; case .call: return "call" }
     }
 }
 

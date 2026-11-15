@@ -83,6 +83,63 @@ import Foundation
         precondition(RefRules.level("agent") == 3 && RefRules.level("ai") == 2 && RefRules.level("chat") == 1)
         print("PASS: the card finds any kind; forms per place; agent apps")
 
+        // --- ambiguous forms (2026-11-14 relations round): the same decisions as entities.decide
+        for c in g["decide"] as! [[String: Any]] {
+            let cands = (c["cands"] as! [[String: Any]]).map { d in
+                EntityRules.Cand(i: d["i"] as! Int, how: d["how"] as! String, score: (d["score"] as! NSNumber).doubleValue,
+                                 heat: (d["heat"] as! NSNumber).doubleValue, related: d["related"] as! Bool, named: d["named"] as! Bool, kind: d["kind"] as! Bool,
+                                 chat: d["chat"] as? Bool ?? false)
+            }
+            let got = EntityRules.decide(cands, flags: c["flags"] as! [String], picked: c["picked"] as? Int)
+            let want = c["expect"] as! [Any]
+            precondition((got.index ?? -1) == want[0] as! Int && got.resolved == want[1] as! Bool, "decide \(c["name"]!): \(got)")
+        }
+        for c in g["chat_target"] as! [[String: Any]] {
+            let got = EntityRules.chatTarget(EntityRules.fold(c["text"] as! String))
+            precondition(got == c["expect"] as? String, "chat target \(c["text"]!): \(String(describing: got))")
+        }
+        // a chat placeholder names the person: an ordinary-word nickname resolves there, and only there
+        var cs = EntityStore(records: [ent("p:bear", "person", "Bear"), ent("t:bear", "tool", "bear")],
+                             surfaces: ["bear": [EntityHit(index: 0, how: "name"), EntityHit(index: 1, how: "name")]],
+                             flags: ["bear": EntitySurfaceFlags(needs_context: true, shared: false, twins: true, ordinary: true, short: false)])
+        let ph = "Message Bear on WhatsApp"
+        m = EntityRules.mention(before: "Message Bear", store: cs, context: EntityRules.fold(ph), picks: [:], expect: [])!
+        precondition(m.index == 0 && m.resolved, "placeholder: \(m)")
+        precondition(EntityRules.mention(before: "Bear", store: cs, context: "bear", picks: [:], expect: []) == nil, "no placeholder: plain word")
+        precondition(EntityRules.mentions(in: ph, store: cs) == [0], "\(EntityRules.mentions(in: ph, store: cs))")
+        cs.surfaceFlags = [:]
+        // an older store (no surface_flags, no relations) still loads; a new one carries both
+        let old = try JSONDecoder().decode(EntityStore.self, from: Data(#"{"records":[{"id":"a","kind":"tool","name":"Anvil","aliases":[],"related":["b"]}],"surfaces":{"anvil":[[0,"name"]]}}"#.utf8))
+        precondition(old.surfaceFlags.isEmpty && old.records[0].relations == nil)
+        let new = try JSONDecoder().decode(EntityStore.self, from: Data(#"{"records":[{"id":"a","kind":"tool","name":"Anvil","aliases":[],"related":["b"],"relations":[{"id":"b","why":"repo of","w":0.81,"src":["aleph"]}]}],"surfaces":{"anvil":[[0,"name"]]},"surface_flags":{"anvil":{"needs_context":true,"shared":false,"ordinary":true,"short":false}}}"#.utf8))
+        precondition(new.surfaceFlags["anvil"]?.list == ["ordinary"] && new.records[0].relations?.first?.why == "repo of")
+        // flagged forms in the matcher: an ordinary-word name needs context, a shared first name needs a related thing
+        var fs = store
+        fs.records.append(ent("x:anvil", "project", "Anvil", heat: 30))
+        fs.surfaces["anvil"] = [EntityHit(index: 7, how: "name")]
+        fs.surfaceFlags = ["anvil": EntitySurfaceFlags(needs_context: true, shared: false, ordinary: true, short: false),
+                           "ганні": EntitySurfaceFlags(needs_context: true, shared: true, ordinary: false, short: false)]
+        precondition(EntityRules.mention(before: "we use Anvil ", store: fs) == nil, "an ordinary word without context")
+        m = EntityRules.mention(before: "we use Anvil ", store: fs, context: "", picks: [:], expect: EntityRules.expect(dest: "agent"))!
+        precondition(m.index == 7 && m.resolved, "kind expected here and a warm project: \(m)")
+        m = EntityRules.mention(before: "дай Ганні", store: fs)!
+        precondition(!m.resolved && m.candidates.count == 2, "a shared form with no context waits for the chooser")
+        m = EntityRules.mention(before: "про Lantern Labs і Ганні", store: fs, context: EntityRules.fold("про Lantern Labs і Ганні"), picks: [:], expect: [])!
+        precondition(m.index == 0 && m.resolved, "a related org named nearby decides: \(m)")
+        m = EntityRules.mention(before: "дай Ганні", store: fs, context: "", picks: ["ганні": "p:hanna2"], expect: [])!
+        precondition(m.index == 1 && m.resolved, "a pick decides")
+        precondition(EntityRules.mentions(in: "Ганні and Anvil.", store: fs).isEmpty)
+        precondition(EntityRules.mentions(in: "Ганні from Lantern Labs.", store: fs) == [0, 2], "\(EntityRules.mentions(in: "Ганні from Lantern Labs.", store: fs))")
+        // his fixes: pure, a fix replaces its opposite
+        var fx = EntityRules.addFix([:], what: "related", a: "b", b: "a", why: "same client")!
+        precondition((fx["related"] as! [[String]]) == [["a", "b", "same client"]])
+        fx = EntityRules.addFix(fx, what: "not_related", a: "a", b: "b")!
+        precondition((fx["related"] as! [[String]]).isEmpty && (fx["not_related"] as! [[String]]) == [["a", "b"]])
+        fx = EntityRules.addFix(fx, what: "not_this", a: "Ганна", b: "p:hanna2")!
+        precondition((fx["not_this"] as! [[String]]) == [["ганна", "p:hanna2"]])
+        precondition(EntityRules.addFix(fx, what: "maybe", a: "a", b: "b") == nil)
+        print("PASS: ambiguous forms need context (golden decisions and chat placeholders as in Python); old stores load; fixes")
+
         // --- cost per word end with 5,000 made-up entities and their surfaces
         var big: [Entity] = [], surf: [String: [EntityHit]] = [:]
         let syll = ["ка", "ло", "ри", "на", "те", "ва", "мо", "ди", "ус", "ен", "ko", "ra", "li", "mo", "sa", "te"]
@@ -95,14 +152,16 @@ import Foundation
                 surf[EntityRules.fold(k), default: []].append(EntityHit(index: i, how: how))
             }
         }
-        let bigStore = EntityStore(records: big, surfaces: surf)
+        var flags: [String: EntitySurfaceFlags] = [:]
+        for (k, v) in surf where !k.contains(" ") { flags[k] = EntitySurfaceFlags(needs_context: true, shared: Set(v.map { $0.index }).count > 1, ordinary: false, short: k.count <= 4) }
+        let bigStore = EntityStore(records: big, surfaces: surf, flags: flags)
         let lines = (0..<2000).map { i -> String in "Сьогодні говорили з " + big[(i * 37) % 5000].name + (i % 3 == 0 ? " про щось " : " ") }
         let ctx = EntityRules.fold(String(lines.joined().suffix(400)))
         var times: [Double] = []
         var found = 0
         for line in lines {
             let t0 = DispatchTime.now().uptimeNanoseconds
-            if EntityRules.mention(before: line, store: bigStore, context: ctx) != nil { found += 1 }
+            if EntityRules.mention(before: line, store: bigStore, context: ctx, picks: [:], expect: ["person"]) != nil { found += 1 }
             times.append(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1000)
         }
         times.sort()

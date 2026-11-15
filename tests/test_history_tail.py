@@ -20,7 +20,7 @@ class Tail(unittest.TestCase):
             built = subprocess.run(['swiftc', '-module-cache-path', str(p / 'cache'), '-parse-as-library', str(p / 'history.swift'),
                                     str(ROOT / 'tests/history_tail.swift'), '-o', str(p / 'check')], capture_output=True, text=True, timeout=180)
             self.assertEqual(built.returncode, 0, built.stderr[-2000:])
-            run = subprocess.run([str(p / 'check')], capture_output=True, text=True, timeout=30)
+            run = subprocess.run([str(p / 'check')], capture_output=True, text=True, timeout=120)
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
 
 

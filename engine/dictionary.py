@@ -80,26 +80,36 @@ def ensure(file=None, old=None, seed=None, git=True):
     return file
 
 
-def load():
-    ensure()
-    try: d = json.loads(FILE.read_text())
+def load(file=None):
+    file = Path(file) if file else ensure()
+    try: d = json.loads(file.read_text())
     except Exception: d = {}
     d.setdefault("words", []); d.setdefault("keep", []); d.setdefault("loose_heard", {})
     return d
 
 
-def save(d):
+def save(d, file=None, store=None):
+    """Writes `words` and the shape Voice Notes reads. With the names reference (data/names.json, engine/names.py) beside
+    it: terms in order of use (Whisper takes the first 60), his Names-page spellings and mishearings in, hidden names out."""
+    file = Path(file or FILE)
     # Voice Notes' Whisper hint takes the first 60 terms: Voice Notes' own words and his phrases go first
     order = {"voicenotes": 0, "menu": 1, "typing": 2, "aleph-live": 3, "aleph": 4}
     d["words"].sort(key=lambda w: order.get(w.get("source"), 9))
     heard = dict(d.get("loose_heard", {}))
     for w in d["words"]:
         for h in w.get("heard", []): heard[h] = w["text"]
+    terms = [w["text"] for w in d["words"] if spelling(w)]
+    if store is None:
+        try: store = json.loads(file.with_name("names.json").read_text())
+        except (OSError, ValueError): store = None
+    if store:
+        import names
+        terms, heard = names.words_view({"terms": terms, "heard": heard}, store)
     out = {"about": ABOUT, "updated": time.strftime("%Y-%m-%d"),
-           "terms": [w["text"] for w in d["words"] if spelling(w)],
+           "terms": terms,
            "heard": heard, "keep": d.get("keep", []), "words": d["words"], "loose_heard": d.get("loose_heard", {})}
-    FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = FILE.with_suffix(".tmp"); tmp.write_text(json.dumps(out, ensure_ascii=False, indent=1)); tmp.replace(FILE)
+    file.parent.mkdir(parents=True, exist_ok=True)
+    tmp = file.with_suffix(".tmp"); tmp.write_text(json.dumps(out, ensure_ascii=False, indent=1)); tmp.replace(file)
     return out
 
 

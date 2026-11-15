@@ -4,7 +4,7 @@ does not name. Temporary files only.
 
     .venv/bin/python -B tests/test_cloud_defaults.py
 """
-import json, re, sys, tempfile, unittest
+import json, re, shutil, subprocess, sys, tempfile, unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -53,15 +53,29 @@ class Migrate(unittest.TestCase):
 class Defaults(unittest.TestCase):
     def test_engine_and_app_agree_on_off(self):
         self.assertTrue(all(v is False for v in cloud.DEFAULTS.values()))
-        src = (ROOT / "app/Main.swift").read_text()
+        src = (ROOT / "app/Settings.swift").read_text()
         for k in cloud.DEFAULTS:
             self.assertRegex(src, rf"\n\s+var {k} = false\b", k)
-            self.assertIn(f"{k} = try c.decodeIfPresent(Bool.self, forKey: .{k}) ?? false", src)
         keys = re.search(r"static let cloudKeys = \[(.*?)\]", src).group(1)
         self.assertEqual(set(re.findall(r'"(\w+)"', keys)), set(cloud.DEFAULTS))
 
+    @unittest.skipUnless(shutil.which("swiftc"), "Swift compiler required")
+    def test_app_decodes_an_empty_file_with_every_cloud_switch_off(self):
+        src = (ROOT / "app/Settings.swift").read_text()
+        settings = "struct Settings: Codable {" + src.split("struct Settings: Codable {", 1)[1]
+        checks = " && ".join(f"s.{k} == false" for k in cloud.DEFAULTS)
+        program = ('import Foundation\nenum LocalConfig { static let skipApps: [String] = [] }\n'
+                   'enum QuickRules { static let defaultKey = "k"; static let defaultSecrets: [String] = [] }\n'
+                   'enum Home { static let bundleID = "t"; static let settings = URL(fileURLWithPath: "/nonexistent") }\n'
+                   + settings + f'\nlet s = try JSONDecoder().decode(Settings.self, from: Data("{{}}".utf8))\nprecondition({checks})\nprint("PASS")\n')
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder); (path / "main.swift").write_text(program)
+            subprocess.run(["swiftc", "-module-cache-path", str(path / "cache"), str(path / "main.swift"), "-o", str(path / "check")],
+                           check=True, capture_output=True, timeout=300)
+            self.assertIn("PASS", subprocess.run([str(path / "check")], capture_output=True, text=True, timeout=60).stdout)
+
     def test_app_migrates_before_it_decodes(self):
-        src = (ROOT / "app/Main.swift").read_text()
+        src = (ROOT / "app/Settings.swift").read_text()
         load = src[src.index("static func load() -> Settings {"):]
         self.assertLess(load.index("migrateCloud()"), load.index("JSONDecoder().decode(Settings.self"))
         self.assertIn('if j["connect"] == nil { j["connect"] = ["provider": "cli"] }', src)   # stays connected through the CLI

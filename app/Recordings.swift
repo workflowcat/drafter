@@ -9,11 +9,24 @@ import SwiftUI
 import AVFoundation
 
 extension WindowModel {
+    /// The recordings, read off the main thread (speed round: every open and every tick read them all on it).
     func loadDocs() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let d = WindowModel.readDocs()
+            DispatchQueue.main.async { self.applyDocs(d) }
+        }
+    }
+
+    /// Every recording as a document (any thread).
+    static func readDocs() -> [CallDoc] {
         let notes = CallDoc.notesIndex(Home.data.appendingPathComponent("notes"))
         let dirs = ((try? FileManager.default.contentsOfDirectory(at: Spool.root, includingPropertiesForKeys: nil)) ?? [])
             .filter { $0.hasDirectoryPath }.sorted { $0.lastPathComponent > $1.lastPathComponent }
-        docs = dirs.map { CallDoc.load($0, notes: notes) }.filter { !$0.turns.isEmpty || $0.live || $0.secs >= 20 }   // not a few seconds of silence
+        return dirs.map { CallDoc.load($0, notes: notes) }.filter { !$0.turns.isEmpty || $0.live || $0.secs >= 20 }   // not a few seconds of silence
+    }
+
+    func applyDocs(_ list: [CallDoc]) {
+        docs = list
         if let d = doc { doc = docs.first { $0.id == d.id } }
         // Read again is under way until a transcript newer than the click is written (an hour at most)
         for (id, since) in rereading {
@@ -21,11 +34,6 @@ extension WindowModel {
             if t > since || Date().timeIntervalSince(since) > 3600 { rereading[id] = nil }
         }
         rebuildTape()
-    }
-
-    func foundDocs() -> [CallDoc] {
-        let t = CallDoc.terms(query)
-        return t.isEmpty ? docs : docs.filter { $0.matches(t) }
     }
 
     /// brief.md for a recording that has none yet (no screenshots, or recorded before briefs existed).
@@ -39,15 +47,7 @@ extension WindowModel {
     func sendToAgent(_ d: CallDoc) {
         if !preview { ensureBrief(d) }
         History.copy(d.handoff())
-        status = "Copied for an agent: «\(d.title)»" + (d.shots.isEmpty ? "" : " with \(d.shots.count) screenshots") + " · ⌘V into Claude or Codex"
-    }
-
-    func sendSearchToAgent() {
-        let found = foundDocs()
-        guard !found.isEmpty else { return }
-        if !preview { found.forEach(ensureBrief) }
-        History.copy(CallDoc.handoff(search: query, docs: found))
-        status = "Copied for an agent: «\(query)» in \(found.count) recording\(found.count == 1 ? "" : "s") · ⌘V into Claude or Codex"
+        status = "On the clipboard for an agent: «\(d.title)»" + (d.shots.isEmpty ? "" : " with \(d.shots.count) screenshots") + " · ⌘V into Claude or Codex"
     }
 
     func stopRecording() {
@@ -57,8 +57,8 @@ extension WindowModel {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.loadDocs() }
     }
 
-    func copyNotes(_ d: CallDoc) { History.copy(d.notesMarkdown()); status = "Copied the notes of «\(d.title)»" }
-    func copyTranscript(_ d: CallDoc) { History.copy(d.transcriptText()); status = "Copied the transcript: \(d.turns.count) turns" }
+    func copyNotes(_ d: CallDoc) { History.copy(d.notesMarkdown()); status = "On the clipboard · the notes of «\(d.title)»" }
+    func copyTranscript(_ d: CallDoc) { History.copy(d.transcriptText()); status = "On the clipboard · the transcript, \(d.turns.count) turns" }
 
     // MARK: playing both sides from a line
 
@@ -183,7 +183,7 @@ struct DocView: View {
             HStack(spacing: 8) {
                 if d.live {
                     Button { m.stopRecording() } label: { Label("Stop recording", systemImage: "stop.fill") }
-                        .buttonStyle(.borderedProminent).tint(UIInk.coral).help("Same as ⇧ right ⌥. The transcript and the note follow.")
+                        .buttonStyle(.borderedProminent).tint(UIInk.coral).help("Same as ⇧ Right Option. The transcript and the note follow.")
                 }
                 // one main button: For agent, unless there are no words yet (then Read again, below, is the main one)
                 if empty { forAgent.buttonStyle(.bordered) } else { forAgent.buttonStyle(.borderedProminent) }

@@ -196,9 +196,18 @@ def read(model, audio, gate=True):
 
 
 def glossary():
-    """Andrii's own words, handed to Whisper as a hint so it spells them right."""
+    """Andrii's own words, handed to Whisper as a hint so it spells them right: the 60 names he uses most from the
+    names reference (data/names.json `voice`, engine/names.py, 2026-11-15), else the dictionary's first 60 terms."""
+    data = os.path.join(os.path.dirname(__file__), "..", "data")
+    if not os.environ.get("DRAFTER_WORDS") and os.environ.get("DRAFTER_NAMES") != "0":
+        try:
+            with open(os.path.join(data, "names.json")) as source:
+                terms = json.load(source)["voice"]
+            if terms: return "Glossary: " + ", ".join(terms[:60]) + "."
+        except Exception:
+            pass
     try:
-        with open(os.environ.get("DRAFTER_WORDS") or os.path.join(os.path.dirname(__file__), "..", "data", "words.json")) as source:
+        with open(os.environ.get("DRAFTER_WORDS") or os.path.join(data, "words.json")) as source:
             terms = json.load(source)["terms"]
         return "Glossary: " + ", ".join(terms[:60]) + "."
     except Exception:

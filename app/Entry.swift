@@ -12,9 +12,13 @@ struct Entry: Identifiable, Hashable {
     var outcome = ""
     var drafts: [String] = []   // Typed: the drafts this message grew out of, oldest first (TypedList)
     var touched: Date?          // Typed: the last draft or line of this message, when later than `when`
+    var started: Date?          // Typed: the first key of this message (a row's "t0"), else its first kept draft
+    var est = false             // Typed: the draft's start is an estimate ("est": true, DraftCaptureRules.resolve)
+    var sent = false            // Typed: the row stands for a sent line (typed.jsonl), not only drafts
     // Clipboard rows (round three): what the copy is, a link's title, the size, the stored picture and its read text
     var clip = ClipKind.text
     var clipTitle = "", bytes = 0, picture = "", ocr = ""
+    var shot = ""               // a capture kept as a shot pack: its id (data/shots/<id>/, app/ShotJournal.swift)
 
     var incomplete: Bool { outcome == "timeout" || outcome == "incomplete" }
     var audioOnly: Bool { text.isEmpty && raw.isEmpty && !incomplete }
@@ -82,6 +86,9 @@ enum TypedList {
             let when = r["t"] as? Double ?? 0
             var e = Entry(id: "\(kind)\(when)", when: Date(timeIntervalSince1970: when), app: r["app"] as? String ?? "", text: t, audio: "")
             e.title = kind == "draft" ? "draft" : ""
+            if let t0 = r["t0"] as? Double, t0 > 0, t0 <= when { e.started = Date(timeIntervalSince1970: t0) }   // since 2026-11-14 (window round two)
+            e.est = (r["est"] as? Bool) == true
+            e.sent = kind == "sent"
             return Item(e: e, n: norm(t), sent: kind == "sent")
         }
         let items = (sent.compactMap { item($0, "sent") } + drafts.compactMap { item($0, "draft") }).sorted { $0.e.when < $1.e.when }
@@ -105,8 +112,12 @@ enum TypedList {
             let rep = items[r].sent ? r : members.max { (items[$0].e.text.count, $0) < (items[$1].e.text.count, $1) }!
             var e = items[rep].e
             e.drafts = members.filter { $0 != rep }.map { items[$0].e.text }
+            e.est = items[rep].e.est   // the row shown carries its own mark
             // the newest moment of the message, so it sorts where it was last touched
             if let last = members.map({ items[$0].e.when }).max(), last > e.when { e.touched = last }
+            // how long it took: from the first key a row kept ("t0"), else from its first kept draft
+            let firsts = members.map { items[$0].e.started ?? items[$0].e.when }
+            if let first = firsts.min(), members.count > 1 || items[rep].e.started != nil { e.started = first }
             out.append(e)
         }
         return out.sorted { ($0.touched ?? $0.when) > ($1.touched ?? $1.when) }

@@ -14,6 +14,10 @@ final class Ghost {
     private(set) var action: [String: Any]? = nil
     /// The letters a fix replaces (Fixer.swift): the ghost reads "→ word" and typing through it does not keep it.
     private(set) var replace = ""
+    /// Mid-line (setting `midLine`, 2026-11-15): text follows the caret on its line, so the grey words cannot sit at the
+    /// caret without covering it. They are drawn on a small card just under the caret's line, starting at the caret.
+    private(set) var mid = false
+    let midBox: Ground = { let g = Ground(); g.radius = 4; return g }()
     var visible: Bool { panel.isVisible && (!text.isEmpty || action != nil) }
 
     let chipBox = Ground()
@@ -29,7 +33,8 @@ final class Ghost {
         label.lineBreakMode = .byClipping
         chip.lineBreakMode = .byTruncatingTail
         chipBox.addSubview(mark); chipBox.addSubview(chip)
-        v.addSubview(label); v.addSubview(chipBox)
+        v.addSubview(midBox); v.addSubview(label); v.addSubview(chipBox)
+        midBox.isHidden = true
     }
 
     /// The field's font and text colour at the caret (read once per field), else a size from the caret's height.
@@ -48,14 +53,17 @@ final class Ghost {
         return CGRect(x: r.minX, y: h - r.maxY, width: r.width, height: r.height)
     }
 
-    func show(_ suggestion: String, action: [String: Any]?, at caret: CGRect, replace: String = "") {
+    func show(_ suggestion: String, action: [String: Any]?, at caret: CGRect, replace: String = "", mid: Bool = false) {
         plain()
+        self.mid = mid && action == nil && replace.isEmpty && !suggestion.isEmpty
+        midBox.isHidden = !self.mid
         if !self.replace.isEmpty, replace.isEmpty { Fixer.hidden() }   // a fix offer covered by a chip ends here (Argon 22)
-        text = suggestion; self.action = action; self.replace = replace
+        text = suggestion; self.action = action; self.replace = replace; altHint = ""
         let c = cocoa(caret)
         // the grey words in the field's own font, as if already typed; no keycap after them since 1 November 2026
         // (Andrii: "I know what tab does, clean it up")
-        let (font, color) = fieldFont(c.height)
+        let (font, fieldColor) = fieldFont(c.height)
+        let color = self.mid ? PK.muted : fieldColor   // on the card's ground, not the field's: the card's own quiet ink
         label.font = font; label.textColor = color; ghostColor = color
         unsure = min(unsure, suggestion.count)
         paint(suggestion)
@@ -79,12 +87,28 @@ final class Ghost {
             chipBox.isHidden = false; chipBox.needsDisplay = true; mark.needsDisplay = true
             w = max(w, chipW)
         } else { chipBox.isHidden = true }
+        if self.mid { placeMid(c, lh: lh); appear(); return }
         let gap: CGFloat = chipH > 0 ? 6 : 0
         let frame = NSRect(x: c.maxX, y: c.minY - chipH - gap, width: w + 4, height: lh + chipH + gap)
         panel.setFrame(frame, display: false)
         // baseline: the grey text sits on the caret's line, centred in its height like the text it continues
         label.frame = NSRect(x: 0, y: chipH + gap + (lh - label.frame.height) / 2, width: label.frame.width, height: label.frame.height)
         appear()
+    }
+
+    /// The mid-line card: the grey words on a flat PixelKit ground one line under the caret, its left edge at the caret,
+    /// so the text after the caret stays readable and the words read as what
+    /// goes in at that point. Above the caret's line when there is no room under it.
+    static let midPad: CGFloat = 5, midGap: CGFloat = 2
+    private func placeMid(_ c: CGRect, lh: CGFloat) {
+        let p = Ghost.midPad
+        let w = label.frame.width + 2 * p, h = lh + 2
+        var y = c.minY - Ghost.midGap - h
+        if let scr = NSScreen.screens.first(where: { $0.frame.contains(CGPoint(x: c.midX, y: c.midY)) }) ?? NSScreen.main,
+           y < scr.visibleFrame.minY { y = c.maxY + Ghost.midGap }
+        panel.setFrame(NSRect(x: c.maxX - p, y: y, width: w, height: h), display: false)
+        midBox.frame = NSRect(x: 0, y: 0, width: w, height: h); midBox.needsDisplay = true
+        label.frame = NSRect(x: p, y: (h - label.frame.height) / 2, width: label.frame.width, height: label.frame.height)
     }
 
     /// Grey words show at full strength in their first frame (14 November 2026, speed first: a 90 ms fade from zero
@@ -128,7 +152,7 @@ final class Ghost {
     private func layoutDraft() {
         guard index < options.count else { return }
         let o = options[index]
-        text = o["text"] ?? ""; action = nil; isDraft = true
+        text = o["text"] ?? ""; action = nil; isDraft = true; mid = false; midBox.isHidden = true
         let c = cocoa(draftCaret)
         let size = max(11, min(14, c.height * 0.72))
         let width = min(520, max(240, (draftField?.width ?? 440) * 0.8))
@@ -180,6 +204,20 @@ final class Ghost {
         label.lineBreakMode = .byClipping; label.maximumNumberOfLines = 1; label.preferredMaxLayoutWidth = 0
     }
 
+    /// Parity round: a quiet "1/3" after the grey words while other ideas are ready (⌥1-⌥3); "" = none. Only drawn,
+    /// never part of `text`.
+    private(set) var altHint = ""
+    func hint(_ h: String) {
+        guard visible, action == nil, replace.isEmpty, !isDraft, h != altHint else { return }
+        altHint = h
+        paint(text)
+        label.sizeToFit()
+        var f = panel.frame
+        f.size.width = label.frame.width + (mid ? 2 * Ghost.midPad : 4)
+        panel.setFrame(f, display: true)
+        if mid { midBox.frame.size.width = f.size.width; midBox.needsDisplay = true }
+    }
+
     /// The grey words: the sure part in the ghost colour, the less sure tail at half of it.
     private func paint(_ t: String) {
         let font = label.font ?? .systemFont(ofSize: 13)
@@ -189,6 +227,11 @@ final class Ghost {
         if !replace.isEmpty { m.append(NSAttributedString(string: " → ", attributes: [.font: font, .foregroundColor: PK.warn])) }
         m.append(NSAttributedString(string: String(t[..<cut]), attributes: [.font: font, .foregroundColor: ghostColor]))
         m.append(NSAttributedString(string: String(t[cut...]), attributes: [.font: font, .foregroundColor: ghostColor.withAlphaComponent(ghostColor.alphaComponent * 0.55)]))
+        if !altHint.isEmpty, replace.isEmpty {
+            m.append(NSAttributedString(string: "  " + altHint, attributes: [.font: NSFont.systemFont(ofSize: max(9, font.pointSize * 0.7)),
+                                                                        .foregroundColor: ghostColor.withAlphaComponent(ghostColor.alphaComponent * 0.6),
+                                                                        .baselineOffset: font.pointSize * 0.25]))
+        }
         label.attributedStringValue = m
     }
 
@@ -201,8 +244,9 @@ final class Ghost {
         paint(text)
         label.sizeToFit()
         var f = panel.frame
-        f.size.width = max(f.size.width, label.frame.width + 4)
+        f.size.width = max(f.size.width, label.frame.width + (mid ? 2 * Ghost.midPad : 4))
         panel.setFrame(f, display: true)
+        if mid { midBox.frame.size.width = f.size.width; midBox.needsDisplay = true }
     }
 
     /// Typing the same letters as the ghost keeps it and only drops what was typed.
@@ -210,20 +254,21 @@ final class Ghost {
         guard !text.isEmpty, action == nil, !isDraft, replace.isEmpty, text.hasPrefix(typed) else { return false }
         if text.count == typed.count { hide(); return true }   // typed it all: nothing left to show
         text.removeFirst(typed.count)
-        unsure = min(unsure, text.count)
+        unsure = min(unsure, text.count); altHint = ""   // the other ideas were for the spot before these letters
         paint(text)
         label.sizeToFit()
         var f = panel.frame
         // move right by the width of what was typed
         let typedW = (typed as NSString).size(withAttributes: [.font: label.font as Any]).width
-        f.origin.x += typedW; f.size.width = label.frame.width + 4
+        f.origin.x += typedW; f.size.width = label.frame.width + (mid ? 2 * Ghost.midPad : 4)
         panel.setFrame(f, display: true)
+        if mid { midBox.frame.size.width = f.size.width; midBox.needsDisplay = true }
         return true
     }
 
     func hide() {
         if !replace.isEmpty { Fixer.hidden() }   // a fix offer went: taken, typed over or expired (log)
-        text = ""; action = nil; replace = ""; unsure = 0; plain()
+        text = ""; action = nil; replace = ""; unsure = 0; altHint = ""; mid = false; midBox.isHidden = true; plain()
         panel.orderOut(nil)
     }
 

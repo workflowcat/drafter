@@ -16,7 +16,10 @@ enum UIShots {
         NSApp.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         // PREVIEW_ONLY=quick (or window, settings, strip): one surface, for a quick look while working on it
         let only = ProcessInfo.processInfo.environment["PREVIEW_ONLY"] ?? ""
+        if only == "soft" { try softShots(folder, dark: dark); return }   // the soft round: gallery, list, peek, Go to, scroll cost
+        if only == "shotjournal" { try shotJournalShots(folder, dark: dark); return }   // the screenshot tool's journal cards
         if only == "knowledge" { try EntityPreview.run(folder); return }   // the entity card, the mark and the context preview
+        if only == "names" { try namesShots(folder, dark: dark); return }   // the Names page (made-up names)
         if only == "window" || only == "window-themes" {   // the window; window-themes: in every built-in theme too
             try windowShots(folder, dark: dark)
             if only == "window-themes" {
@@ -30,7 +33,11 @@ enum UIShots {
             }
             return
         }
+        // the strip style in use for these renders (never read from the settings file): STRIP_STYLE, default composer
+        if Pill.shared.forced == nil { Pill.shared.forced = StripStyle.of(ProcessInfo.processInfo.environment["STRIP_STYLE"]) }
+        if only == "pick" { try PickPanel.shared.preview(folder); return }   // Pick parts (made-up texts)
         if only == "strip" { try Pill.shared.preview(folder); return }
+        if only == "strips" { try stripStyles(folder); return }   // every style, both themes, and the two contact sheets
         if only == "quick" || only == "themes" {
             try Quick.shared.preview(folder)
             if only == "themes" {   // every built-in theme: folder/theme-<id>/
@@ -47,58 +54,132 @@ enum UIShots {
         try Pill.shared.preview(folder)
         try Command.shared.preview(folder)
         try Quick.shared.preview(folder)
+        try PickPanel.shared.preview(folder)
         try EntityPreview.run(folder)
         try onScreen(folder)
         try windowShots(folder, dark: dark)
+        try shotJournalShots(folder, dark: dark)
         print("Native UI previews passed: " + folder)
     }
 
-    /// Made-up rows for the tape: copied, typed and said through one morning (never his).
-    static func sampleTape(_ m: WindowModel, now: Double, filler: Int = 0) {
-        func at(_ h: Int, _ min: Int) -> Date {
-            Calendar.current.date(bySettingHour: h, minute: min, second: 14, of: Date(timeIntervalSince1970: now))!
+    /// Made-up rows for the journal (never his): one morning today in detail (clips, drafts, voice notes, a chat
+    /// export, a web page with its navigation, three repeats), then older days in sessions back `days` days.
+    static func sampleTape(_ m: WindowModel, now: Double, days: Int = 420, perDay: Int = 6) {
+        let cal = TapeBuild.cal
+        let today = cal.startOfDay(for: Date(timeIntervalSince1970: now))
+        func at(_ h: Int, _ min: Int, back: Int = 0, s: Int = 14) -> Date {
+            cal.date(byAdding: .second, value: (h * 60 + min) * 60 + s, to: cal.date(byAdding: .day, value: -back, to: today)!)!
         }
-        func e(_ id: String, _ h: Int, _ mi: Int, _ app: String, _ text: String, secs: Double = 0) -> Entry {
-            Entry(id: id, when: at(h, mi), app: app, text: text, audio: "", secs: secs)
+        func e(_ id: String, _ h: Int, _ mi: Int, _ app: String, _ text: String, secs: Double = 0, back: Int = 0) -> Entry {
+            Entry(id: id, when: at(h, mi, back: back), app: app, text: text, audio: "", secs: secs)
         }
-        m.clips = [e("c1", 12, 38, "Safari", "https://example.org/station/review-14#plan"),
-                   e("c5", 12, 30, "Preview", "Image · 640 × 400"), e("c6", 12, 27, "Finder", NSHomeDirectory() + "/Desktop/station-drawings-final.pdf"),
-                   e("c2", 12, 4, "Mail", "Room 4.12, second floor, the door on the left"),
-                   e("c3", 11, 9, "Xcode", "let share = taken / shown"),
-                   e("c4", 10, 31, "Mail", "Mila Synthetic, +380 00 000 00 00, Tuesday after 14:00")]
-        // round three: a link with its title, a picture with its read text, a file
-        m.clips[0].clip = .link; m.clips[0].clipTitle = "Station review 14"
-        if let p = try? Quick.samplePicture() { m.clips[1].clip = .image; m.clips[1].picture = p.name; m.clips[1].bytes = p.bytes; m.clips[1].ocr = p.ocr }
-        m.clips[2].clip = .file; m.clips[2].bytes = 482_113
+        var clips = [e("c1", 12, 38, "Safari", "https://example.org/station/review-14#plan"),
+                     e("c5", 12, 30, "Preview", "Image · 640 × 400"), e("c6", 12, 27, "Finder", NSHomeDirectory() + "/Desktop/station-drawings-final.pdf"),
+                     e("c2", 12, 4, "Mail", "Room 4.12, second floor, the door on the left"),
+                     e("c3", 11, 9, "Xcode", "let share = taken / shown"),
+                     e("c4", 10, 31, "Mail", "Mila Synthetic, +380 00 000 00 00, Tuesday after 14:00"),
+                     e("c7", 10, 2, "Telegram", "[14.11.26, 10:01] Sava Synthetic: Lantern build is green, can you look at the order form today?"),
+                     e("c8", 9, 41, "Safari", "Skip to content\nHome\nProducts\nPricing\nBlog\nSign in\nThe station map shows every platform, lift and exit in one view, updated each night.\nMore text."),
+                     e("c9", 9, 33, "Figma", "Lantern order form, step 2"), e("c10", 9, 32, "Figma", "Lantern order form, step 2"),
+                     e("c11", 9, 31, "Figma", "Lantern order form, step 2")]
+        clips[0].clip = .link; clips[0].clipTitle = "Station review 14"
+        if let p = try? Quick.samplePicture() { clips[1].clip = .image; clips[1].picture = p.name; clips[1].bytes = p.bytes; clips[1].ocr = p.ocr }
+        clips[2].clip = .file; clips[2].bytes = 482_113
+        clips[7].clipTitle = "Station map · Example Transit"
         var typed = [e("t1", 12, 41, "Telegram", "Could you send the final drawings by three? I will look before the call."),
                      e("t2", 12, 20, "Claude", "Rewrite this paragraph in plain English, at most 40 words, keep it warm"),
-                     e("t3", 11, 22, "Terminal", "git commit -m \"tape: one column, no panes\""),
+                     e("t3", 11, 22, "Terminal", "git commit -m \"journal: sessions under chunks of time\""),
                      e("t4", 11, 2, "Messages", "See you at the station at nine, I will bring the drawings."),
-                     e("t5", 10, 15, "Claude", "Can you check the contrast of the grey text in both themes?"),
-                     e("t6", 9, 52, "Slack", "Warm, but not formal - we write the way people talk")]
+                     e("t5", 10, 15, "Claude", "Can you check the contrast of the grey text in both themes? Mila asked for it."),
+                     e("t6", 9, 52, "Slack", "Warm, but not formal - we write the way people talk"),
+                     e("t7", 9, 36, "Telegram", "Привіт, Саво! Форму Lantern подивлюсь до обіду, напишу що не так.")]
         typed[3].drafts = ["See you at the", "See you at the station at ten", "See you at the station at nine"]
-        m.typed = typed
-        var takes = [e("v1", 12, 31, "Notes", "Note after the review: we keep the tape and drop the three panes. Button words should be simpler. Mila does the second round by Tuesday.", secs: 18),
+        typed[0].started = typed[0].when.addingTimeInterval(-74); typed[1].started = typed[1].when.addingTimeInterval(-41)
+        typed[3].started = typed[3].when.addingTimeInterval(-128); typed[6].started = typed[6].when.addingTimeInterval(-63)
+        var takes = [e("v1", 12, 31, "Notes", "Note after the review: we keep the journal and drop the three panes. Button words should be simpler. Mila does the second round by Tuesday.", secs: 18),
                      e("v2", 11, 36, "Calendar", "Remind me on Monday to send the invoice to the studio", secs: 6),
                      e("v3", 10, 47, "Notes", "Idea: show the grey text only after half a second of pause, not on every letter", secs: 9)]
         takes[0] = Entry(id: "v1", when: takes[0].when, app: "Notes", text: takes[0].text, audio: "/sample/take.wav", secs: 18)
-        takes[0].raw = "Note after the review: well, we keep the tape and, um, drop the three panes. Button words should be simpler. Mila does the second round by Tuesday."
-        m.takes = takes
-        // filler for the speed check: older days, all kinds
-        let words = ["plan", "station", "drawings", "budget", "зустріч", "четвер", "report", "звіт", "invoice", "notes", "draft", "review"]
-        let apps = ["Notes", "Safari", "Mail", "Telegram", "Slack", "Claude"]
-        for i in 0..<filler {
-            var w: [String] = []
-            for k in 0..<(5 + i % 18) { w.append(words[(k * 7 + i) % words.count]) }
-            w.append("\(i)")
-            let x = Entry(id: "f\(i)", when: Date(timeIntervalSince1970: now - 86400 - Double(i) * 1100), app: apps[i % apps.count], text: w.joined(separator: " "), audio: "")
-            switch i % 3 { case 0: m.clips.append(x); case 1: m.typed.append(x); default: m.takes.append(x) }
+        takes[0].raw = "Note after the review: well, we keep the journal and, um, drop the three panes. Button words should be simpler. Mila does the second round by Tuesday."
+        // older days: sessions of made-up lines, back `days` days
+        let lines: [(String, String)] = [
+            ("Telegram", "Ok, I will send the drawings tonight"), ("Telegram", "Завтра о десятій на станції, беру ноутбук"),
+            ("Claude", "Summarise the Lantern order notes in five bullets"), ("Claude", "Write a short reply to Mila, warm and clear"),
+            ("Mail", "Thanks, the invoice is attached. Payment within 14 days."), ("Mail", "Зустріч переносимо на четвер, 15:00"),
+            ("Figma", "Order form, empty state"), ("Safari", "https://example.org/docs/lantern-gate"), ("Notes", "Plan for the week: form, map, invoice"),
+            ("Slack", "Can someone review the station map before Friday?"), ("Notes", "Ідея: показувати сесії, а не години"),
+            ("Terminal", "npm run test -- lantern"), ("Mail", "Sava Synthetic, design review notes"), ("Claude", "Check this paragraph for tone")]
+        var r: UInt64 = 7
+        func next(_ n: Int) -> Int { r = r &* 6364136223846793005 &+ 1442695040888963407; return Int((r >> 33) % UInt64(max(1, n))) }
+        var k = 0
+        for back in 1...max(1, days) {
+            let n = back <= 14 ? perDay : next(perDay + 1)
+            guard n > 0 else { continue }
+            var h = 8 + next(3), mi = next(50)
+            for j in 0..<n {
+                let (app, text) = lines[next(lines.count)]
+                if j > 0 { if next(3) == 0 { h += 1 + next(3); mi = next(40) } else { mi += 2 + next(7) } }
+                if h > 22 { break }
+                if mi >= 60 { h += 1; mi -= 60 }
+                var x = e("o\(k)", h, mi, app, text + (back % 7 == 0 && j == 0 ? "" : ""), secs: 0, back: back); k += 1
+                switch next(4) {
+                case 0: if app == "Safari" { x.clip = .link }; clips.append(x)
+                case 1: x = Entry(id: x.id, when: x.when, app: app, text: text, audio: "", secs: Double(4 + next(30))); takes.append(x)
+                default: x.started = x.when.addingTimeInterval(-Double(20 + next(200))); typed.append(x)
+                }
+            }
         }
+        m.clips = clips.sorted { $0.when > $1.when }; m.typed = typed.sorted { $0.when > $1.when }; m.takes = takes.sorted { $0.when > $1.when }
     }
 
-    /// The window as one tape: the tape with a row open, a call chosen, a search, one kind, the command, the pages.
+    /// A made-up entity store for the preview: people, a studio, a project and its Worker (a twin: shows as the
+    /// project), relations with reasons; "Mark" points to two people and the store's flags leave it undecided (no tag).
+    static func sampleEntities() -> EntityStore {
+        func e(_ id: String, _ kind: String, _ name: String, _ who: String) -> Entity { var x = Entity(id: id, kind: kind, name: name); x.who = who; return x }
+        var mila = e("p:mila", "person", "Mila Synthetic", "designer on the station project")
+        mila.relations = [EntityRelation(id: "o:studio", why: "works at", w: 0.9), EntityRelation(id: "x:lantern", why: "similar topics: order form, drawings", w: 0.5)]
+        var sava = e("p:sava", "person", "Sava Synthetic", "builds the Lantern order form")
+        sava.relations = [EntityRelation(id: "x:lantern", why: "works on", w: 0.95), EntityRelation(id: "p:mila", why: "often together in chats", w: 0.6)]
+        var lantern = e("x:lantern", "project", "Lantern", "ordering tool for a made-up studio")
+        lantern.relations = [EntityRelation(id: "o:studio", why: "part of", w: 0.9), EntityRelation(id: "p:sava", why: "built by", w: 0.8)]
+        lantern.twins = ["t:gate"]
+        var gate = e("t:gate", "tool", "lantern-gate", "the Worker behind Lantern"); gate.twin_of = "x:lantern"
+        let recs = [mila, sava, lantern, gate, e("p:mark1", "person", "Mark Sample", ""), e("p:mark2", "person", "Mark Other", ""),
+                    e("o:studio", "org", "Example Studio", "a made-up design studio")]
+        func h(_ i: Int, _ how: String = "name") -> [EntityHit] { [EntityHit(index: i, how: how)] }
+        return EntityStore(records: recs, surfaces: ["mila synthetic": h(0), "mila": h(0, "first"), "sava synthetic": h(1), "sava": h(1, "first"), "саво": h(1, "first"),
+                                                     "lantern": h(2), "lantern-gate": h(3), "mark": h(4, "first") + h(5, "first")],
+                           flags: ["mark": EntitySurfaceFlags(needs_context: true, shared: true)])
+    }
+
+    /// The journal: three panes, chunks of time, sessions; the reader, the editor, a search, Group by, both
+    /// densities, the sidebar shut, a narrow window, a long scroll; the pages. Counts lines per screen.
+    /// The Names page on made-up names: the list, a search, a spelling being fixed, a merge being picked, after a hide
+    /// with its undo, the hidden ones, a narrow window.
+    static func namesShots(_ folder: String, dark: Bool) throws {
+        let model = WindowModel(); model.preview = true
+        let s = NamesStore.shared; s.preview = true; s.use(NamesPreview.sample())
+        let host = NSHostingView(rootView: WindowView(titlebar: true).environmentObject(model).environment(\.colorScheme, dark ? .dark : .light))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1280, height: 760), styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView = host; host.frame = NSRect(x: 0, y: 0, width: 1280, height: 760); model.width = 1280
+        func shot(_ name: String, wait: Double = 0.25) throws { RunLoop.current.run(until: Date().addingTimeInterval(wait)); try save(host, folder + "/" + name + ".png") }
+        model.show(.names); try shot("names")
+        s.query = "ган"; try shot("names-search")
+        s.query = ""; s.chosen = "p2"; s.editing = "p2"; try shot("names-edit")
+        s.editing = nil; s.chosen = "p1"; s.merging = "p4"; s.kind = ""; try shot("names-merge")
+        s.merging = nil; s.hide("p3"); try shot("names-hidden-notice")
+        s.kind = "hidden"; try shot("names-hidden")
+        s.undo(); s.kind = ""
+        host.frame = NSRect(x: 0, y: 0, width: 760, height: 760); model.width = 760; try shot("names-narrow")
+        s.notice = ""
+    }
+
     static func windowShots(_ folder: String, dark: Bool, short: Bool = false) throws {
-        let now = Calendar.current.date(bySettingHour: 12, minute: 45, second: 0, of: Date())!.timeIntervalSince1970
+        let cal = TapeBuild.cal
+        let now = cal.date(from: DateComponents(year: 2026, month: 11, day: 14, hour: 12, minute: 45))!.timeIntervalSince1970
+        Entities.previewStore = sampleEntities()
+        defer { Entities.previewStore = nil }
+        TapeBuild.tagCache = [:]
         let model = WindowModel(); model.preview = true; model.now = now
         // made-up numbers for Settings (the real ones come from data/app.log)
         model.stats = [LogStats.suggest: .init(shown: 8400, taken: 410), LogStats.claude: .init(shown: 96, taken: 9),
@@ -106,56 +187,90 @@ enum UIShots {
                        LogStats.facts: .init(shown: 3, taken: 1), LogStats.next: .init(shown: 140, taken: 12),
                        LogStats.rework: .init(shown: 5, taken: 4), LogStats.typo: .init(shown: 380, taken: 130),
                        LogStats.fixWord: .init(shown: 680, taken: 28), LogStats.layout: .init(shown: 18, taken: 18), "takes": .init(shown: 7, taken: 0)]
-        sampleTape(model, now: now)
+        sampleTape(model, now: now, days: 420, perDay: 5)
         var docs = try sampleDocs()
-        docs[0].started = Date(timeIntervalSince1970: Calendar.current.date(bySettingHour: 11, minute: 58, second: 0, of: Date(timeIntervalSince1970: now))!.timeIntervalSince1970)
-        docs[0].secs = 92
+        docs[0].started = cal.date(bySettingHour: 11, minute: 48, second: 0, of: Date(timeIntervalSince1970: now))!
+        docs[0].secs = 92 * 60 / 10
         docs[1].started = Date(timeIntervalSince1970: now - 86400 + 3600); docs[1].secs = 4 * 60 + 10
-        docs[2].started = Date(timeIntervalSince1970: now - 2 * 86400)
+        docs[2].started = Date(timeIntervalSince1970: now - 3 * 86400)
         model.docs = docs
+        model.previewPins = ["t:t6"]
+        model.journalStore.change("v:v3", to: "Idea: show the grey text only after half a second of pause, never on every letter.", original: model.takes.first { $0.id == "v3" }?.text ?? "")
         model.rebuildTape()
         let host = NSHostingView(rootView: WindowView(titlebar: true).environmentObject(model).environment(\.colorScheme, dark ? .dark : .light))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1280, height: 1000), styleMask: [.borderless], backing: .buffered, defer: false)
         window.contentView = host
         host.frame = NSRect(x: 0, y: 0, width: 1280, height: 1000)
-        func shot(_ name: String, wait: Double = 0.15) throws { RunLoop.current.run(until: Date().addingTimeInterval(wait)); try save(host, folder + "/" + name + ".png") }
-        // a copied link open, as on the concept board
-        model.chosen = model.rows.first { $0.entry?.id == "c1" }?.id; model.open = model.chosen
-        try shot("window", wait: 0.3)
-        model.chosen = model.rows.first { $0.doc != nil }?.id; model.open = nil
-        try shot("window-call")
-        model.chosen = model.rows.first { $0.entry?.id == "c5" }?.id; model.open = model.chosen
-        try shot("window-picture-open")
-        model.chosen = model.rows.first { $0.entry?.id == "v1" }?.id; model.open = model.chosen
-        try shot("window-said-open")
-        if short { model.open = nil; model.show(.settings); try shot("settings"); return }
-        model.chosen = model.rows.first { $0.entry?.id == "t4" }?.id; model.open = model.chosen
-        try shot("typed")
-        model.open = nil; model.query = "station"
-        try shot("window-search")
-        model.query = ""; model.solo(.said)
-        try shot("window-said")
-        model.solo(.said)
-        var incomplete = Entry(id: "sample-incomplete", when: Date(timeIntervalSince1970: now - 60), app: "Notes", text: "", audio: "", secs: 12)
-        incomplete.raw = "The last words heard before transcription stopped."; incomplete.outcome = "timeout"
-        model.takes.insert(incomplete, at: 0); model.rebuildTape()
-        model.chosen = "v:sample-incomplete"; model.open = model.chosen
-        try shot("voice-recovery")
-        model.takes.removeFirst(); model.rebuildTape(); model.open = nil
+        model.width = 1280
+        func shot(_ name: String, wait: Double = 0.15) throws {
+            RunLoop.current.run(until: Date().addingTimeInterval(wait)); try save(host, folder + "/" + name + ".png")
+            if let v = model.listView, let clip = v.enclosingScrollView?.contentView {   // what one screen of the list holds
+                let top = clip.bounds.minY, bottom = top + clip.bounds.height
+                var n: [JLine.Kind: Int] = [:]
+                for (i, l) in v.lines.enumerated() where i < v.placed.count && v.placed[i].y >= top && v.placed[i].y + v.placed[i].h <= bottom { n[l.kind, default: 0] += 1 }
+                print("screen \(name): \(n[.row] ?? 0) items, \(n[.session] ?? 0) sessions, \(n[.chunk] ?? 0) chunks, \(n[.head] ?? 0) days/weeks, \(n[.part] ?? 0) parts · list \(Int(clip.bounds.height)) pt")
+            }
+        }
+        func pick(_ entry: String) { if let id = model.rows.first(where: { $0.entry?.id == entry || $0.id == entry })?.id { model.choose(id); model.nav.region = .list } }
+        // 1 the journal: a draft chosen, the reader open
+        pick("t4")
+        try shot("window", wait: 0.4)
+        // 1b a session of several items unfolded, one of its items chosen
+        if let c = model.lines.first(where: { $0.kind == .row && $0.inSession }) { model.choose(c.id); model.nav.region = .list }
+        try shot("window-session")
+        // 1c the When group's Older unfolded to the months and years
+        model.olderOpen = true; model.refilter(); model.nav.region = .sidebar; model.nav.cursor = 7; try shot("window-older")
+        model.olderOpen = false; model.refilter(); model.nav.region = .list
+        // 2 a recording chosen
+        pick("d:" + docs[0].id); try shot("window-call")
+        // 3 a changed voice note, focus on the reader's actions
+        pick("v3"); model.nav.region = .reader(0); try shot("window-changed")
+        // 4 the editor
+        pick("v1"); model.edit(); model.draft += " Then we look at it together on Thursday."; try shot("window-editor")
+        model.leaveEditor(); model.revert(); model.undoLast(); model.status = ""
+        // 5 a search with its matches marked, the result count
+        model.query = "station"; pick("t4"); try shot("window-search", wait: 0.3)
+        model.query = ""
+        // 6 group by related to
+        model.setGroup(.related); pick("c7"); try shot("window-related"); model.setGroup(.time); pick("t4")
+        // 7 comfortable
+        model.settings.tapeDensity = "comfortable"; model.tapeTick += 1; try shot("window-comfortable"); model.settings.tapeDensity = "compact"; model.tapeTick += 1
+        // 8 sidebar and reader shut: an item open in place
+        model.sidebarShown = false; model.readerPref = false; pick("c4"); model.open = model.chosen; try shot("window-bare")
+        model.open = nil; model.sidebarShown = true; model.readerPref = nil
+        // 9 the long scroll: today folded, earlier this week with one day open, older months folded
+        model.opens["h|c:today"] = false
+        model.refilter()
+        if let d = model.lines.first(where: { $0.kind == .head && $0.chunk == "c:week" }) { model.opens[d.id] = true }
+        model.refilter()
+        if let y = model.lines.first(where: { $0.id == "h|c:yesterday" }) { model.choose(y.id) }
+        model.nav.region = .list
+        try shot("window-long")
+        model.opens = [:]; model.refilter()
+        // 10 two items picked, combined into a draft
+        pick("t1"); model.extend(1); model.extend(1); model.combine(); try shot("window-combine")
+        model.editing = nil; model.picked = []; model.nav.region = .list; model.status = ""
+        // 11 a delete with its undo next to it
+        pick("c2"); model.delete(); try shot("window-delete"); model.undoLast(); model.status = ""
+        if short { model.show(.settings); try shot("settings"); return }
+        // 12 a narrow window: the reader closed by itself
+        host.frame = NSRect(x: 0, y: 0, width: 860, height: 760); model.width = 860; pick("t2"); try shot("window-narrow", wait: 0.3)
+        host.frame = NSRect(x: 0, y: 0, width: 1280, height: 1000); model.width = 1280
         model.startCommand(); model.command = "book 30 min with Mila tomorrow"
         model.options = [["chip": "Book «Design review» tomorrow 10:00-10:30"], ["chip": "Find a free 30 min slot tomorrow"]]
         model.status = "Haiku · click to run"
         try shot("command-options")
-        model.escape(); model.status = ""
+        model.commandMode = false; model.command = ""; model.options = []; model.status = ""
         // the pages: a call, its search, a long note, a call with no words
         model.openDoc(model.docs[0]); try shot("recordings", wait: 0.3)
         model.query = "схем"; try shot("recordings-search", wait: 0.3)
         model.query = ""; model.openDoc(model.docs[1]); try shot("recordings-note", wait: 0.2)
         model.warnings[model.docs[2].id] = ["Your microphone gives only silence (muted or taken by another app?)"]
         model.openDoc(model.docs[2]); try shot("recordings-empty", wait: 0.3)
+        NamesStore.shared.preview = true; NamesStore.shared.use(NamesPreview.sample())
+        model.show(.names); try shot("names", wait: 0.3)
         model.show(.shortcuts); try shot("shortcuts")
         model.show(.settings); try shot("settings")
-        // the whole Settings page at once, to see the groups below the fold (calls, calendars)
         let tall = NSHostingView(rootView: SettingsView().environmentObject(model).foregroundStyle(UIInk.ink).tint(UIInk.blue)
             .background(UIInk.paper).environment(\.colorScheme, dark ? .dark : .light))
         let tallWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1152, height: 2300), styleMask: [.borderless], backing: .buffered, defer: false)
@@ -163,32 +278,49 @@ enum UIShots {
         RunLoop.current.run(until: Date().addingTimeInterval(0.2))
         try save(tall, folder + "/settings-all.png")
         model.show(.help); try shot("help")
-        model.back(); model.query = "no matching recording"
-        host.frame = NSRect(x: 0, y: 0, width: 760, height: 520)
+        let helpTall = NSHostingView(rootView: HelpView().environmentObject(model).foregroundStyle(UIInk.ink).background(UIInk.paper).environment(\.colorScheme, dark ? .dark : .light))
+        let helpWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 2000), styleMask: [.borderless], backing: .buffered, defer: false)
+        helpWindow.contentView = helpTall; helpTall.frame = NSRect(x: 0, y: 0, width: 760, height: 2000)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        try save(helpTall, folder + "/help-all.png")
+        model.back(); model.query = "no matching item"
+        host.frame = NSRect(x: 0, y: 0, width: 760, height: 520); model.width = 760
         try shot("window-small-empty")
-        host.frame = NSRect(x: 0, y: 0, width: 1280, height: 1000)
-        // speed: 1,000 made-up rows: build (merge and filter), lay out and draw what is in view; then scroll
+        model.query = ""
+        // speed: a year and more of made-up rows: build, search, outline, lay out and draw what is in view; then scroll
         let big = WindowModel(); big.preview = true; big.now = now
-        sampleTape(big, now: now, filler: 990)
+        sampleTape(big, now: now, days: 730, perDay: 30)
         big.docs = docs
-        let v = TapeView(frame: NSRect(x: 0, y: 0, width: 1152, height: 800))
-        let sv = NSScrollView(frame: NSRect(x: 0, y: 0, width: 1152, height: 800)); sv.documentView = v; v.model = big
-        // what AppKit asks for: the rows in the visible rect, drawn into a bitmap of that size
+        TapeBuild.tagCache = [:]
+        let v = TapeView(frame: NSRect(x: 0, y: 0, width: 760, height: 800))
+        let sv = NSScrollView(frame: NSRect(x: 0, y: 0, width: 760, height: 800)); sv.documentView = v; v.model = big; big.listView = v
         func drawVisible() {
             let r = sv.contentView.documentVisibleRect
             guard let rep = v.bitmapImageRepForCachingDisplay(in: r) else { return }
             v.cacheDisplay(in: r, to: rep)
         }
-        var opens: [Double] = [], builds: [Double] = []
-        for _ in 0..<5 {
+        // the real path: the list paints first, the tags no cache knows come after it (fillTags); then a second open
+        // reads them from the file on disk (a new process: nothing in memory)
+        let tagFile = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("drafter-preview-journal-tags.json")
+        try? FileManager.default.removeItem(at: tagFile)
+        big.previewTagFile = tagFile; big.previewDefer = true
+        var firsts: [Double] = [], builds: [Double] = [], fills: [Double] = []
+        for k in 0..<3 {
+            TapeBuild.tagCache = [:]; TapeBuild.disk = nil
+            if k == 0 { try? FileManager.default.removeItem(at: tagFile) }
             let t0 = Date()
+            big.previewDefer = k == 0
+            // the first paint: the build, the outline, the layout and the lines in view (the fill is timed apart)
             big.rebuildTape()
-            builds.append(Date().timeIntervalSince(t0) * 1000)
-            v.apply(rows: big.rows, chosen: big.rows.first?.id, open: nil, query: "")
+            builds.append(big.journal.ms)
+            v.apply(big.snap, items: big.rows, facts: big.journal.facts)
             drawVisible()
-            opens.append(Date().timeIntervalSince(t0) * 1000)
+            firsts.append(Date().timeIntervalSince(t0) * 1000 - (k == 0 ? big.fillMs : 0))
+            fills.append(k == 0 ? big.fillMs : 0)
         }
-        let total = big.rows.count
+        let fileKB = ((try? FileManager.default.attributesOfItem(atPath: tagFile.path)[.size] as? Int) ?? 0) / 1024
+        let t1 = Date(); big.rebuildTape(); v.apply(big.snap, items: big.rows, facts: big.journal.facts); drawVisible()
+        let warm = Date().timeIntervalSince(t1) * 1000
         var scrolls: [Double] = []
         for k in 1...30 {
             let t0 = Date()
@@ -196,13 +328,32 @@ enum UIShots {
             drawVisible()
             scrolls.append(Date().timeIntervalSince(t0) * 1000)
         }
-        var keys: [Double] = []
-        for q in ["s", "st", "sta", "stat", "stati"] {
-            let t0 = Date(); big.query = q; v.apply(rows: big.rows, chosen: big.chosen, open: nil, query: q); drawVisible(); keys.append(Date().timeIntervalSince(t0) * 1000)
+        // the index is built once (off the main thread in the app; inline here), with each row's detector marks; then
+        // every key is timed on its own: the search core, and with the layout and the draw of what is in view. A key
+        // over 30 ms in the core, or a detector run while typing, fails the run.
+        let marksBefore = SearchMarkStore.shared.computed
+        let tb = Date(); big.query = "zq"; v.apply(big.snap, items: big.rows, facts: big.journal.facts)
+        let indexMs = Date().timeIntervalSince(tb) * 1000, marked = SearchMarkStore.shared.computed - marksBefore
+        big.query = ""; v.apply(big.snap, items: big.rows, facts: big.journal.facts)
+        var keys: [Double] = [], cores: [Double] = []
+        let marksKeys = SearchMarkStore.shared.computed
+        for q in ["s", "st", "sta", "stat", "stati", "station has:date", "has:money", "mentions:friday", "plan mentions:friday", "lantern"] {
+            let t0 = Date(); big.query = q; v.apply(big.snap, items: big.rows, facts: big.journal.facts); drawVisible(); keys.append(Date().timeIntervalSince(t0) * 1000); cores.append(big.searchSide.view.ms)
         }
-        print(String(format: "window speed: %d rows · open (build + layout + draw in view) first %.1f ms, then %.1f ms (build alone avg %.1f ms) · scroll a screen avg %.2f ms, worst %.2f ms · search per key avg %.1f ms, worst %.1f ms",
-                     total, opens[0], opens.dropFirst().reduce(0, +) / 4, builds.reduce(0, +) / 5, scrolls.reduce(0, +) / Double(scrolls.count), scrolls.max() ?? 0,
-                     keys.reduce(0, +) / Double(keys.count), keys.max() ?? 0))
+        big.query = ""
+        print("journal search keys: " + keys.map { String(format: "%.1f", $0) }.joined(separator: " ") + " · core " + cores.map { String(format: "%.1f", $0) }.joined(separator: " "))
+        print(String(format: "journal search: index with marks %.0f ms (%d rows read by the detector) · search per key avg %.1f ms, worst %.1f ms · with layout and draw avg %.1f ms, worst %.1f ms · detector runs while typing %d",
+                     indexMs, marked, cores.reduce(0, +) / Double(cores.count), cores.max() ?? 0, keys.reduce(0, +) / Double(keys.count), keys.max() ?? 0,
+                     SearchMarkStore.shared.computed - marksKeys))
+        if (cores.max() ?? 0) > 30 || SearchMarkStore.shared.computed != marksKeys {
+            throw NSError(domain: "Preview", code: 30, userInfo: [NSLocalizedDescriptionKey: "journal search over 30 ms a key in the core, or the detector ran while typing"])
+        }
+        let t2 = Date(); big.toggleFold("h|c:yesterday"); v.apply(big.snap, items: big.rows, facts: big.journal.facts); drawVisible()
+        let foldMs = Date().timeIntervalSince(t2) * 1000
+        print(String(format: "journal speed: %d stored rows (made-up) -> %d items, %d sessions, %d lines unfolded · first paint (build + outline + layout + draw) %.0f ms with no tags known (build %.0f ms; the tags follow in %.0f ms off the main thread), %.0f ms on a second open with the tags on disk (build %.0f ms, file %d KB), %.0f ms with them in memory · scroll a screen avg %.2f ms, worst %.2f ms · search per key avg %.1f ms, worst %.1f ms · fold %.1f ms",
+                     big.clips.count + big.typed.count + big.takes.count + big.docs.count, big.rows.count, big.journal.sessions.count, big.lines.count,
+                     firsts[0], builds[0], fills[0], firsts[1], builds[1], fileKB, warm, scrolls.reduce(0, +) / Double(scrolls.count), scrolls.max() ?? 0,
+                     keys.reduce(0, +) / Double(keys.count), keys.max() ?? 0, foldMs))
     }
 
     /// Two fictional recordings in a temporary folder: a call with timed lines, both sides, audio and screenshots, and
@@ -263,6 +414,126 @@ enum UIShots {
         }
         try silence(2).write(to: unread.appendingPathComponent("me.wav")); try silence(300).write(to: unread.appendingPathComponent("them.wav"))
         return [CallDoc.load(call, notes: notes), CallDoc.load(note, notes: notes), CallDoc.load(unread, notes: notes)]
+    }
+}
+
+// MARK: the strip styles side by side (14 November 2026)
+
+extension UIShots {
+    /// The states the owner's words are about, in order (made-up text only).
+    static let stripStates: [(String, String)] = [
+        ("listening-1", "Listening · 1 line"), ("listening-2", "Listening · 2 lines"), ("listening-4", "Listening · 4 lines, scrolling"),
+        ("finishing", "Finishing"), ("finishing-latched", "Finishing · ↩ latched"), ("armed", "Draft ready → a field"), ("armed-copy", "Draft ready · no field"), ("kept", "In the journal"), ("inserted", "In the field"),
+        ("copied", "On the clipboard · no field"), ("waking", "Waking · audio kept"), ("segment", "↩ while speaking · inserting"),
+        ("segment-done", "↩ while speaking · in the field"), ("live", "Live mode · words in the field"), ("held", "Live mode · ↩ held"),
+        ("call", "A call"), ("warning", "A call · a side not heard"), ("offer", "An offer"), ("undo", "A receipt with Undo")]
+
+    /// Every state of both strip styles in light and dark, on a made-up screen top with the camera housing and on a
+    /// made-up external display: <root>/<style>/<theme>/<state>-<notch|display>.png, then one contact sheet per style
+    /// and theme (<root>/sheet-<style>-<theme>.png). Made-up text only.
+    static func stripStyles(_ root: String) throws {
+        let fm = FileManager.default
+        let only = (ProcessInfo.processInfo.environment["STRIP_ONLY"] ?? "").split(separator: ",").map(String.init)
+        for theme in ["dark", "light"] {
+            NSApp.appearance = NSAppearance(named: theme == "dark" ? .darkAqua : .aqua)
+            for s in StripStyle.allCases where only.isEmpty || only.contains(s.rawValue) {
+                let dir = root + "/\(s.rawValue)/\(theme)"
+                try? fm.removeItem(atPath: dir)
+                try fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                Pill.shared.forced = s
+                for (screen, notch) in [("notch", CGFloat(200)), ("display", CGFloat(0))] {
+                    try stripRun(s, notch: notch) { name in dir + "/\(name)-\(screen).png" }
+                }
+                try stripSheet(root, style: s, theme: theme)
+            }
+        }
+        print("Strip styles: " + root)
+    }
+
+    /// Drives one style through the states with the calls Voice makes, shooting each.
+    static func stripRun(_ s: StripStyle, notch: CGFloat, path: (String) -> String) throws {
+        let bar: CGFloat = { if let sc = NSScreen.main, sc.safeAreaInsets.top > 0 { return sc.safeAreaInsets.top }; return 32 }()
+        let comp = ComposerStrip.shared, classic = ClassicStrip.shared
+        let face = Pill.face(s)
+        func start(live: Bool = false) {
+            if s == .composer { comp.previewStart(notch: notch, bar: notch > 0 ? bar : 24, live: live) } else { classic.previewOn(notch: notch) }
+        }
+        func levels(_ n: Int) { if s == .composer { comp.previewLevels(n) } else { classic.previewLevels(n) } }
+        func shot(_ name: String) throws {
+            if s == .composer { try composerScene(comp, path(name)) } else { try classic.previewShot(path(name)) }
+        }
+        let w1 = "Let's move the review to Friday"
+        let w2 = w1 + " and keep the first half for the made-up launch plan"
+        let w4 = w2 + ", then the budget sheet, the two drafts from Mila, and whatever is left from the call about the strip and the notch on the new laptops."
+            + " After that we look at the made-up numbers for the second week and decide who writes the short note to the team"
+        start()
+        face.listening(); face.draft(w1); levels(30); try shot("listening-1")
+        face.draft(w2); levels(10); try shot("listening-2")
+        face.draft(w4); levels(10); try shot("listening-4")
+        face.finishing(insert: false); try shot("finishing")
+        face.finishing(insert: true); try shot("finishing-latched")
+        face.armed(w2 + "."); face.target("→ Claude", button: "Insert"); try shot("armed")
+        face.target("No text field in Finder", button: "Copy"); try shot("armed-copy")
+        face.kept(w2 + "."); try shot("kept")
+        face.listening(); face.draft(w1); face.inserted(); try shot("inserted")
+        face.copied("No text field here"); try shot("copied")
+        face.listening(); face.waking(true); levels(30); try shot("waking")
+        face.waking(false); face.draft(w2); face.segment("Inserting → Claude"); face.draft("And the room for the demo"); levels(10); try shot("segment")
+        face.segmentDone(ok: true, reason: ""); try shot("segment-done")
+        start(live: true)
+        face.listening(); face.draft(w2); levels(30); try shot("live")
+        face.held(); try shot("held")
+        start()
+        face.recording(call: true, seconds: 83, title: "", outline: ["Agree on the strip and how it opens under the notch"], event: "Design review: voice strip", shots: 2, warning: nil)
+        if s == .composer { comp.previewSet { $0.me = 0.62; $0.them = 0.34 } }
+        try shot("call")
+        face.recording(call: true, seconds: 95, title: "", outline: [], event: "Design review: voice strip", shots: 0, warning: "Not hearing the other side yet")
+        if s == .composer { comp.previewSet { $0.me = 0.5; $0.them = 0 } }
+        try shot("warning")
+        face.hide(after: 0)
+        face.offer(["Record this call?", "Design review: voice strip · Mila Synthetic, Sava Synthetic"], kind: "Call", side: "Zoom",
+                   controls: [StripButton("Record", key: "tab", style: .primary) {}, StripButton("Dismiss", key: "esc") {}], seconds: 30)
+        try shot("offer")
+        face.flash("Offers off in Slack", button: StripButton("Undo", key: "", style: .primary) {})
+        try shot("undo")
+        if s == .composer { comp.previewStart(notch: 200, bar: bar) }
+    }
+
+    static func stripSheet(_ root: String, style s: StripStyle, theme: String) throws {
+        func load(_ path: String) -> NSBitmapImageRep? {
+            guard let d = FileManager.default.contents(atPath: path), let r = NSBitmapImageRep(data: d) else { return nil }
+            r.size = NSSize(width: CGFloat(r.pixelsWide) / 2, height: CGFloat(r.pixelsHigh) / 2); return r
+        }
+        let cols = [("notch", "MacBook screen, camera housing"), ("display", "External display")]
+        let cap: CGFloat = 200, gap: CGFloat = 14, head: CGFloat = 54
+        var rows: [(String, [NSBitmapImageRep?], CGFloat)] = []
+        for (name, label) in stripStates {
+            let imgs = cols.map { load(root + "/\(s.rawValue)/\(theme)/\(name)-\($0.0).png") }
+            rows.append((label, imgs, imgs.compactMap { $0?.size.height }.max() ?? 80))
+        }
+        let cell = rows.flatMap { $0.1.compactMap { $0?.size.width } }.max() ?? 820
+        let w = cap + CGFloat(cols.count) * (cell + gap) + gap
+        let h = head + rows.reduce(0) { $0 + $1.2 + gap } + gap
+        try picture(NSSize(width: w, height: h), root + "/sheet-\(s.rawValue)-\(theme).png") { r in
+            PK.paper.setFill(); r.fill()
+            (("\(s.name) · \(theme)") as NSString).draw(at: NSPoint(x: 20, y: h - 34), withAttributes: [.font: PK.display(20), .foregroundColor: PK.ink])
+            let label: [NSAttributedString.Key: Any] = [.font: PK.text(14), .foregroundColor: PK.muted]
+            for (i, c) in cols.enumerated() { (c.1 as NSString).draw(at: NSPoint(x: cap + gap + CGFloat(i) * (cell + gap), y: h - 34), withAttributes: label) }
+            var y = h - head
+            for (label, imgs, rh) in rows {
+                y -= rh + gap
+                (label as NSString).draw(with: NSRect(x: 20, y: y, width: cap - 30, height: rh - 8), options: [.usesLineFragmentOrigin],
+                                         attributes: [.font: PK.text(14), .foregroundColor: PK.ink])
+                for (i, img) in imgs.enumerated() {
+                    guard let img else { continue }
+                    let x = cap + gap + CGFloat(i) * (cell + gap)
+                    NSGraphicsContext.saveGraphicsState()
+                    NSRect(x: x, y: y, width: cell, height: rh).clip()
+                    img.over(NSRect(x: x + (cell - img.size.width) / 2, y: y + rh - img.size.height, width: img.size.width, height: img.size.height))
+                    NSGraphicsContext.restoreGraphicsState()
+                }
+            }
+        }
     }
 }
 

@@ -118,6 +118,28 @@ struct LiveTypeTest {
         check(m.summary == "steady -> field median 600 ms, worst 600 ms; shown -> field median 900 ms, worst 1500 ms", "summary: \(m.summary)")
         check(LiveType.Meter.median([3, 1, 2]) == 2 && LiveType.Meter.median([1, 2, 3, 4]) == 2.5, "median")
 
+        // the cut-off fault: at the end the field always reaches the final text (keys, or the run replaced whole),
+        // never a few live words with the rest only on the clipboard
+        let ends: [(String, String)] = [
+            ("Let's meet on", "Let's meet on Friday at ten, and bring the made-up plan for the launch with the two drafts and the budget sheet."),
+            ("the quick brown fox", "A quick brown fox jumps over the lazy dog near the river bank."),
+            ("Привіт, як справи з", "Привіт! Як там справи з вигаданим планом на наступний тиждень?"),
+            ("one two three four five six seven", "Completely different words came back from the careful reading of the note."),
+            ("Hello there", "Hello there, friend."),
+            ("hello there friend", "Hello there, friend."),
+        ]
+        for (have, want) in ends {
+            switch LiveType.endWay(have: have, want: want) {
+            case .keys(let p):
+                let got = apply(p, to: have)
+                check(got == want || (p.marksOnly && LiveType.onlyMarks(got, want)), "end by keys reaches the final: «\(got)»")
+            case .replace(let t):
+                check(t == want, "the run is replaced by the whole final text")
+            }
+        }
+        if case .replace = LiveType.endWay(have: "one two three four five six seven", want: "Completely different words came back from the careful reading of the note.") {} else {
+            check(false, "a run far from the final is replaced whole")
+        }
         print(failed == 0 ? "live type: all passed" : "live type: \(failed) failed")
         exit(failed == 0 ? 0 : 1)
     }

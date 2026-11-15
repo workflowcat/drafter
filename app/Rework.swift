@@ -5,6 +5,8 @@
 // Tab or Return puts it over the selection (a paste, so line breaks never send a chat message); a digit tries another
 // command; Esc keeps his text. Backspace as the very next key after Tab brings his text back (⌘Z in the app works too).
 // Nothing leaves the Mac before he picks a command. Not in skipped apps, password fields or under secure input.
+// Synonyms (2026-11-15): on one word or a 2-3 word phrase the list starts with up to 6 offline synonyms from engine
+// `/synonyms` (a thesaurus on this Mac, nothing sent); 1-6 pick them and the commands follow (SynonymRules).
 import AppKit
 import Carbon
 import ScreenCaptureKit
@@ -27,7 +29,12 @@ final class Rework {
     var sel = 0
     var typed = ""                  // his own instruction
     private(set) var original = "", result = "", ran = "", by = "", ms = 0
-    private var el: AXUIElement?, pid: pid_t = 0, app = "", anchor = CGRect.zero, seq = 0
+    private var el: AXUIElement?, pid: pid_t = 0, app = "", bundle = "", anchor = CGRect.zero, seq = 0
+    struct Syn { let text: String; let base: Bool }
+    private(set) var syns: [Syn] = []
+    private var synAsked = false, synMs = 0, synPicked = 0
+    /// Rows in the menu before the typed one: synonyms, then the commands.
+    var rows: Int { syns.count + cmds.count }
     struct Done { let el: AXUIElement; let old: String; let new: String; let revision: Int; let at: Date }
     static var last: Done?
 
@@ -62,12 +69,14 @@ final class Rework {
               (text as NSString).length <= 3000 else { return false }
         Fields.end("rework")
         Keys.shared.cancel(); Ghost.shared.hide()
-        self.el = el; pid = front.processIdentifier; app = front.localizedName ?? ""
+        self.el = el; pid = front.processIdentifier; app = front.localizedName ?? ""; bundle = front.bundleIdentifier ?? ""
         original = text; typed = ""; sel = 0; result = ""; ran = ""
         cmds[6].hint = Translate.lang(text, share: 0.6) == "uk" ? "→ English" : "→ Українська"
         anchor = Focus.selectionRect(el) ?? Focus.frame(el) ?? CGRect(x: NSEvent.mouseLocation.x, y: 200, width: 1, height: 18)
         state = .menu
+        syns = []; synAsked = false; synMs = 0; synPicked = 0
         Engine.shared.post("/rework", ["warm": true])
+        if SynonymRules.asks(text) { askSynonyms(text, before: Focus.before(el) ?? "") }
         draw()
         log("rework: open, \(text.count) chars in \(front.bundleIdentifier ?? "?")")
         return true
@@ -76,6 +85,7 @@ final class Rework {
     func close(_ why: String) {
         guard isOpen else { return }
         state = .closed; seq += 1
+        if synAsked { log(SynonymRules.logLine(shown: syns.count, picked: synPicked, ms: synMs)); synAsked = false }
         panel.orderOut(nil)
         log("rework: closed (\(why))")
     }
@@ -85,20 +95,22 @@ final class Rework {
         if NSWorkspace.shared.frontmostApplication?.processIdentifier != pid { close("app changed"); return false }
         if code == 48, mods == .maskAlternate { close("⌥tab"); return true }
         if !mods.subtracting(.maskShift).isEmpty { close("shortcut"); return false }
-        let digit = ch.count == 1 ? Int(ch).flatMap { (1...cmds.count).contains($0) ? $0 : nil } : nil
+        let digit = ch.count == 1 ? Int(ch).flatMap { SynonymRules.digit($0, synonyms: syns.count, commands: cmds.count) } : nil
         switch state {
         case .menu:
             switch code {
             case 53: close("esc")
             case 126: sel = max(0, sel - 1); draw()
-            case 125: sel = min(cmds.count, sel + 1); draw()
-            case 36, 76, 48: if !typed.trimmingCharacters(in: .whitespaces).isEmpty { run("custom") } else if sel < cmds.count { run(cmds[sel].id) }
+            case 125: sel = min(rows, sel + 1); draw()
+            case 36, 76, 48:
+                if !typed.trimmingCharacters(in: .whitespaces).isEmpty { run("custom") }
+                else if let p = SynonymRules.row(sel, synonyms: syns.count, commands: cmds.count) { pick(p) }
             case 51: if !typed.isEmpty { typed.removeLast(); draw() }
             case 123, 124, 115, 119, 116, 121: close("arrow"); return false
             default:
-                if typed.isEmpty, let d = digit { run(cmds[d - 1].id) }
+                if typed.isEmpty, let p = digit { pick(p) }
                 else if let c = ch.unicodeScalars.first, !CharacterSet.controlCharacters.contains(c), typed.count < 200 {
-                    typed += ch; sel = cmds.count; draw()
+                    typed += ch; sel = rows; draw()
                 }
             }
             return true
@@ -110,10 +122,38 @@ final class Rework {
                 if state == .result { close("tab"); DispatchQueue.main.async { self.apply() } }
                 return true
             default:
-                if let d = digit { run(cmds[d - 1].id); return true }
+                if let p = digit { pick(p); return true }
                 close("typed"); return false          // he types on: his key goes to the app as usual
             }
         case .closed: return false
+        }
+    }
+
+    /// A row he picked: a synonym goes over the selection at once, a command runs.
+    func pick(_ p: SynonymRules.Pick) {
+        switch p {
+        case .command(let i): run(cmds[i].id)
+        case .synonym(let i):
+            guard i < syns.count else { return }
+            synPicked = i + 1; result = syns[i].text; ran = "synonym"
+            close("synonym")                    // closed now, so a second key cannot apply it twice
+            DispatchQueue.main.async { self.apply() }
+        }
+    }
+
+    /// Offline synonyms for a short selection (engine/synonyms.py); they show only if the list is still untouched.
+    private func askSynonyms(_ text: String, before: String) {
+        synAsked = true
+        let mine = seq, t0 = Date()
+        Engine.shared.post("/synonyms", ["text": text, "before": String(before.suffix(200))], timeout: 1.5) { j in
+            self.synMs = Int(Date().timeIntervalSince(t0) * 1000)
+            guard mine == self.seq, self.state == .menu, self.typed.isEmpty, self.sel == 0 else { return }
+            let items = (j?["items"] as? [[String: Any]] ?? []).prefix(SynonymRules.maxShown)
+            self.syns = items.compactMap { d in
+                guard let t = d["text"] as? String, !t.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+                return Syn(text: t, base: d["form"] as? String == "base")
+            }
+            if !self.syns.isEmpty { self.draw() }
         }
     }
 
@@ -121,7 +161,9 @@ final class Rework {
         ran = cmd; state = .working; seq += 1
         let mine = seq, t0 = Date()
         draw()
-        Engine.shared.post("/rework", ["text": original, "cmd": cmd, "custom": cmd == "custom" ? typed : "", "app": app], timeout: 45) { j in
+        let st = Drafter.shared.settings
+        Engine.shared.post("/rework", ["text": original, "cmd": cmd, "custom": cmd == "custom" ? typed : "", "app": app,
+                                       "notes": WritingNotes.forApp(bundle, global: st.writingNote, perApp: st.appNotes)], timeout: 45) { j in
             guard mine == self.seq, self.state == .working else { return }
             let out = (j?["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             self.ms = Int(Date().timeIntervalSince(t0) * 1000)
@@ -198,7 +240,7 @@ final class ReworkView: NSView {
     func fit() -> NSSize {
         guard let m = model else { return .zero }
         switch m.state {
-        case .menu: return NSSize(width: W, height: 28 + CGFloat(m.cmds.count + 1) * row + 8)
+        case .menu: return NSSize(width: W, height: 28 + CGFloat(m.rows + 1) * row + 8 + (m.syns.isEmpty ? 0 : 6))
         case .working, .failed: return NSSize(width: W, height: 28 + row + 8)
         case .result: return NSSize(width: W, height: 28 + resultHeight() + 12 + row + 6)
         case .closed: return .zero
@@ -224,7 +266,7 @@ final class ReworkView: NSView {
         let name = m.ran == "custom" ? "Your words" : (m.cmds.first { $0.id == m.ran }?.name ?? "")
         let head: String
         switch m.state {
-        case .menu: head = "Rework · \(m.original.count) characters"
+        case .menu: head = m.syns.isEmpty ? "Rework · \(m.original.count) characters" : "Synonyms · on this Mac"
         case .working: head = "\(name) · writing…"
         case .result: head = "\(name) · \(m.by) · \(String(format: "%.1f", Double(m.ms) / 1000)) s"
         case .failed: head = "\(name) · nothing better came back"
@@ -237,20 +279,31 @@ final class ReworkView: NSView {
         var y: CGFloat = 30
         switch m.state {
         case .menu:
-            for (i, c) in m.cmds.enumerated() {
+            for (i, s) in m.syns.enumerated() {
                 if i == m.sel { PK.selected.setFill(); NSRect(x: 2, y: y, width: W - 4, height: row).fill() }
-                _ = cap("\(i + 1)", at: NSPoint(x: pad, y: y + 4))
+                if let l = SynonymRules.label(i) { _ = cap(l, at: NSPoint(x: pad, y: y + 4)) }
+                let t = s.text.trimmingCharacters(in: .whitespaces)
+                (t as NSString).draw(with: NSRect(x: pad + 26, y: y + 4, width: W - pad * 2 - 26 - 80, height: 18),
+                                     options: [.truncatesLastVisibleLine, .usesLineFragmentOrigin], attributes: a(13, PK.ink))
+                if s.base { ("base form" as NSString).draw(at: NSPoint(x: W - pad - 66, y: y + 5), withAttributes: a(12, PK.faint)) }
+                y += row
+            }
+            if !m.syns.isEmpty { PK.rule.setFill(); NSRect(x: 0, y: y + 2, width: W, height: 1).fill(); y += 6 }
+            for (k, c) in m.cmds.enumerated() {
+                let i = m.syns.count + k
+                if i == m.sel { PK.selected.setFill(); NSRect(x: 2, y: y, width: W - 4, height: row).fill() }
+                if let l = SynonymRules.label(i) { _ = cap(l, at: NSPoint(x: pad, y: y + 4)) }
                 (c.name as NSString).draw(at: NSPoint(x: pad + 26, y: y + 4), withAttributes: a(13, PK.ink))
                 (c.hint as NSString).draw(at: NSPoint(x: pad + 110, y: y + 5), withAttributes: a(12, PK.muted))
                 y += row
             }
-            if m.sel == m.cmds.count { PK.selected.setFill(); NSRect(x: 2, y: y, width: W - 4, height: row).fill() }
+            if m.sel == m.rows { PK.selected.setFill(); NSRect(x: 2, y: y, width: W - 4, height: row).fill() }
             let t = m.typed.isEmpty ? "or type what to do…" : m.typed
             (t as NSString).draw(with: NSRect(x: pad + 26, y: y + 4, width: W - pad * 2 - 26 - 50, height: 18), options: [.truncatesLastVisibleLine, .usesLineFragmentOrigin],
                                  attributes: a(13, m.typed.isEmpty ? PK.faint : PK.ink))
             if !m.typed.isEmpty { _ = cap("⏎", at: NSPoint(x: W - pad - 22, y: y + 4)) }
         case .working, .failed:
-            (("1-\(m.cmds.count) another") as NSString).draw(at: NSPoint(x: pad, y: y + 4), withAttributes: a(12, PK.muted))
+            (("1-\(min(9, m.rows)) another") as NSString).draw(at: NSPoint(x: pad, y: y + 4), withAttributes: a(12, PK.muted))
         case .result:
             let h = resultHeight()
             resultText.draw(with: NSRect(x: pad, y: y + 2, width: W - 2 * pad, height: h), options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
@@ -259,7 +312,7 @@ final class ReworkView: NSView {
             var x = pad
             x += cap("tab", at: NSPoint(x: x, y: y + 2)) + 5
             ("replace" as NSString).draw(at: NSPoint(x: x, y: y + 2), withAttributes: a(12, PK.muted)); x += 62
-            x += cap("1-\(m.cmds.count)", at: NSPoint(x: x, y: y + 2)) + 5
+            x += cap("1-\(min(9, m.rows))", at: NSPoint(x: x, y: y + 2)) + 5
             ("another" as NSString).draw(at: NSPoint(x: x, y: y + 2), withAttributes: a(12, PK.muted))
         case .closed: break
         }

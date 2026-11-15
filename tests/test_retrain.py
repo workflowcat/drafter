@@ -79,6 +79,20 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(target.read_bytes(), old)
         self.assertIn('no beeper lines', report[-1])
 
+    def test_comparison_refuses_a_set_without_chat_lines(self):
+        """The default set left by the 8 November draw: 60 AI-app lines, 0 chat lines. No recording, layer kept."""
+        (self.root / 'data/replay-fresh.json').write_text(json.dumps([{'text': 'made up', 'src': 'claude', 'app': 'Claude'}] * 60))
+        report = []
+        with patch.object(retrain, 'record', side_effect=AssertionError('recorded')):
+            self.assertEqual(retrain.compare('old', 'new', report), (False, None))
+        self.assertIn('no beeper lines', report[-1])
+
+    def test_missing_kinds_by_src_or_app(self):
+        self.assertEqual(retrain.missing_kinds([{'src': 'beeper'}, {'src': 'claude'}]), [])
+        self.assertEqual(retrain.missing_kinds([{'app': 'Beeper'}, {'app': 'ChatGPT'}]), [])
+        self.assertEqual(retrain.missing_kinds([{'src': 'claude', 'app': 'Claude'}]), ['beeper'])
+        self.assertEqual(retrain.missing_kinds([]), ['beeper', 'claude'])
+
     def test_comparison_rejects_equal_truncation_missing_positions_and_wrong_set(self):
         rows = {(0, 2): {}, (1, 2): {}}
         summary = Mock(return_value={'Beeper': {'saved': 10, 'right': 80}})

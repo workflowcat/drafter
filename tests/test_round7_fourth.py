@@ -19,7 +19,7 @@ class Sleep(unittest.TestCase):
                           mx=types.SimpleNamespace(clear_cache=Mock())), cls='Model')
         self.m = types.SimpleNamespace(lock=threading.Lock(), model=None, wake_at=0,
                                        retrain_sleep=False, repo='fake', adapter=None,
-                                       head_ids=[], parked={}, sleeps=0, _warm=Mock(),
+                                       head_ids=[], parked={}, marks={}, sleeps=0, _warm=Mock(),   # marks: big-model round
                                        lora=Mock(), _oneshot=Mock(return_value='answer'),
                                        memory_gb=lambda: (0, 0))
         for name, fn in ns.items():

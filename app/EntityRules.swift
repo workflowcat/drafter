@@ -7,6 +7,28 @@ import Foundation
 
 struct EntityFact: Codable, Equatable { let text: String; let source: String; let date: String; let quote: Bool }
 struct EntityPointer: Codable, Equatable { let label: String; let value: String; let path: Bool }
+/// One kept relation (2026-11-14 relations round): the other record, a reason he can read ("works at", "in the same
+/// note: story", "often together in chats"), its weight 0..1 and where the evidence came from. `related` keeps the
+/// same ids in the same order for older readers.
+struct EntityRelation: Codable, Equatable {
+    let id: String
+    let why: String
+    let w: Double
+    var src: [String]? = nil
+}
+
+/// What a name form needs before it counts as a mention (the store's `surface_flags`; a form with none is not listed).
+struct EntitySurfaceFlags: Codable, Equatable {
+    var needs_context: Bool? = nil
+    var shared: Bool? = nil
+    var twins: Bool? = nil
+    var ordinary: Bool? = nil
+    var short: Bool? = nil
+    var list: [String] {
+        (shared == true ? ["shared"] : []) + (twins == true ? ["twins"] : []) + (ordinary == true ? ["ordinary"] : []) + (short == true ? ["short"] : [])
+    }
+}
+
 struct EntityPack: Codable, Equatable {
     var facts: [EntityFact] = []
     var pointers: [EntityPointer] = []
@@ -26,6 +48,10 @@ struct Entity: Codable, Equatable {
     var heat: Double? = nil
     var cards_only: Bool? = nil
     var `private`: Bool? = nil
+    var relations: [EntityRelation]? = nil
+    /// A twin (a project's repo, its Worker) points to the record that keeps the thing; the main record lists its twins.
+    var twin_of: String? = nil
+    var twins: [String]? = nil
 
     var cardOnly: Bool { cards_only == true }
     var isPrivate: Bool { `private` == true }
@@ -48,16 +74,19 @@ struct EntityHit: Decodable, Equatable {
 struct EntityStore: Decodable {
     var records: [Entity] = [] { didSet { byId = EntityStore.ids(records) } }
     var surfaces: [String: [EntityHit]] = [:]
+    /// Name forms that need context (shared, ordinary word, 4 letters or fewer); an older store has none.
+    var surfaceFlags: [String: EntitySurfaceFlags] = [:]
     var built_day: String? = nil
     private(set) var byId: [String: Int] = [:]
-    private enum Keys: String, CodingKey { case records, surfaces, built_day }
-    init(records: [Entity] = [], surfaces: [String: [EntityHit]] = [:]) {
-        self.records = records; self.surfaces = surfaces; byId = EntityStore.ids(records)
+    private enum Keys: String, CodingKey { case records, surfaces, built_day, surface_flags }
+    init(records: [Entity] = [], surfaces: [String: [EntityHit]] = [:], flags: [String: EntitySurfaceFlags] = [:]) {
+        self.records = records; self.surfaces = surfaces; self.surfaceFlags = flags; byId = EntityStore.ids(records)
     }
     init(from d: Decoder) throws {
         let c = try d.container(keyedBy: Keys.self)
         records = try c.decode([Entity].self, forKey: .records)
         surfaces = try c.decodeIfPresent([String: [EntityHit]].self, forKey: .surfaces) ?? [:]
+        surfaceFlags = (try? c.decodeIfPresent([String: EntitySurfaceFlags].self, forKey: .surface_flags)) ?? [:]
         built_day = try c.decodeIfPresent(String.self, forKey: .built_day)
         byId = EntityStore.ids(records)
     }
@@ -204,6 +233,105 @@ enum EntityRules {
         return out
     }
 
+    // MARK: ambiguous forms (twin of entities.decide; tests/entity_cases.json "decide" holds cases both sides run)
+
+    static let need: [String: Double] = ["shared": 1, "short": 1, "ordinary": 2, "twins": 0]
+    /// What kind of thing he names where (the destinations of RefRules.dest).
+    static func expect(dest: String) -> [String] {
+        switch dest { case "agent": return ["tool", "project"]; case "ai": return ["project", "tool"]
+        case "chat": return ["person", "project", "org"]; case "mail": return ["person", "org"]; default: return [] }
+    }
+    struct Cand: Equatable {
+        let i: Int; let how: String; let score: Double; let heat: Double
+        var related = false, named = false, kind = false, chat = false
+    }
+    /// Chat box placeholders name the chat ("message bear on whatsapp"): the same patterns as entities.CHAT_PATTERNS,
+    /// on folded text. The last one wins; nil when there is none.
+    static let messengers = "whatsapp|telegram|signal|instagram|messenger|linkedin|imessage|sms|slack|discord|beeper|viber|teams|twitter|facebook|matrix|вайбері|вайбер|телеграмі|телеграм|ватсапі|ватсап|вотсапі|вотсап|сигналі|сигнал|інстаграмі|інстаграм|месенджері|месенджер"
+    static let chatPatterns: [NSRegularExpression] = [
+        #"(?:send a message to|message|write to|reply to|text) (.{1,40}?) (?:on|in|via) (?:"# + messengers + #")\b"#,
+        #"(?:повідомлення|написати|напишіть|відповісти|відповідь)(?: для| до)? (.{1,40}?) (?:у|в|через) (?:"# + messengers + #")\b"#,
+    ].map { try! NSRegularExpression(pattern: $0) }
+    static func chatTarget(_ folded: String) -> String? {
+        var best: (Int, String)? = nil
+        let ns = folded as NSString
+        for rx in chatPatterns {
+            for m in rx.matches(in: folded, range: NSRange(location: 0, length: ns.length)) where m.numberOfRanges > 1 {
+                let t = ns.substring(with: m.range(at: 1)).trimmingCharacters(in: CharacterSet(charactersIn: " .,:;'\""))
+                if best == nil || m.range.location >= best!.0 { best = (m.range.location, t) }
+            }
+        }
+        guard let b = best, !b.1.isEmpty else { return nil }
+        return b.1
+    }
+    /// The form is the chat's name or one word of it.
+    static func namesChat(_ key: String, _ target: String?) -> Bool {
+        guard let t = target, !t.isEmpty else { return false }
+        return key == t || t.split(separator: " ").contains(Substring(key)) || t.hasPrefix(key + " ")
+    }
+    static func heatBonus(_ h: Double) -> Double { min(1, log(1 + max(0, h - 1)) / log(20)) }
+    /// A related thing named nearby 2, its own fuller name nearby 2, the chat's placeholder names this person 2, the
+    /// kind expected here 1; then heat up to 1.
+    /// Heat alone backs nothing.
+    static func support(_ c: Cand) -> Double {
+        let b = (c.related ? 2.0 : 0) + (c.named ? 2.0 : 0) + (c.chat ? 2.0 : 0) + (c.kind ? 1.0 : 0)
+        return b > 0 ? b + heatBonus(c.heat) : 0
+    }
+    /// No flags: the old rule (best score; resolved at twice the next). A pick decides. Twins (one name, several
+    /// records: a project and its repo): the record of the kind expected here. Shared: a stronger kind of match decides
+    /// (2x); else the context must back one candidate with `need` and twice the next. Ordinary or short: the context
+    /// must back it with `need`. If it does not, an ordinary or short form is no mention (nil) and a shared form stays
+    /// open for the chooser.
+    static func decide(_ cands: [Cand], flags flags0: [String], picked: Int? = nil) -> (index: Int?, resolved: Bool) {
+        guard !cands.isEmpty else { return (nil, false) }
+        if let p = picked, cands.contains(where: { $0.i == p }) { return (p, true) }
+        let many = Set(cands.map { $0.i }).count > 1
+        let flags = flags0.filter { ($0 != "shared" && $0 != "twins") || many }
+        let order = cands.sorted { $0.score != $1.score ? $0.score > $1.score : $0.i < $1.i }
+        let top = order[0], second = order.count > 1 ? order[1].score : 0
+        if flags.isEmpty { return (top.i, second == 0 || top.score >= 2 * second) }
+        let loose = flags.contains("ordinary") || flags.contains("short")
+        if flags.contains("shared"), !loose, order.count > 1 {
+            let bases: [(Double, Int)] = cands.map { c -> (Double, Int) in (base[c.how] ?? 1, c.i) }
+            let sortedBases = bases.sorted { (x: (Double, Int), y: (Double, Int)) -> Bool in x.0 != y.0 ? x.0 < y.0 : x.1 < y.1 }
+            let best = sortedBases[sortedBases.count - 1], next = sortedBases[sortedBases.count - 2]
+            if best.0 >= 2 * next.0 { return (best.1, true) }
+        }
+        let needed = flags.map { need[$0] ?? 1 }.max() ?? 1
+        let by = cands.sorted { a, b in
+            let sa = support(a), sb = support(b)
+            if sa != sb { return sa > sb }
+            if a.kind != b.kind { return a.kind }
+            return a.score != b.score ? a.score > b.score : a.i < b.i
+        }
+        let s1 = support(by[0]), s2 = by.count > 1 && flags.contains("shared") ? support(by[1]) : 0
+        if s1 >= needed && s1 >= 2 * s2 { return (by[0].i, true) }
+        if loose { return (nil, false) }
+        return (top.i, false)
+    }
+
+    /// His corrections (data/entity-fixes.json), the twin of entities.add_fix: a new dictionary with one fix added.
+    /// related / not_related / same / not_same: two record ids (order does not matter); not_this: a name form and the
+    /// record it never means. A fix replaces its opposite. nil for an unknown kind.
+    static let fixKinds = ["related", "not_related", "not_this", "same", "not_same"]
+    static func addFix(_ fixes: [String: Any], what: String, a: String, b: String, why: String = "") -> [String: Any]? {
+        guard fixKinds.contains(what) else { return nil }
+        var out: [String: [[String]]] = [:]
+        for k in fixKinds { out[k] = ((fixes[k] as? [[Any]]) ?? []).map { $0.map { "\($0)" } } }
+        if what == "not_this" {
+            let item = [fold(a), b]
+            if !(out["not_this"] ?? []).contains(where: { Array($0.prefix(2)) == item }) { out["not_this", default: []].append(item) }
+            return out
+        }
+        guard a != b else { return out }
+        let key = [a, b].sorted()
+        func same(_ x: [String]) -> Bool { x.count >= 2 && [x[0], x[1]].sorted() == key }
+        let opposite = ["related": "not_related", "not_related": "related", "same": "not_same", "not_same": "same"][what]!
+        out[opposite] = (out[opposite] ?? []).filter { !same($0) }
+        out[what] = (out[what] ?? []).filter { !same($0) } + [key + (what == "related" && !why.isEmpty ? [why] : [])]
+        return out
+    }
+
     // MARK: finding
 
     /// The `;` card and the Quick panel's `@` query: an exact surface first, then a prefix of a name, an alias or one
@@ -240,6 +368,12 @@ enum EntityRules {
     /// map knows. `context`: the last few hundred characters and the window title, folded, for the related-entity
     /// bonus; `picks`: folded name -> record id he picked here before (decides). nil when nothing matches.
     static func mention(before: String, store: EntityStore, context: String = "", picks: [String: String] = [:]) -> EntityMention? {
+        mention(before: before, store: store, context: context, picks: picks, expect: [])
+    }
+
+    /// The same, with the kinds of thing expected in this app (`expect(dest:)`): a form marked in `surface_flags`
+    /// (shared, an ordinary word, 4 letters or fewer) counts only when the context decides (`decide`).
+    static func mention(before: String, store: EntityStore, context: String, picks: [String: String], expect: [String]) -> EntityMention? {
         // the text up to the last word, then the words, each with its UTF-16 distance from the caret
         let chars = Array(before.suffix(120))
         var end = chars.count
@@ -290,10 +424,27 @@ enum EntityRules {
                     if rel.contains(where: { id in ids[id].map { context.contains(fold(store.records[$0].name)) } ?? false }) { cands[c].2 += 1 }
                 }
             }
+            let back = String(chars[startIdx...]).utf16.count
+            if let flags = store.surfaceFlags[key]?.list, !flags.isEmpty {
+                let ids = store.byId
+                let target = chatTarget(context)
+                let dc: [Cand] = cands.map { c in
+                    let r = store.records[c.0]
+                    let rel = (r.related ?? []).contains { id in ids[id].map { j -> Bool in let n = fold(store.records[j].name); return n.count >= 3 && context.contains(n) } ?? false }
+                    let named = ([r.name] + r.aliases).contains { n in let f = fold(n); return f.count >= 3 && f != key && context.contains(f) }
+                    let chat = r.kind == "person" && namesChat(key, target)
+                    return Cand(i: c.0, how: c.1, score: c.2, heat: r.heat ?? 1, related: rel, named: named, kind: expect.contains(r.kind) || chat, chat: chat)
+                }
+                let pick = picks[key].flatMap { id in cands.first(where: { store.records[$0.0].id == id })?.0 }
+                let d = decide(dc, flags: flags, picked: pick)
+                guard let got = d.index, let chosen = cands.first(where: { $0.0 == got }) else { continue }
+                let rest = cands.filter { $0.0 != got }.sorted { $0.2 != $1.2 ? $0.2 > $1.2 : $0.0 < $1.0 }
+                return EntityMention(text: text, back: back, length: back - tailUnits, index: got, how: chosen.1, score: chosen.2,
+                                     candidates: [got] + rest.map { $0.0 }, resolved: d.resolved)
+            }
             if let picked = picks[key], let k = cands.firstIndex(where: { store.records[$0.0].id == picked }) { cands[k].2 += 100 }
             cands.sort { $0.2 != $1.2 ? $0.2 > $1.2 : $0.0 < $1.0 }
             let top = cands[0], second = cands.count > 1 ? cands[1].2 : 0
-            let back = String(chars[startIdx...]).utf16.count
             return EntityMention(text: text, back: back, length: back - tailUnits, index: top.0, how: top.1, score: top.2,
                                  candidates: cands.map { $0.0 }, resolved: second == 0 || top.2 >= 2 * second)
         }
@@ -302,11 +453,15 @@ enum EntityRules {
 
     /// Every resolved name in a finished text (a dictated take): record indices, first seen first, no repeats. A longer
     /// name that grows over a shorter one ("Lantern" then "Lantern Labs") replaces it.
-    static func mentions(in text: String, store: EntityStore) -> [Int] {
+    static func mentions(in text: String, store: EntityStore) -> [Int] { mentions(in: text, store: store, expect: []) }
+
+    /// The same, with the kinds expected in this app; the text itself is the context for flagged forms.
+    static func mentions(in text: String, store: EntityStore, expect: [String]) -> [Int] {
         var found: [(start: Int, index: Int)] = []
         var prefix = "", units = 0
+        let ctx = fold(text)
         func look() {
-            guard let m = mention(before: prefix, store: store), m.resolved else { return }
+            guard let m = mention(before: prefix, store: store, context: store.surfaceFlags.isEmpty ? "" : ctx, picks: [:], expect: expect), m.resolved else { return }
             let start = units - m.back
             if let last = found.last, start <= last.start { found.removeLast() }
             if found.last?.start != start { found.append((start, m.index)) }

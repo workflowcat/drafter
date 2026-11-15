@@ -28,6 +28,11 @@ ap.add_argument("--know", default="data/know.json", help="local knowledge pack p
 ap.add_argument("--people", action="store_true", help="Beeper replies get his older messages in that chat (data/bench/people-fresh.json)")
 ap.add_argument("--ctx-chars", type=int, default=None, help="keep only the last N characters of the screen context (the engine: 1000; 0 = none)")
 ap.add_argument("--app", default=None, help="only the items from this app (Beeper, Claude)")
+ap.add_argument("--notes", default="", help="parity round: a writing instruction for every line (engine/prompt.py notes)")
+ap.add_argument("--every", type=int, default=1, help="parity round: only every Nth key of a line (short A/B runs)")
+ap.add_argument("--strength", type=float, default=1.0, help="parity round: his layer's merge scale, 0..1")
+ap.add_argument("--no-clip", action="store_true", help="parity round: leave the set's clip field out")
+ap.add_argument("--no-stable", action="store_true", help="the old copy path: read the screen text again at every key")
 a = ap.parse_args()
 if a.boost is None:
     try: a.boost = float(json.loads((ROOT / "data/gate.json").read_text()).get("boost", 0))
@@ -56,7 +61,7 @@ sha = typescore.set_sha(ROOT / a.set)
 typescore.SETS.mkdir(parents=True, exist_ok=True)
 if not (typescore.SETS / f"{sha}.json").exists(): (typescore.SETS / f"{sha}.json").write_bytes((ROOT / a.set).read_bytes())
 (ROOT / "data/bench" / f"{label}.meta.json").write_text(json.dumps({"set": a.set, "set_sha": sha, "repo": a.repo, "adapter": a.adapter,
-    "tokens": a.tokens, "know": a.know, "know_sha": typescore.set_sha(ROOT / a.know) if a.know != "none" and (ROOT / a.know).exists() else None, "boost": a.boost, "people": a.people, "app": a.app, "ctx_chars": a.ctx_chars, "fused": os.environ.get("DRAFTER_LORA_FUSE", "1") == "1", "made": time.strftime("%Y-%m-%d %H:%M")}, indent=1))
+    "tokens": a.tokens, "know": a.know, "know_sha": typescore.set_sha(ROOT / a.know) if a.know != "none" and (ROOT / a.know).exists() else None, "boost": a.boost, "people": a.people, "app": a.app, "ctx_chars": a.ctx_chars, "fused": os.environ.get("DRAFTER_LORA_FUSE", "1") == "1", "stable": not a.no_stable, "notes": a.notes, "every": a.every, "strength": a.strength, "clip": not a.no_clip, "made": time.strftime("%Y-%m-%d %H:%M")}, indent=1))
 
 
 def free_pct():
@@ -67,7 +72,7 @@ def free_pct():
 
 
 t = time.time()
-m = Model(a.repo, ROOT / a.adapter if a.adapter else None)
+m = Model(a.repo, ROOT / a.adapter if a.adapter else None, **({"strength": a.strength} if a.strength != 1.0 else {}))
 b = Builder(m, a.fmt)
 m.warm(b.head_ids)
 print(f"{label}: loaded in {time.time() - t:.1f}s, head {len(b.head_ids)} tokens, mlx {mx.get_active_memory() / 2**30:.2f} GB", flush=True)
@@ -91,10 +96,12 @@ PEOPLE = people_rows() if a.people else {}
 ru = lambda toks, logits: logits + m.russian_mask(logits.shape)
 
 
-def record(before, app, context, mine="", title=""):
-    ids, heal = b.ids(before, app, title, context, mine)
-    t0 = time.perf_counter()
-    tail = m._feed(ids); m.ids = list(ids)
+def record(before, app, context, mine="", title="", clip=""):
+    ids, heal, stable = b.ids_stable(before, app, title, context, mine, clip, a.notes)
+    t0 = time.perf_counter()   # before _feed (big-model round): restoring a copy is part of the key's time
+    # big-model round: a cache that cannot be cut back keeps a copy after the screen text (Model._feed), as the
+    # engine now does; for the live Qwen3 cache `stable` changes nothing
+    tail = m._feed(ids, None if a.no_stable else stable); m.ids = list(ids)
     procs = ([m.healer(heal, len(tail))] if heal else []) + [ru]
     bp = m.booster(words_mod.boost_targets(W, before, heal, knowledge=knowledge, context=context, title=title), len(tail), a.boost) if W else None
     if bp: procs.append(bp)
@@ -127,8 +134,8 @@ with out_p.open("w") as f:
         text = it["text"]
         for pos in range(1, len(text)):
             before = text[:pos]
-            if len(before.strip()) < 2: continue
-            heal, toks, pre = record(before, it["app"], it.get("context", ""), mine, it.get("title", ""))
+            if len(before.strip()) < 2 or pos % a.every: continue
+            heal, toks, pre = record(before, it["app"], it.get("context", ""), mine, it.get("title", ""), "" if a.no_clip else it.get("clip", ""))
             f.write(json.dumps({"i": i, "pos": pos, "heal": heal, "toks": toks, "max_tokens": a.tokens, "prefill_ms": round(pre, 1)}, ensure_ascii=False) + "\n")
         mx.clear_cache(); done += 1
         if mx.get_peak_memory() / 2**30 > a.cap:

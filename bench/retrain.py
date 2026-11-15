@@ -128,6 +128,10 @@ def _compare(cur_dir, new_dir, report):
     import gate, typescore
     try:
         items = json.loads((ROOT / "data/replay-fresh.json").read_text())
+        missing = missing_kinds(items)
+        if missing:     # the 8 November set (60 AI-app lines, 0 chat lines) stayed the default until the next draw
+            report.append(f"- the test set has no {', '.join(missing)} lines: not a fair test, kept the current layer")
+            return False, None
         expected = {(i, pos) for i, item in enumerate(items) for pos in range(1, len(item["text"]))
                     if len(item["text"][:pos].strip()) >= 2}
         rec_c, line_c = record(cur_dir, "retrain-cur")
@@ -147,6 +151,13 @@ def _compare(cur_dir, new_dir, report):
     return switch, rec_n
 
 
+def missing_kinds(items):
+    """The kinds of line a fair layer test needs (chats and AI apps) that `items` lacks: [] when both are there.
+    A line's kind: its `src` ("beeper" / "claude"), else its app (Beeper = chat, any other = AI app)."""
+    have = {i.get("src") or ("beeper" if i.get("app") == "Beeper" else "claude") for i in items}
+    return [k for k in ("beeper", "claude") if k not in have]
+
+
 def fresh_set(report):
     """Publish only a usable fresh set; a failed/small draw leaves the last set intact."""
     target = ROOT / "data/replay-fresh.json"
@@ -158,7 +169,7 @@ def fresh_set(report):
         items = json.loads(candidate.read_text())
         # 8 November: `beeper` was not on launchd's PATH, the set held 0 chat lines and the layers were judged on
         # AI-app lines alone. Both kinds or no comparison.
-        missing = [k for k in ("beeper", "claude") if not any(i.get("src") == k for i in items)]
+        missing = missing_kinds(items)
         if missing:
             report.append(f"- no {', '.join(missing)} lines in the fresh set: not a fair test of the layers")
             return 0

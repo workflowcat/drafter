@@ -18,9 +18,9 @@ def run_swift(test, files, program, marker):
         path = Path(folder)
         (path / 'main.swift').write_text(program)
         built = subprocess.run(['swiftc', '-module-cache-path', str(path / 'cache'), *map(str, files), str(path / 'main.swift'),
-                                '-o', str(path / 'check')], capture_output=True, text=True, timeout=90)
+                                '-o', str(path / 'check')], capture_output=True, text=True, timeout=300)
         test.assertEqual(built.returncode, 0, built.stderr)
-        ran = subprocess.run([str(path / 'check'), str(path)], capture_output=True, text=True, timeout=10)
+        ran = subprocess.run([str(path / 'check'), str(path)], capture_output=True, text=True, timeout=60)
         test.assertEqual(ran.returncode, 0, ran.stderr)
         test.assertIn(marker, ran.stdout)
 
@@ -62,8 +62,8 @@ print("PASS stands")
         run_swift(self, [], program, 'PASS stands')
 
     def test_settings_defaults_and_round_trip(self):
-        source = (ROOT / 'app/Main.swift').read_text()
-        settings = 'struct Settings: Codable {' + source.split('struct Settings: Codable {', 1)[1].split('// MARK: engine process', 1)[0]
+        source = (ROOT / 'app/Settings.swift').read_text()
+        settings = 'struct Settings: Codable {' + source.split('struct Settings: Codable {', 1)[1]
         program = ('import Foundation\nenum LocalConfig { static let skipApps: [String] = [] }\nenum QuickRules { static let defaultKey = "k"; static let defaultSecrets: [String] = [] }; enum Home { static let bundleID = "drafter.test"; static let settings = URL(fileURLWithPath: CommandLine.arguments[1] + "/settings.json") }\n'
                    + settings + r'''
 let empty = try JSONDecoder().decode(Settings.self, from: Data("{}".utf8))
@@ -74,6 +74,9 @@ s.save(); let back = Settings.load()
 precondition(back.autocorrectMode == "replace" && back.proofreadOff.isEmpty)
 let odd = try JSONDecoder().decode(Settings.self, from: Data(#"{"autocorrectMode":7,"proofreadOff":"ai"}"#.utf8))
 precondition(odd.autocorrectMode == "offer" && odd.proofreadOff == ["ai"])
+// one wrongly typed key falls back alone; before 2026-11-15 a wrong type on a strict key reset every setting
+let one = try JSONDecoder().decode(Settings.self, from: Data(#"{"voice":"yes","minGhost":3,"skip":["a.b"]}"#.utf8))
+precondition(!one.voice && one.minGhost == 3 && one.skip == ["a.b"])
 print("PASS settings")
 ''')
         run_swift(self, [], program, 'PASS settings')

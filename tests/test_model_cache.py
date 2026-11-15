@@ -18,7 +18,8 @@ class Cache(unittest.TestCase):
             ns = dict(copy=copy, can_trim_prompt_cache=lambda c: trimmable,
                       trim_prompt_cache=trim, make_prompt_cache=rebuild)
             exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), 'exec'), ns)
-            m = types.SimpleNamespace(cache=['speculation'], ids=[1, 2, 3, 8, 9], snapshot=None, rebuilds=0, model=object())
+            m = types.SimpleNamespace(cache=['speculation'], ids=[1, 2, 3, 8, 9], snapshot=None, rebuilds=0, model=object(),
+                                      marks={}, screen=None)   # _feed's fields (big-model round)
             tail = ns['_feed'](m, [1, 2, 4, 5])
             self.assertEqual(m.ids + tail, [1, 2, 4, 5])
             if trimmable:

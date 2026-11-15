@@ -144,7 +144,7 @@ enum Entities {
         _ = same(s); fieldDest = d; fieldPlace = place(s)
         let t0 = DispatchTime.now().uptimeNanoseconds
         let ctx = EntityRules.fold(String(s.before.suffix(400)) + " " + s.title)
-        let m = EntityRules.mention(before: s.before, store: st, context: ctx, picks: picks(for: fieldPlace))
+        let m = EntityRules.mention(before: s.before, store: st, context: ctx, picks: picks(for: fieldPlace), expect: EntityRules.expect(dest: d))
         cost(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1000)
         guard let m, m.how != "part" || m.resolved else { return }
         let r = st.records[m.index]
@@ -165,7 +165,7 @@ enum Entities {
         let st = store
         guard !st.records.isEmpty else { return }
         _ = same(s); fieldDest = d; fieldPlace = place(s)
-        let found = EntityRules.mentions(in: text, store: st).filter { i in !pending.contains { $0.id == st.records[i].id } && !tray.contains { $0.id == st.records[i].id } }
+        let found = EntityRules.mentions(in: text, store: st, expect: EntityRules.expect(dest: d)).filter { i in !pending.contains { $0.id == st.records[i].id } && !tray.contains { $0.id == st.records[i].id } }
         guard !found.isEmpty else { return }
         for i in found { pending.append(Pending(index: i, id: st.records[i].id, text: st.records[i].name, candidates: [st.records[i].id], resolved: true, typed: false)) }
         Pill.shared.flash("⌥Tab context: " + found.prefix(3).map { st.records[$0].name }.joined(separator: ", ") + (found.count > 3 ? " +\(found.count - 3)" : ""))
@@ -289,6 +289,16 @@ enum Entities {
         History.copy(text)
         Pill.shared.flash("Copied " + what + " · ⌘V to paste")
         log("context door: copied, \(text.count) chars")
+    }
+
+    /// His correction from a card ("Not related", "Not this one", "Same", "Not the same"): data/entity-fixes.json,
+    /// applied by the next build (engine/entities.py). No card calls it yet.
+    @discardableResult
+    static func fix(_ what: String, _ a: String, _ b: String, why: String = "") -> Bool {
+        guard let all = EntityRules.addFix(readJSON("entity-fixes.json"), what: what, a: a, b: b, why: why) else { return false }
+        writeJSON("entity-fixes.json", all)
+        log("entity fix: \(what)")
+        return true
     }
 
     // MARK: small files

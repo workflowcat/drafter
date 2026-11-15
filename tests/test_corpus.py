@@ -104,9 +104,31 @@ class Weights(unittest.TestCase):
     def test_settings_file_overrides_default_weights(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.object(C, "DATA", Path(d)):
             self.assertEqual(C.weights(), C.WEIGHTS)
-            (Path(d) / "corpus-weights.json").write_text('{"take": 0}')
-            self.assertEqual(C.weights()["take"], 0)
+            (Path(d) / "corpus-weights.json").write_text('{"beeper": 1}')
+            self.assertEqual(C.weights()["beeper"], 1)
             self.assertEqual(C.weights()["typed"], C.WEIGHTS["typed"])
+
+
+class NightlyMix(unittest.TestCase):
+    def test_chats_do_not_drown_prompts(self):
+        """Round three: the nightly mix samples chats at 0.1 and leaves takes out, as the weights round trains."""
+        import sys
+        sys.path.insert(0, str(Path(C.__file__).parent / "weights"))
+        from train_sweep import MIX
+        self.assertEqual(C.WEIGHTS["beeper"], 0.1)
+        self.assertEqual(C.WEIGHTS["take"], 0)
+        self.assertEqual({k: v for k, v in C.WEIGHTS.items() if v}, MIX)
+        # the source sizes of 14 November: 60,265 chats against 2,911 typed and 3,771 prompts
+        sizes = {"typed": 2911, "take": 1385, "cc": 3771, "codex": 33, "beeper": 60265, "vnotes": 409, "vault": 69, "fb": 2263}
+        lines = {k: n * C.WEIGHTS[k] for k, n in sizes.items()}
+        self.assertLess(lines["beeper"] / sum(lines.values()), 0.4)
+        self.assertGreater(lines["typed"] + lines["cc"], lines["beeper"])
+
+    def test_zero_weight_source_is_left_out(self):
+        import make_train
+        rows = [{"src": "take", "text": "made up take line", "t": 1}] * 5 + [{"src": "typed", "text": "made up typed line", "t": 1}]
+        out = make_train.weighted(rows, C.WEIGHTS)
+        self.assertNotIn("take", {r["src"] for r in out})
 
 
 class Vault(unittest.TestCase):

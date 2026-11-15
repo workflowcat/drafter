@@ -39,5 +39,26 @@
   8,
   12
  ],
- "sprites": true
+ "sprites": true,
+ "surface": {
+  "light": {
+   "well": 5,
+   "hover": 4.5,
+   "pick": 8.5
+  },
+  "dark": {
+   "well": 30,
+   "hover": 5,
+   "pick": 9
+  }
+ },
+ "radii": {
+  "pane": 12,
+  "card": 10,
+  "row": 8
+ },
+ "motion": {
+  "fold": 120,
+  "fade": 80
+ }
 }

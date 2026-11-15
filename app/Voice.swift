@@ -19,6 +19,13 @@ final class VoiceEngine {
     private var stops: [Date] = []
     private var generation = UUID()
     var loadedAt = Date.distantPast   // when Parakeet last loaded: a take whose press came before it was a cold one
+    /// Parakeet is in memory now (false from the start, after an idle unload, after the process stopped): a press then
+    /// says "Waking" while the audio waits in the engine's queue.
+    private(set) var loaded = false
+    /// Audio heard while there is no process to take it (starting, or starting again): kept and sent in order.
+    private var wake = WakeBuffer()
+    /// END frames still waiting for their text: a draft that comes before those answers belongs to a closed segment.
+    var endsWaiting: Int { waitText.count }
 
     func start() {
         guard proc == nil else { return }
@@ -46,7 +53,7 @@ final class VoiceEngine {
             DispatchQueue.main.async {
                 guard let me = self, me.proc === t else { return }
                 log("voice engine exited \(t.terminationStatus)")
-                me.proc = nil
+                me.proc = nil; me.loaded = false
                 try? me.input?.close(); me.input = nil
                 me.buffer.removeAll()
                 me.failPending()
@@ -62,12 +69,16 @@ final class VoiceEngine {
                 }
             }
         }
-        do { try p.run(); proc = p; input = inPipe.fileHandleForWriting } catch { log("voice engine did not start: \(error)") }
+        loaded = false
+        do {
+            try p.run(); proc = p; input = inPipe.fileHandleForWriting
+            for s in wake.flush() { frame(0, s) }
+        } catch { log("voice engine did not start: \(error)") }
     }
 
     func stop() {
         generation = UUID()   // invalidate an already scheduled restart
-        let old = proc; proc = nil
+        let old = proc; proc = nil; loaded = false; wake = WakeBuffer()
         try? input?.close(); input = nil
         buffer.removeAll()
         old?.terminate()
@@ -92,8 +103,8 @@ final class VoiceEngine {
             if let d = m["draft"] as? String { draftMs = m["ms"] as? Int; onDraft?(d) }
             if let t = m["text"] as? String, !waitText.isEmpty { let w = waitText.removeFirst(); w(t, m["loud"] as? Bool ?? false) }
             if let c = m["careful"] as? String { let w = waitCareful; waitCareful = nil; w?(c) }
-            if let l = m["loaded"] { loadedAt = Date(); log("voice: loaded \(l) in \(m["s"] ?? "?") s") }
-            if let l = m["unloaded"] { log("voice: unloaded \(l) (\(m["why"] ?? "?"))") }
+            if let l = m["loaded"] { loadedAt = Date(); loaded = true; Talk.shared.engineAwake(); log("voice: loaded \(l) in \(m["s"] ?? "?") s") }
+            if let l = m["unloaded"] { loaded = false; log("voice: unloaded \(l) (\(m["why"] ?? "?"))") }
             if m["file"] != nil, !waitFile.isEmpty { waitFile.removeFirst()((m["segments"] as? [[String: Any]]) ?? []) }
         }
     }
@@ -129,8 +140,8 @@ final class VoiceEngine {
     }
     /// Load Parakeet now (app start, voice switched on, after the engine restarted), outside any take.
     func preload() { guard Talk.shared.state == .idle else { return }; start(); frame(250) }
-    func feed(_ s: [Float]) { frame(0, s) }
-    func drop() { frame(254) }
+    func feed(_ s: [Float]) { for x in wake.add(s, ready: input != nil) { frame(0, x) } }
+    func drop() { wake = WakeBuffer(); frame(254) }
     var running: Bool { proc?.isRunning == true }
     func finish(_ done: @escaping (String, Bool) -> Void) {
         guard running else { done("", false); return }
@@ -184,16 +195,27 @@ final class Talk {
         }
     }
     private var sending = false
+    // round three: Return while he speaks puts in the segment so far (closeSegment); inserts go one at a time, in order
+    var segmentsSent = 0
+    var insertQueue: [(String, Bool)] = []
+    var insertBusy = false
+    // the voice note's way to the field (app/VoiceFlowRules.swift, 14 November 2026): enter mode keeps the field
+    // untouched while he speaks and ↩ puts the whole final text in; live mode types it in as before
+    private(set) var flow = VoiceFlow()
+    private var flowTimer: Timer?
     private var afterPiece: (() -> Void)?  // the take's end, held while an Enter piece is still going into the field
     // live typing (2026-10-19): settled words go into the field while he talks
     private var live = false
+    /// The take started while the shot strip was open (app/CaptureNote.swift): its text goes into the strip's line,
+    /// never into the app (screenshot tool, 15 November 2026).
+    private(set) var toNote = false
     private var prevWords: [Substring] = []
     /// Enter while talking puts what was said so far into the field on its own line (never sends): only with words heard
     /// Words were heard in this take: Enter then ends it and puts them in (Keys.swift)
     /// Enter puts words in only when they are words: "Yeah." / "Okay." / a quiet "Thank you." heard in the pause after the
     /// last Enter are what the reader makes of room noise, so that Enter goes to the app and sends (2026-10-22: those
     /// swallowed his sending Enter two or three times in a row and the strip cycled through them).
-    var canSend: Bool { state == .listening && !sending && Double(samples) / 16000 >= 0.4 && Talk.realCleaned(sendDraft, peak: peak) }
+    var canSend: Bool { insertMode == .live && state == .listening && !sending && Double(samples) / 16000 >= 0.4 && Talk.realCleaned(sendDraft, peak: peak) }
 
     static let noiseWords = try! NSRegularExpression(pattern: #"(?i)^\s*(thank you|thanks|thank you for watching|дякую|спасибі|bye)[.!]?\s*$"#)
     static func real(_ draft: String, peak: Float) -> Bool {
@@ -226,7 +248,9 @@ final class Talk {
         if down {
             // a press within 0.8 s of a take's end does not start a new one (2026-10-22: 0.5-1 s empty takes right after
             // real ones, up to three in a row, and some ran 16-46 s on room noise; none had speech)
-            if state == .idle, at.timeIntervalSince(endedAt) < 0.8 { log("voice: press right after a take ignored"); return }
+            if state == .idle, VoiceFlowRules.pressIgnored(sinceEnd: at.timeIntervalSince(endedAt), lastHadWords: lastHadWords) {
+                log("voice: press right after a take ignored"); return
+            }
             if state == .idle {
                 clock = Clock(press: at)
                 // ⇧ right ⌥ while another app holds the mic for a call: both sides (2026-10-29: 60+ call offers since 21
@@ -257,6 +281,7 @@ final class Talk {
         guard state == .idle else { return }
         self.long = long; isCall = long && call; micReopened = false; warning = nil
         testing = false
+        toNote = !long && CaptureNote.shared.isOpen
         var steps: [(String, Date)] = [("", Date())]
         func step(_ n: String) { steps.append((n, Date())) }
         func report() {
@@ -271,6 +296,8 @@ final class Talk {
         if long { VoiceEngine.shared.longTake() }
         VoiceEngine.shared.onDraft = { [weak self] d in
             guard let self, self.state == .listening else { return }
+            // a draft read before a closed segment's text came back is that segment's, not the new one's
+            if !self.long, VoiceEngine.shared.endsWaiting > 0 { return }
             if d.count != self.lastDraft.count { self.lastVoice = Date() }
             if self.clock.words == nil {
                 self.clock.drafts += 1
@@ -278,7 +305,11 @@ final class Talk {
             }
             self.lastDraft = d
             self.spool?.text(d)
-            if !self.long { Pill.shared.draft(Talk.realCleaned(self.sendDraft, peak: self.peak) ? self.cleanedDraft : "") }   // noise words never show
+            if !self.long {   // noise words never show; an armed draft he speaks after shows with the new words
+                let real = Talk.realCleaned(self.sendDraft, peak: self.peak)
+                Pill.shared.draft(real ? VoiceFlowRules.join(self.flowPrefix, self.cleanedDraft) : self.flowPrefix)
+                self.flowEvent(.words(VoiceFlowRules.said(self.cleanedDraft, seconds: Double(self.samples) / 16000, noise: !real)))
+            }
             self.liveDraft(d)
         }
         lastVoice = Date()
@@ -310,6 +341,9 @@ final class Talk {
         state = .listening
         if long { startShots() }
         Pill.shared.listening()
+        segmentsSent = 0
+        if !VoiceEngine.shared.loaded { Pill.shared.waking(true); log("voice: press while the engine is waking, audio kept") }
+        if !long { flowEvent(.start) }
         if SecureInput.holder != nil { DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { SecureInput.tell() } }   // Enter will not be seen
         if long { startRecordingBar() }
         step("strip")
@@ -329,7 +363,7 @@ final class Talk {
             let sp = Focus.spot(skip: []).0
             self.rect = sp?.rect ?? Focus.focused().flatMap { Focus.prevCharRect($0) }
             step("spot")
-            self.editing = long ? nil : Focus.selection().flatMap { $0.count >= 2 ? $0 : nil }
+            self.editing = long || self.toNote ? nil : Focus.selection().flatMap { $0.count >= 2 ? $0 : nil }
             step("selection")
             self.readNames(sp)
             self.startLive(sp)
@@ -415,6 +449,7 @@ final class Talk {
     func send() {
         guard canSend else { return }
         sending = true
+        flowEvent(.piece)
         let pieceAudio = audio, app = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
         samples = 0; peak = 0; lastDraft = ""; audio = []
         Pill.shared.draft("")
@@ -478,6 +513,7 @@ final class Talk {
     /// (never two pastes at once, which would paste one text twice and leave the piece on his clipboard).
     private func pieceDone(after delay: Double = 0) {
         sending = false
+        flowEvent(.pieceDone)
         guard let next = afterPiece else { return }
         afterPiece = nil
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { next() }
@@ -493,11 +529,13 @@ final class Talk {
         shots?.stop(); shots = nil
         flushTimer?.invalidate(); flushTimer = nil
         Pill.shared.hide()
+        flowEvent(.cancel)                 // Esc already dropped it; other ways out: an armed draft he added to waits again
     }
 
     static let askWake = try! NSRegularExpression(pattern: #"(?i)^\s*(drafter|драфтер|дрефтер|дрaфтер)[,.:!?]?\s+\S"#)
 
     private var endedAt = Date.distantPast
+    private var lastHadWords = false       // the last note showed words (a press right after it is a bounce)
 
     /// A guard exit must not leave a live microphone feeding a dead process.
     func engineFailed() {
@@ -510,6 +548,7 @@ final class Talk {
         flushTimer?.invalidate(); flushTimer = nil
         stopRecordingBar()
         Pill.shared.flash("Voice stopped · take saved in Voice history · press Right Option to retry")
+        flowEvent(.cancel)
     }
 
     /// A long note or call is being recorded now.
@@ -532,12 +571,13 @@ final class Talk {
         let secs = Double(max(samples, long ? max(spool?.frames ?? 0, tape.now().themSamples) : 0)) / 16000, heardPeak = peak
         guard secs >= 0.3 else {
             shots?.stop(); shots = nil; VoiceEngine.shared.drop(); state = .idle; Pill.shared.hide()
+            if !long { flowEvent(.cancel) }
             if let sp = tape.detach() { sp.close(); try? FileManager.default.removeItem(at: sp.dir) }   // nothing in it
             spool = nil; isCall = false; long = false; stopRecordingBar()
             return
         }
         state = .reading
-        Pill.shared.reading()
+        if long { Pill.shared.reading() } else { flowEvent(.stop); Pill.shared.finishing(insert: flowInsertPending) }
         let t = Date()
         let mine = started
         let takeAudio = audio, takeDraft = lastDraft, app = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
@@ -551,6 +591,7 @@ final class Talk {
         // only words he saw in the strip are pasted: when he stops on random sounds, a late reading of them is not
         // his text (2026-10-20)
         let sawWords = Talk.real(lastDraft, peak: heardPeak)
+        lastHadWords = sawWords || segmentsSent > 0
         // nothing showed in the strip, so nothing will be pasted: close at once instead of waiting for a last reading
         // (2026-10-21: those takes held the strip 0.2-1.4 s for nothing)
         if !sawWords, files == nil, editing == nil, !sending {
@@ -559,8 +600,12 @@ final class Talk {
             flushTimer?.invalidate(); flushTimer = nil
             History.take("", audio: takeAudio, app: app, loud: false)
             log(String(format: "take %.1f s, peak %.3f, nothing shown: closed at once", secs, heardPeak))
-            if keptNote { keptNote = false; Pill.shared.flash("Field kept as typed · final text copied") }
-            else if heardPeak < 0.002 { Pill.shared.flash("No mic signal") } else { Pill.shared.hide() }
+            flowEvent(.cancel)
+            if keptNote { keptNote = false; Pill.shared.copied("The field changed under the words") }
+            else if segmentsSent > 0, flow.queue > 0 || insertBusy || !insertQueue.isEmpty {
+                Pill.shared.finishing(insert: true)   // a segment Return closed is still on its way: its receipt shows
+            }
+            else if heardPeak < 0.002, segmentsSent == 0 { Pill.shared.flash("No mic signal") } else { Pill.shared.hide() }
             return
         }
         // never stay stuck with the mark on screen: no answer in 15 s ends the take
@@ -572,6 +617,7 @@ final class Talk {
             }
             self.state = .idle; self.long = false; self.editing = nil
             self.flushTimer?.invalidate(); self.flushTimer = nil
+            if files == nil { self.flowEvent(.cancel) }
             Pill.shared.flash(files == nil ? "Transcription timed out · review in Voice history" : "Transcription timed out · review in Recordings")
         }
         // the take's text into the field; an Enter piece still on its way there goes in first (pieceDone runs this)
@@ -583,6 +629,7 @@ final class Talk {
                 History.take("", audio: takeAudio, app: app, loud: loud, raw: takeDraft, outcome: "incomplete")
                 self.editing = nil
                 self.flushTimer?.invalidate(); self.flushTimer = nil
+                self.flowEvent(.cancel)
                 Pill.shared.flash("No final transcript · review in Voice history")
                 return
             }
@@ -595,9 +642,19 @@ final class Talk {
                 self.transcribe(dir: dir, me: me, them: them, call: wasCall, live: kept.count > text.count ? kept : text)
                 return
             }
+            // the shot strip was open: the words are its note, nothing goes into the app
+            if self.toNote {
+                self.toNote = false
+                self.editing = nil
+                self.flushTimer?.invalidate(); self.flushTimer = nil
+                self.flowReset("a screenshot note")
+                CaptureNote.shared.heard(text)
+                return
+            }
             // "Drafter, …" / "Драфтер, …": a question to his notes; the answer shows in the strip, nothing is pasted
             if Talk.askWake.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil {
                 self.editing = nil
+                self.flowReset("a question to the notes")
                 Pill.shared.show("Searching your notes…", seconds: 45)
                 log("ask: \(text.count) chars")
                 Engine.shared.post("/ask", ["text": text], timeout: 60) { j in
@@ -609,6 +666,7 @@ final class Talk {
             }
             if let original = self.editing, !text.isEmpty {
                 self.editing = nil
+                self.flowReset("an edit of the selection")
                 self.edit(original, with: text)
                 return
             }
@@ -618,12 +676,20 @@ final class Talk {
             // nothing (or only what was never shown) is not pasted; no second reading of noise either: Whisper invents
             // words in it (2026-10-20, Andrii: "I'm just shutting it down after a use")
             if text.isEmpty || !sawWords {
-                if heardPeak < 0.002 { Pill.shared.flash("No mic signal") }
+                self.flowEvent(.cancel)
+                if heardPeak < 0.002, self.segmentsSent == 0 { Pill.shared.flash("No mic signal") }
                 log("take ended: nothing new to paste" + (text.isEmpty ? "" : " (\(text.count) chars heard only at the end, dropped)"))
                 return
             }
-            if self.live { self.liveFinish(text, tail: " ", piece: false); Entities.dictated(text) } else { self.put(text) }
-            if self.keptNote { self.keptNote = false; Pill.shared.flash("Field kept as typed · final text copied") } else { Pill.shared.landed() }
+            if self.live {
+                self.flowEvent(.final(text))
+                self.liveFinish(text, tail: " ", piece: false); Entities.dictated(text)
+                if self.keptNote { self.keptNote = false; Pill.shared.copied("The field changed under the words") } else { Pill.shared.landed() }
+            } else if self.testing {
+                self.flowReset("a voice test"); self.put(text); Pill.shared.landed()   // tests write only into their marked field
+            } else {
+                self.flowEvent(.final(text))   // enter mode: the draft waits for ↩ (or ↩ came already: it goes in now)
+            }
             let c = self.clock, e = c.end ?? t
             log("voice timing\(self.timingStart()); "
                 + "end: engine \(Int(readAt.timeIntervalSince(e) * 1000)) ms, pasted \(Int(Date().timeIntervalSince(e) * 1000)) ms after the end")
@@ -903,7 +969,7 @@ final class Talk {
 
     /// A take or an Enter piece starts: a fresh run. `spot` is the field read at the take's start (nil: read later).
     private func startLive(_ spot: Spot? = nil, keepField: Bool = false) {
-        live = Drafter.shared.settings.voiceLive && editing == nil && !long   // never over a selection or in a long note
+        live = Drafter.shared.settings.voiceInsert == "live" && editing == nil && !long && !toNote   // never over a selection, in a long note or into the shot strip
         if !keepField {
             runEl = spot?.el; runPid = spot?.app.processIdentifier ?? 0; runBefore = spot?.before.last
             if testing, let s = spot, !s.value.contains("⟦drafter-test⟧") { runEl = nil }
@@ -1071,6 +1137,21 @@ final class Talk {
             report("field changed under the run, \(final.count) chars copied")
             return .copied
         }
+        // far from the final text (the cut-off fault): the whole run is replaced by the final text, the field never
+        // keeps a few live words with the rest only on the clipboard
+        if case .replace(let t) = LiveType.endWay(have: run, want: want) {
+            let old = run, add = t + tail
+            run = add; runBefore = add.last
+            Focus.replace(old, with: add) { ok in
+                if ok { log("live field (\(what)): end: run of \(old.count) chars replaced by the final \(add.count) chars") }
+                else {
+                    History.copy(final)
+                    Pill.shared.copied("The field changed under the words")
+                    log("live field (\(what)): end: run could not be replaced, \(final.count) chars copied")
+                }
+            }
+            return .pasted
+        }
         let p = LiveType.plan(have: run, want: want, end: true)
         press(p.keys)
         let add = p.append + tail
@@ -1145,7 +1226,7 @@ extension Focus {
         guard let v = AXValueCreate(.cfRange, &r),
               AXUIElementSetAttributeValue(s.el, kAXSelectedTextRangeAttribute as CFString, v) == .success,
               let sel: String = attr(s.el, kAXSelectedTextAttribute), sel == old else { done(false); return }
-        if AXUIElementSetAttributeValue(s.el, kAXSelectedTextAttribute as CFString, new as CFString) == .success,
+        if Focus.setSelectedText(s.el, new) == .success,
            let now: String = attr(s.el, kAXValueAttribute), now.contains(new) { done(true); return }
         paste(new)   // the old words are selected, so a paste replaces them
         done(true)
@@ -1194,73 +1275,185 @@ enum NameBook {
     }
 }
 
-/// How much memory the Mac has free, as macOS itself counts it (kern.memorystatus_level, %). Under `low` a long
-/// reading puts the text model to sleep (2026-11-01, Andrii: "not to overload the Mac").
-enum Budget {
-    static let low = 35
-    /// Readings that want the text model asleep, and one request at a time to the engine: what the engine should
-    /// be is the only thing compared, so a fast reading, two readings at once or a sleep right after a wake always
-    /// end in the right state (Codex round 4). Main thread only.
-    private static var holds = 0, asleep = false, busy = false, secs = 120.0
+// MARK: the voice note's way to the field (app/VoiceFlowRules.swift)
 
-    /// Idle sleep (2026-11-14): no typing request for `textIdleMin` minutes -> the text model sleeps (~2.2 GB back);
-    /// focus arriving in a text field (/prefill, Keys.warmField) or any typing request wakes it, and the field is
-    /// prefilled again once it is back, so the first ghost costs what it did before. One-off prompts load it on demand.
-    private static var idle = false, lastTyping = Date(), wokeFor: Date?
-    static let typingPaths: Set<String> = ["/complete", "/prefill", "/chip", "/pause"]
+extension Talk {
+    var insertMode: VoiceMode { Drafter.shared.settings.voiceInsert == "live" ? .live : .enter }
+    /// An armed draft he is speaking after: the new words add to it.
+    var flowPrefix: String { if case .listening(let p) = flow.state { return p }; return "" }
+    /// ↩ came while the note was finishing: the text goes in once it is read.
+    var flowInsertPending: Bool { if case .finishing(_, true, _, _, _) = flow.state { return true }; return false }
 
-    /// Engine.post / stream: a typing request is a sign of life; while idle-asleep it wakes the model.
-    static func request(_ path: String) {
-        guard typingPaths.contains(path) else { return }
-        guard Thread.isMainThread else { DispatchQueue.main.async { request(path) }; return }
-        lastTyping = Date()
-        guard idle else { return }
-        idle = false; wokeFor = Date()
-        log("memory: text model wakes (\(path))")
-        sync()
-    }
-
-    /// Every second (the app's 1 s timer): asleep after `textIdleMin` minutes without typing, never mid-take.
-    static func idleCheck() {
-        let mins = Drafter.shared.settings.textIdleMin
-        guard mins > 0, !idle, Talk.shared.state == .idle, Date().timeIntervalSince(lastTyping) > Double(mins) * 60 else { return }
-        idle = true
-        log("memory: text model idle \(mins) min, sleeps")
-        sync()
-    }
-
-    static func rest(secs s: Double, why: String) {
-        holds += 1; secs = max(secs, s)
-        log("memory: text model steps aside (\(why))")
-        sync()
-    }
-
-    static func wake() { holds = max(0, holds - 1); sync() }
-
-    private static func sync() {
-        let want = holds > 0 || idle
-        guard !busy, want != asleep else { return }
-        busy = true
-        // a reading's sleep has a timer in the engine; an idle one has none (only a wake ends it)
-        let body: [String: Any] = holds > 0 ? ["secs": secs] : ["idle": true]
-        Engine.shared.post(want ? "/sleep" : "/wake", want ? body : [:], timeout: 30) { j in
-            busy = false
-            if want {
-                asleep = j?["slept"] != nil
-                log("memory: text model asleep, \(j?["claude_stopped"] as? Int ?? 0) idle Claude helpers stopped")
-            } else {
-                asleep = false; secs = 120
-                let ms = wokeFor.map { Int(Date().timeIntervalSince($0) * 1000) }
-                log("memory: text model back (\(j?["woke"] as? Bool == true ? "ok" : "later"))" + (ms.map { ", \($0) ms after the wake sign, load \(j?["load_s"] as? Double ?? 0) s" } ?? ""))
-                if wokeFor != nil { wokeFor = nil; Keys.shared.warmField() }   // the field's prefill hit a sleeping model
-            }
-            if j != nil { sync() }   // the engine down: nothing to put to sleep; its own timer wakes it anyway
+    private static func stateName(_ s: FlowState) -> String {
+        switch s {
+        case .idle: return "idle"
+        case .listening(let p): return p.isEmpty ? "listening" : "listening after a draft"
+        case .finishing(_, let ins, let dr, let held, let piece): return "finishing" + (ins ? ", insert next" : "") + (dr ? ", drop" : "") + (held ? ", ↩ held" : "") + (piece ? " (piece)" : "")
+        case .armed(let t): return "armed (\(t.count) chars)"
+        case .kept: return "kept"
+        case .inserted: return "in the field"
+        case .copied: return "on the clipboard"
+        case .dropped: return "dropped"
         }
     }
 
-    static func free() -> Int {
-        var v: Int32 = 0
-        var n = MemoryLayout<Int32>.size
-        return sysctlbyname("kern.memorystatus_level", &v, &n, nil, 0) == 0 ? Int(v) : -1
+    /// One event into the flow; does what it says. Returns true when a key is swallowed. `tap`: from the event tap,
+    /// which must return at once, so the work runs on the next turn of the main queue.
+    @discardableResult
+    func flowEvent(_ e: FlowEvent, tap: Bool = false) -> Bool {
+        guard let (f, swallow, act) = VoiceFlowRules.step(flow, e, mode: insertMode, now: Date().timeIntervalSince1970) else { return false }
+        let was = flow.state, queueBefore = flow.queue
+        flow = f
+        if f.state != was { log("voice flow: \(Talk.stateName(was)) -> \(Talk.stateName(f.state))") }   // lengths only, never text
+        // a swallowed key always shows (round three): a Return the flow takes that showed nothing is said in the log
+        if swallow, e == .ret, VoiceFlowRules.visible(f) == VoiceFlowRules.visible(VoiceFlow(state: was, at: f.at, said: f.said, queue: f.queue)), f.queue <= queueBefore {
+            log("voice flow: ↩ taken without a visible change (\(Talk.stateName(was)))")
+        }
+        if tap { DispatchQueue.main.async { self.flowDo(act, was: was) } } else { flowDo(act, was: was) }
+        if flow.state == .idle { flowTimer?.invalidate(); flowTimer = nil }
+        else if flowTimer == nil {
+            flowTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.flowEvent(.tick) }
+        }
+        return swallow
+    }
+
+    /// A note that became something else (a question to the notes, an edit): the flow starts over; the note is in
+    /// the journal.
+    func flowReset(_ why: String) {
+        guard flow.state != .idle else { return }
+        log("voice flow: \(Talk.stateName(flow.state)) -> idle (\(why))")
+        flow = VoiceFlow(); flowTimer?.invalidate(); flowTimer = nil
+    }
+
+    private func flowDo(_ act: FlowAct, was: FlowState) {
+        switch act {
+        case .none: break
+        case .stopNote: clock.end = Date(); end()
+        case .dropNote: cancel()
+        case .arm(let t): Pill.shared.armed(t); watchTarget()
+        case .insert(let t): insertDraft(t)
+        case .keep(let t): Pill.shared.kept(t); log("voice flow: draft kept (\(t.count) chars, in the journal)")
+        case .drop: Pill.shared.hide(); log("voice flow: draft dropped (in the journal)")
+        case .holdReturn: Pill.shared.held(); log("voice flow: ↩ held while the note finishes")
+        case .willInsert: Pill.shared.finishing(insert: true)
+        case .closeSegment(let p): closeSegment(p)
+        case .hide: break   // the end of a note handles its own strip
+        }
+    }
+
+    /// Return while he speaks (enter mode): the words so far are one segment. The engine closes it (an END frame; the
+    /// audio after it starts the next Take, engine/voice.py, so no new protocol message), the microphone never stops,
+    /// and the new segment starts clean in the strip. Its final text goes in once read, in order (insertNext).
+    private func closeSegment(_ prefix: String) {
+        let segAudio = audio, app = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
+        samples = 0; peak = 0; lastDraft = ""; audio = []
+        segmentsSent += 1
+        Pill.shared.segment("Inserting → " + (app.isEmpty ? "this app" : app))
+        let t0 = Date()
+        VoiceEngine.shared.finish { heard, _ in
+            let text = VoiceFlowRules.join(prefix, self.finish(heard))
+            log("voice segment: \(text.count) chars, read \(Int(Date().timeIntervalSince(t0) * 1000)) ms after ↩")
+            if !self.timingSaid { log("voice timing" + self.timingStart()) }
+            History.take(text, audio: segAudio, app: app, loud: false, raw: heard)
+            self.flowEvent(.segment(text))
+            if text.isEmpty { self.segmentGone() }
+        }
+    }
+    /// A segment that read as nothing: the band goes back to the live words; after the note, the strip goes.
+    private func segmentGone() {
+        if state == .listening { Pill.shared.segmentDone(ok: true, reason: "") }
+        else if flow.state == .idle, flow.queue == 0, insertQueue.isEmpty, !insertBusy { Pill.shared.hide() }
+    }
+
+    /// Something the engine says is ready again: the strip stops saying "Waking".
+    func engineAwake() { if state == .listening { Pill.shared.waking(false) } }
+
+    /// While a draft is armed: where Return would put it, said in the strip as the focus moves (at most 4 reads a
+    /// second, off the main thread, so the event tap never waits on Accessibility). An app switch reads at once.
+    func watchTarget() {
+        guard case .armed = flow.state else { return }
+        var last = "", busy = false
+        func read() {
+            guard case .armed = flow.state, !busy else { return }
+            busy = true
+            let skip = Drafter.shared.settings.skip, front = NSWorkspace.shared.frontmostApplication
+            DispatchQueue.global(qos: .userInitiated).async {
+                let (spot, why) = Focus.spot(skip: skip)
+                let t = VoiceFlowRules.target(spot: spot != nil, why: IsSecureEventInputEnabled() ? "secure input" : why,
+                                              canPaste: spot == nil && Focus.pasteTarget(why), ownApp: front?.processIdentifier == getpid())
+                let w = VoiceFlowRules.target(t, app: front?.localizedName ?? "")
+                DispatchQueue.main.async {
+                    busy = false
+                    guard case .armed = self.flow.state, w.place + w.button != last else { return }
+                    last = w.place + w.button
+                    Pill.shared.target(w.place, button: w.button)
+                }
+            }
+        }
+        read()
+        let nc = NSWorkspace.shared.notificationCenter
+        var token: NSObjectProtocol?
+        token = nc.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { _ in read() }
+        Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] t in
+            guard let self, case .armed = self.flow.state else { t.invalidate(); if let token { nc.removeObserver(token) }; return }
+            read()
+        }
+    }
+
+    /// ↩ on an armed draft, or a closed segment's text: in at the caret of the field focused when it is ready, one at a
+    /// time and in order (a later segment never lands before an earlier one), the way the Quick panel puts text in.
+    /// No field, a password field, a skipped app or secure input: the clipboard, said in words. Drafter never presses
+    /// Return here and never sends. The strip says "In the field" as soon as the paste is out (2026-11-14: waiting for
+    /// the check held the flow 1-2 s, and his next Return, his send, was taken in that time); the check after it only
+    /// reports a failure.
+    private func insertDraft(_ text: String) {
+        // a segment: the note is still going (or its last part is being read); the receipt then sits in the band
+        let segment: Bool = { switch flow.state { case .listening, .finishing: return true; default: return false } }()
+        insertQueue.append((text, segment))
+        insertNext()
+    }
+
+    private func insertNext() {
+        guard !insertBusy, !insertQueue.isEmpty else { return }
+        let (text, segment) = insertQueue.removeFirst()
+        insertBusy = true
+        let front = NSWorkspace.shared.frontmostApplication, st = Drafter.shared.settings
+        let piece = text + " "
+        func done(after: Double) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + after) { self.insertBusy = false; self.insertNext() }
+        }
+        func onClipboard(_ why: String) {
+            History.copy(text)
+            if segment { Pill.shared.segmentDone(ok: false, reason: why) } else { flowEvent(.inserted(false)); Pill.shared.copied(why) }
+            log("voice flow: \(text.count) chars to the clipboard (\(why))\(segment ? " (segment)" : "")")
+        }
+        let (spot, why) = Focus.spot(skip: st.skip)
+        func early(_ why: String) { onClipboard(why); done(after: 0.05) }
+        if IsSecureEventInputEnabled() || why == "secure input" { early("Secure input is on here"); return }
+        if why == "password field" { early("A password field: not put in"); return }
+        if st.skip.contains(front?.bundleIdentifier ?? "") || why == "skipped app" { early("Drafter is off in this app"); return }
+        if front?.processIdentifier == getpid() { early("No text field here"); return }
+        if spot == nil, !Focus.pasteTarget(why) { early("No text field here"); return }
+        guard let how = Quick.shared.put(QuickItem(kind: .voice, text: text, app: front?.localizedName ?? "", at: Date().timeIntervalSince1970),
+                                         piece, keep: true, from: front) else {
+            early("No text field here"); return
+        }
+        Entities.dictated(text)                               // names in the note wait for ⌥Tab (app/Entities.swift)
+        if segment { Pill.shared.segmentDone(ok: true, reason: "") } else { Pill.shared.inserted() }
+        // the next insert waits until a paste put his clipboard back (two pastes at once would paste one text twice)
+        let pasted = how.hasPrefix("paste")
+        let wait = pasted ? Focus.restoreDelay + 0.1 : 0.12
+        done(after: pasted ? Focus.restoreDelay + 0.05 : 0.05)
+        // the check: the field holds the text; only a failure is said (the Return is his at once either way)
+        DispatchQueue.main.asyncAfter(deadline: .now() + wait) {
+            let now = Focus.spot(skip: st.skip).0
+            let plain = { (x: String) in x.replacingOccurrences(of: "\u{A0}", with: " ").trimmingCharacters(in: .whitespacesAndNewlines) }
+            let tail = String(plain(text).suffix(40))
+            if let now, !(plain(now.before).contains(tail) || plain(now.value).contains(tail)) {
+                onClipboard("Could not see it in the field")
+                return
+            }
+            log("voice flow: \(text.count) chars in the field (\(how)\(now == nil ? ", field unreadable" : ", checked"))\(segment ? " (segment)" : "")")
+        }
     }
 }

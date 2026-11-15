@@ -31,6 +31,10 @@ struct ThemeSpec {
     let corners: [Double]              // square, keys and tags, controls, floating panels
     let shadow: (y: Double, blur: Double, alpha: Double)
     let problems: [String]             // empty: usable
+    /// Soft round (14 November 2026): the radii of a pane, a card and a chosen row, and how long a fold slides and the
+    /// reader fades (ms). From the theme's "radii" and "motion"; these are the defaults.
+    var radii: [String: Double] = ThemeRules.defaultRadii
+    var motion: [String: Double] = ThemeRules.defaultMotion
 }
 
 enum ThemeRules {
@@ -38,7 +42,35 @@ enum ThemeRules {
     /// The colour jobs the app draws with (PixelTokens.swift has one constant for each).
     static let jobs = ["paper", "card", "ink", "muted", "faint", "line", "rule", "controlEdge", "soft", "key", "keyEdge",
                        "primary", "primaryEdge", "onPrimary", "blue", "mint", "violet", "coral", "warn", "selected", "okBg",
-                       "warnBg", "critBg", "actionBg", "ok", "crit"]
+                       "warnBg", "critBg", "actionBg", "ok", "crit", "well", "hover", "pick"]
+    static let defaultRadii: [String: Double] = ["pane": 12, "card": 10, "row": 8]
+    static let defaultMotion: [String: Double] = ["fold": 120, "fade": 80]
+    /// The surface steps in % (soft round): `well` the window behind the panes (light: `mix` over ground; dark: black
+    /// over ground, so the panes stand lighter), `hover` and `pick` (the chosen row or card) are `mix` over raised.
+    static let defaultSurface: [String: [String: Double]] = ["light": ["well": 5, "hover": 4.5, "pick": 8.5], "dark": ["well": 30, "hover": 5, "pick": 9]]
+
+    /// The three surface jobs from the derived ones (`line` carries `mix`): the well, a hover, a pick.
+    static func surfaces(_ j: [String: RGBA], mode: String, pct: [String: Double]? = nil) -> [String: RGBA] {
+        let p = pct ?? defaultSurface[mode]!
+        guard let paper = j["paper"], let card = j["card"], let line = j["line"] else { return [:] }
+        let mix = RGBA(r: line.r, g: line.g, b: line.b, a: 1)
+        let wellInk = mode == "dark" ? RGBA(r: 0, g: 0, b: 0, a: 1) : mix
+        return ["well": wellInk.alpha((p["well"] ?? 5) / 100).over(paper), "hover": mix.alpha((p["hover"] ?? 5) / 100).over(card),
+                "pick": mix.alpha((p["pick"] ?? 9) / 100).over(card)]
+    }
+    /// The soft surfaces' gates: text 4.5:1 on a hover and a pick (ink and quiet), the focus ring 3:1 on a pick, and
+    /// faint 4.5:1 on the well (the left pane's counts sit there).
+    static func surfaceGates(_ c: [String: RGBA], _ sf: [String: RGBA], mode: String) -> [String] {
+        var bad: [String] = []
+        func gate(_ fg: RGBA, _ bg: RGBA, _ need: Double, _ what: String) {
+            let r = RGBA.ratio(fg, bg)
+            if r < need - 0.005 { bad.append(String(format: "%@: %@ %.2f:1, needs %.1f:1", mode, what, r, need)) }
+        }
+        for t in ["ink", "quiet"] { for g in ["hover", "pick", "well"] { gate(c[t]!, sf[g]!, 4.5, "\(t) text on \(g)") } }
+        gate(c["faint"]!, sf["well"]!, 4.5, "faint text on well")
+        gate(c["accent"]!, sf["pick"]!, 3, "focus ring on pick")
+        return bad
+    }
     static let defaultEdge = ["light": 40.0, "dark": 34.0]
 
     /// "#rrggbb", "#rgb", "rgba(r,g,b,a)", "rgb(r g b / a)".
@@ -130,6 +162,10 @@ enum ThemeRules {
             problems += gates(c, edge: edge, mode: mode)
             var jobs = derive(c, edge: edge)
             for (k, v) in exact[mode] as? [String: String] ?? [:] { if jobs[k] != nil, let col = color(v) { jobs[k] = col } }   // exact values (pixel)
+            let pct = ((j["surface"] as? [String: Any])?[mode] as? [String: Any])?.compactMapValues { ($0 as? NSNumber)?.doubleValue }
+            let sf = surfaces(jobs, mode: mode, pct: pct)
+            problems += surfaceGates(c, sf, mode: mode)
+            jobs.merge(sf) { a, _ in a }
             modes[mode] = jobs
         }
         let f = j["fonts"] as? [String: String] ?? [:], one = j["font"] as? String
@@ -138,9 +174,12 @@ enum ThemeRules {
         let mono = families(f["mono"]).isEmpty ? (tabular ? [] : ["JetBrains Mono", "ui-monospace"]) : families(f["mono"])
         var corners = (j["corners"] as? [Any] ?? []).compactMap { ($0 as? Double) ?? ($0 as? Int).map(Double.init) }
         if corners.count != 4 { if j["corners"] != nil { problems.append("corners: four radii, from square to the largest") }; corners = [0, 4, 8, 12] }
+        func nums(_ k: String, _ d: [String: Double]) -> [String: Double] {
+            d.merging(((j[k] as? [String: Any]) ?? [:]).compactMapValues { ($0 as? NSNumber)?.doubleValue }.filter { d[$0.key] != nil && $0.value >= 0 && $0.value <= 400 }) { _, b in b }
+        }
         return ThemeSpec(id: id, name: j["name"] as? String ?? id, light: modes["light"] ?? [:], dark: modes["dark"] ?? [:],
                          display: display, body: body, mono: mono, tabular: tabular, corners: corners,
                          shadow: shadow(j["shadow"] as? String ?? "0 1px 2px rgb(0 0 0 / .06), 0 8px 24px -6px rgb(0 0 0 / .18)"),
-                         problems: problems)
+                         problems: problems, radii: nums("radii", defaultRadii), motion: nums("motion", defaultMotion))
     }
 }

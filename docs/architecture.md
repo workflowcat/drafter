@@ -13,7 +13,7 @@ records calls and long notes. Everything it needs runs on your Mac. This page sh
 
 The app starts both Python processes and restarts them when they stop. They exit when the app is gone.
 
-- All Swift files in `app/` build into one binary with `app/build.sh`. The `Engine` class in `app/Main.swift` runs
+- All Swift files in `app/` build into one binary with `app/build.sh`. The `Engine` class in `app/Engine.swift` runs
   the text engine. `app/Voice.swift` runs the voice process.
 - The text engine is an HTTP server on `127.0.0.1:8798`. It answers local programs only. A request with an
   `Origin` or `Sec-Fetch-*` header, another `Host`, or a POST that is not JSON gets 403, so a web page cannot use it.

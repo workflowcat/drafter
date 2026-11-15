@@ -175,6 +175,17 @@ enum LiveType {
     static let midReach = 16, midTouch = 12
     static let endReach = 400, endShare = 0.3, endFloor = 24
 
+    /// How a take's (or an Enter piece's) end reaches the final text (the cut-off fault, 14 November 2026: when the
+    /// final text differed a lot from what was typed live, the field kept the few live words and the rest went only to
+    /// the clipboard; 7 of 25 live ends that day). `keys`: the plan's own fixes and append get the field to the final
+    /// text (or differ only in marks far back). `replace`: the whole run is replaced by the final text in one step.
+    enum EndWay: Equatable { case keys(Plan), replace(String) }
+    static func endWay(have: String, want: String) -> EndWay {
+        let p = plan(have: have, want: want, end: true)
+        if p.left.isEmpty || p.marksOnly { return .keys(p) }
+        return .replace(want)
+    }
+
     static func plan(have: String, want: String, end: Bool) -> Plan {
         var p = Plan()
         if want.hasPrefix(have) {

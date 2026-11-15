@@ -11,7 +11,7 @@ usage() {
 Usage: scripts/setup.sh [--models] [--voice] [--app] [--lean]
 
   (no flag)  check this Mac, make the Python environment, write data/drafter.local.json from the example
-  --models   download the text model for typing (about 1 GB)
+  --models   download the text model for typing (about 1 GB) and the thesaurus for synonyms (about 20 MB)
   --voice    also download the two voice readers for dictation and calls (about 4.1 GB)
   --app      build ~/Applications/Drafter.app (needs Apple Command Line Tools)
   --lean     a second environment (.venv-lean) only to check the install; not for the app
@@ -74,6 +74,8 @@ fi
 if (( models )); then
   if (( voice )); then "$venv/bin/python" scripts/download_models.py --voice
   else "$venv/bin/python" scripts/download_models.py; fi
+  # offline synonyms for ⌥Tab (about 20 MB, LibreOffice thesaurus files; their licences in the script)
+  "$venv/bin/python" scripts/download_thesaurus.py || echo 'Thesaurus download failed: ⌥Tab shows no synonyms until it is rerun.'
 fi
 if (( app )); then
   ./app/build.sh

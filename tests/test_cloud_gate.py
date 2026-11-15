@@ -69,7 +69,7 @@ class Gate(unittest.TestCase):
         self.assertTrue(cloud.allowed("proofread", live))
         self.assertFalse(cloud.allowed("reply", live))
         self.assertFalse(cloud.allowed("proofread", {"claudeTyping": False}))
-        self.assertFalse(cloud.allowed("pause", {}))           # the app's defaults (app/Main.swift Settings): off since 2026-11-14
+        self.assertFalse(cloud.allowed("pause", {}))           # the app's defaults (app/Settings.swift): off since 2026-11-14
         self.assertFalse(cloud.allowed("nothing-like-this", {}))
         self.assertFalse(cloud.allowed("pause", {"claudeTyping": True, "claudePause": "no"}))   # only a real true
         self.assertFalse(cloud.allowed("call_notes", {}))
@@ -80,9 +80,9 @@ class Gate(unittest.TestCase):
         self.assertEqual({f for f, o in cloud.OWNERS.items() if not o}, {"command", "ask"})
 
     def test_defaults_match_the_app(self):
-        main = (ENGINE.parent / "app/Main.swift").read_text()
+        main = (ENGINE.parent / "app/Settings.swift").read_text()
         for k, v in cloud.DEFAULTS.items():
-            self.assertIn(f"forKey: .{k}) ?? {'true' if v else 'false'}", main, k)
+            self.assertRegex(main, rf"\n\s+var {k} = {'true' if v else 'false'}\b", k)   # the decoder falls back to this default
 
     def test_every_claude_call_site_is_known(self):
         found = set()

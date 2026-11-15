@@ -3,7 +3,7 @@
     .venv/bin/python -B bench/weights/guarded.py <cap GB> <script.py | -m module> [args ...]
 The guard exits the process when its footprint stays over the cap for 2 s or ever passes cap + 0.5 GB (the Mac froze
 on 2026-10-06 during a local model run)."""
-import runpy, sys
+import atexit, runpy, sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -12,6 +12,14 @@ import guard
 
 cap, target, rest = float(sys.argv[1]), sys.argv[2], sys.argv[3:]
 guard.start(cap)
+
+
+@atexit.register
+def _peak():
+    """mlx-lm 0.32 training no longer prints its peak memory: every guarded step prints MLX's own at exit."""
+    mx = sys.modules.get("mlx.core")
+    if mx is not None: print(f"Peak mem {mx.get_peak_memory() / 2**30:.3f} GB (guarded step)", flush=True)
+
 if target == "-m":
     module, rest = rest[0], rest[1:]
     sys.argv = [module, *rest]

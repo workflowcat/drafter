@@ -16,6 +16,14 @@ struct ThemeTest {
             check(s.problems.isEmpty, "\(s.id) passes: \(s.problems)")
             check(Set(s.light.keys) == Set(ThemeRules.jobs) && Set(s.dark.keys) == Set(ThemeRules.jobs), "\(s.id) has every job")
             check(s.corners.count == 4, "\(s.id) four corners")
+            check(s.radii["pane"] == 12 && s.radii["row"] == 8 && s.motion["fold"] == 120, "\(s.id) radii and motion")
+            for (mode, c) in [("light", s.light), ("dark", s.dark)] {   // the soft surfaces step the right way
+                check(c["well"]!.luminance < c["card"]!.luminance || mode == "light" && c["well"]!.luminance < c["paper"]!.luminance + 1e-9, "\(s.id) \(mode) panes stand off the well")
+                check(c["hover"] != c["pick"] && RGBA.ratio(c["pick"]!, c["card"]!) > RGBA.ratio(c["hover"]!, c["card"]!), "\(s.id) \(mode) pick a step past hover")
+                for k in ["blue", "mint", "violet", "coral"] {   // the kind marks
+                    check(RGBA.ratio(c[k]!, c["card"]!) >= 3 && RGBA.ratio(c[k]!, c["pick"]!) >= 3 && RGBA.ratio(c[k]!, c["well"]!) >= 3, "\(s.id) \(mode) \(k) kind mark 3:1 on card, pick and well")
+                }
+            }
             print(String(format: "%@ ok · body %@ · corners %@ · shadow y %.0f blur %.0f a %.2f", s.id, s.body.first ?? "-",
                          s.corners.map { String(Int($0)) }.joined(separator: "/"), s.shadow.y, s.shadow.blur, s.shadow.alpha))
         }
@@ -38,6 +46,11 @@ struct ThemeTest {
         check(ThemeRules.color("#abc") == ThemeRules.color("#aabbcc"), "#rgb parses")
         check(ThemeRules.families(#""Fixel Text", -apple-system, sans-serif"#) == ["Fixel Text", "-apple-system", "sans-serif"], "families")
         let sh = ThemeRules.shadow("0 1px 2px rgb(0 0 0 / .06), 0 8px 24px -6px rgb(0 0 0 / .18)")
+        // a theme whose pick is too strong for its quiet text is refused
+        var loud = weak; loud["light"] = base.merging(["faint": "#6b6b74"]) { _, b in b }; loud["dark"] = loud["light"]
+        loud["surface"] = ["light": ["well": 5, "hover": 5, "pick": 60], "dark": ["well": 30, "hover": 5, "pick": 60]]
+        loud["corners"] = [0, 4, 8, 12]
+        check(ThemeRules.parse(id: "loud", loud).problems.contains { $0.contains("text on pick") }, "a loud pick refused")
         check(sh.y == 8 && sh.blur == 24 && abs(sh.alpha - 0.18) < 1e-9, "shadow last layer")
         check(ThemeRules.shadow("none").alpha == 0, "no shadow")
         print(failed == 0 ? "theme rules: all passed" : "theme rules: \(failed) failed")

@@ -1,14 +1,16 @@
 import AppKit
 import ApplicationServices
 
-// swiftc -parse-as-library app/Focus.swift tests/focus_own_pid.swift -o app/build/focus-own-pid-test && app/build/focus-own-pid-test
+// swiftc -parse-as-library app/Focus.swift app/GhostRules.swift tests/focus_own_pid.swift -o app/build/focus-own-pid-test && app/build/focus-own-pid-test
 // 3 November 2026: a background Accessibility read of Drafter's own window waited for the main thread while main
 // waited in another AX call, and his side of a 53-minute call was lost. Off the main thread, Focus must never ask its
 // own process, and must answer at once even while main is blocked. (No Accessibility grant is needed: the guard
 // answers before any AX message is sent.)
 
 // stand-ins for the app parts Focus.swift touches
-enum History { static let ownType = NSPasteboard.PasteboardType("drafter.test.own") }
+// skipChange: Focus.paste calls it since 4e6e76c (Quick panel, 2026-11-14); the stand-in lacked it and this test
+// stopped compiling
+enum History { static let ownType = NSPasteboard.PasteboardType("drafter.test.own"); static func skipChange(_ count: Int) {} }
 enum Screen { static var allowed = true; static func textAbove(pid: pid_t, caret: CGRect) -> String { "" } }
 var logged: [String] = []
 let logLock = NSLock()

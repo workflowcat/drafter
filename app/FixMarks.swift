@@ -321,13 +321,14 @@ final class FixMarks {
             }
             let app = NSWorkspace.shared.frontmostApplication
             if app.map({ Focus.isWeb($0) }) == true
-                || AXUIElementSetAttributeValue(el, kAXSelectedTextAttribute as CFString, m.old as CFString) != .success {
+                || Focus.setSelectedText(el, m.old) != .success {
                 Focus.typeText(m.old)
             }
         }
         if after > 0 { FixMarks.arrowRight(after) }
         // the keyboard goes back only when nothing was typed after the fix but its space
         if m.kind.hasPrefix("layout"), after <= 1 { KeyLayout.select(uk: m.wasUk) }
+        Autocorrect.spared.insert(m.old.trimmingCharacters(in: .whitespaces).trimmingCharacters(in: .punctuationCharacters).lowercased())   // typo hold
         Autocorrect.keepWord(m.old)
         Autocorrect.last = nil
         drop(m)

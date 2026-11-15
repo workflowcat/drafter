@@ -35,10 +35,10 @@ enum KeyHooks {
             log("tab taken back \(piece.count) chars \(front.bundleIdentifier ?? "?")")
             // the grey text again where the caret is once the app took the keys out
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-                guard let s = Focus.spot(skip: Drafter.shared.settings.skip).0, CFEqual(s.el, el), let r = s.rect, !Ghost.shared.visible else { return }
+                guard let s = Focus.spot(skip: Drafter.shared.settings.skip, midLine: Keys.midLine).0, CFEqual(s.el, el), let r = s.rect, !Ghost.shared.visible else { return }
                 k.spot = s
                 Ghost.shared.unsure = 0
-                Ghost.shared.show(ghost, action: nil, at: r)
+                Ghost.shared.show(s.mid ? GhostRules.midText(ghost, rest: s.lineAfter) : ghost, action: nil, at: r, mid: s.mid)
             }
         }
         return true
@@ -72,5 +72,16 @@ enum KeyHooks {
             log("esc pause off \(app?.bundleIdentifier ?? "?")")
             return true
         }
+    }
+
+    /// On the tap, for any key down: true = the voice note's flow took it (swallowed). False: the key goes on to the
+    /// tap's other rules as before. Return on an armed draft inserts it; any other key disarms it (and is the app's);
+    /// Esc drops it. A long recording or a call is never the flow's (Esc and Return stay the app's there).
+    static func voiceKey(_ code: Int64, _ flags: CGEventFlags) -> Bool {
+        let t = Talk.shared
+        guard t.flow.state != .idle, !t.long else { return false }
+        // Return while Right Option is held (push to talk) is still a bare Return (VoiceFlowRules.key)
+        let e = VoiceFlowRules.key(code: code, flags: flags.rawValue)
+        return t.flowEvent(e, tap: true)
     }
 }

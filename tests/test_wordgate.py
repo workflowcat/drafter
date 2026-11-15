@@ -88,7 +88,7 @@ class Server(unittest.TestCase):
         from unittest.mock import Mock
         src = (ROOT / "engine/server.py").read_text()
         tree = ast.parse(src)
-        fns = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("_complete", "word_first", "clean", "short", "offers_now")]
+        fns = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("_complete", "word_first", "clean", "short", "offers_now", "extras")]
         w = words.Words()
         for _ in range(5): w.add("please check the build")
         sent = []
@@ -103,13 +103,13 @@ class Server(unittest.TestCase):
                   wordgate=lambda: {"w": [5.0] + [0.0] * (len(gatecore.WORD_NAMES) - 1), "th": 0.5, "min_letters": 3},
                   gate=lambda: {"th": {"ai": 0.4, "chat": 0.4}, "w": [5.0] + [0.0] * (len(gatecore.NAMES) - 1), "words": (2, 0.6, 1)},
                   parts=lambda r, remember=True: (r["before"], r.get("app", "Claude"), "", "", ""),
-                  builder_for=lambda f: types.SimpleNamespace(ids=lambda *a: ([1], "")), FMT="raw",
+                  builder_for=lambda f: types.SimpleNamespace(ids=lambda *a: ([1], ""), ids_stable=lambda *a: ([1], "", 0)), FMT="raw",
                   snippets=types.SimpleNamespace(offer=lambda b: None),
                   phrases=types.SimpleNamespace(suggest=lambda b: said),
                   actions=types.SimpleNamespace(detect=lambda b: None),
                   knowledge=types.SimpleNamespace(snapshot=lambda: None, offered=0), earlier=lambda *a, **k: "",
-                  run=lambda job, low=False, seq=None: job(lambda: False), AI_APPS=("claude",), MAX_TOKENS=8, GROW=0.05,
-                  GROW_WORDS=6, MIN_P=0.6, MAX_WORDS=3)
+                  run=lambda job, low=False, seq=None, cancel=None: job(lambda: False), AI_APPS=("claude",), MAX_TOKENS=8, GROW=0.05,
+                  GROW_WORDS=6, MIN_P=0.6, MAX_WORDS=3, FUTURES=0)
         exec(compile(ast.Module(body=fns, type_ignores=[]), "server.py", "exec"), ns)
         return ns["_complete"], sent
 
@@ -166,11 +166,13 @@ class BranchLetters(unittest.TestCase):
         from collections import OrderedDict
         src = (ROOT / "engine/server.py").read_text()
         fns = [n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name in ("branch_letters", "look_ahead")]
+        import time as _t
         asked = []
-        ns = dict(re=re, time=time, threading=types.SimpleNamespace(Thread=lambda target, **k: types.SimpleNamespace(start=target)),
+        ns = dict(re=re, time=time, threading=types.SimpleNamespace(Thread=lambda target, **k: types.SimpleNamespace(start=target), Event=threading.Event),
                   BRANCHES=2, finisher=types.SimpleNamespace(dist=lambda before, k: dist), LATEST_LOCK=threading.Lock(), latest=[5],
                   stale=lambda seq: False, ahead_key=lambda r: r["before"], AHEAD=OrderedDict(), AHEAD_LOCK=threading.Lock(),
-                  AHEAD_STATS={"made": 0}, AHEAD_KIND={}, ahead_count=lambda **k: None, complete=lambda r, low, seq: asked.append(r["before"]) or {"text": "x"})
+                  AHEAD_STATS={"made": 0}, AHEAD_KIND={}, ahead_count=lambda **k: None, complete=lambda r, low, seq, keep=None: asked.append(r["before"]) or {"text": "x"},
+                  futures_k=lambda cap=None: 2, FUT_INDEX=OrderedDict(), INFLIGHT={}, COSTS=[])
         exec(compile(ast.Module(body=fns, type_ignores=[]), "server.py", "exec"), ns)
         return ns, asked
 

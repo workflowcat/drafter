@@ -33,8 +33,14 @@ final class Keys {
     // none of 11 ghosts of 10+ letters whole; held AI lines with the live selector: ghosts of 10+ letters 96 -> 55,
     // the wholly right ones 5 -> 6, grey words after the first wrong one 699 -> 587, letters saved the same
     // (bench/out/r5_tail.py).
+    // Long round (2026-11-14, Andrii: "with cotypist i had this experience of literally full sentences"): setting
+    // ghostLength. "sentence" (default) and "phrase": after the gate's first word the ghost runs while the running
+    // chance of its words holds (product, floor 0.1), to the sentence end, up to 24 tokens; the less sure end is lighter
+    // (engine/gatecore.py run_words). "word" keeps round five's rule below. Zoom stays strict.
     static func length(_ id: String) -> [String: Any] {
         let st = Drafter.shared.settings
+        let mode = GhostRules.lengthMode(st.ghostLength)
+        if mode != "word", id != "us.zoom.xos" { return ["length": mode, "floor": 0.1, "cap": 24] }
         let tail: [String: Any] = ["tail": 0.3, "tail_words": 8]
         if aiApps.contains(id) { return ["max_words": 3, "soft": 0.25, "soft_from": 1].merging(st.longGhostsAI ? tail : [:]) { a, _ in a } }
         if id == "us.zoom.xos" { return ["max_words": 3] }
@@ -65,6 +71,12 @@ final class Keys {
     /// The newest request whose final line came back: its parts (and their retries) are never drawn after it.
     var finishedSeq = 0
     var stat: GhostStat?
+    /// Typo hold (TypoHold in app/TypoRules.swift): the last line it was worked out for (its spell checks run once per
+    /// line text) and the hold last logged, so each hold logs one line.
+    var holdMemo: (line: String, at: TypoHold.At, len: Int)?
+    var holdLogged: String?
+    /// Gaps between typed letters, one histogram line a minute (app/KeyGapRules.swift).
+    var gaps = KeyGaps()
     func endStat() {
         guard let s = stat else { return }
         stat = nil
@@ -156,6 +168,7 @@ final class Keys {
             if code == 56 || code == 60, Drafter.shared.settings.layoutFix, Drafter.shared.active { shiftTap(event.flags.contains(.maskShift)) }
             return pass
         }
+        if type == .keyDown, KeyHooks.voiceKey(code, event.flags) { return nil }   // the voice note's flow (VoiceFlowRules)
         if type == .keyDown, Talk.shared.state == .listening {
             // Esc drops a short take; a long note or call never (2026-10-20: Esc in a meeting lost two calls), Esc is the app's
             if code == 53, !Talk.shared.long { DispatchQueue.main.async { Talk.shared.cancel() }; return nil }
@@ -238,6 +251,9 @@ final class Keys {
         // Esc, ⇧Esc or another key on an offer, grey words or not (Codex round 4: with a ghost up, typing left the offer
         // armed and the next Tab started a recording); Tab still goes to the ghost when one shows
         if Offer.active, !(code == 48 && mods.isEmpty) {
+            if let i = CopyChip.digit(code: Int(code), plain: mods.isEmpty, forms: Offer.picks.isEmpty ? 0 : (Offer.picks.keys.max() ?? 0) + 1) {   // 2 / 3 on the copy chip
+                DispatchQueue.main.async { Offer.pick(i) }; return nil
+            }
             if code == 53, mods.isEmpty { DispatchQueue.main.async { Offer.dismiss("esc") }; return nil }
             if code == 53, mods == .maskShift, let app = Offer.app { DispatchQueue.main.async { CallWatch.turnOff(app) }; return nil }
             // he types on: the offer steps aside, so a Tab meant for the app never starts a recording; ⇧ right ⌥ still can.
@@ -256,6 +272,21 @@ final class Keys {
         }
         if g.visible, code == 48, mods == .maskShift, !g.text.isEmpty, g.action == nil {                       // ⇧Tab: the whole suggestion
             let t = g.text, rev = editRevision; DispatchQueue.main.async { self.accept(t, rev: rev) }; return nil
+        }
+        // parity round: ⌥1 ⌥2 ⌥3 put that idea in the ghost's place (AltKeys), only on a plain ghost with that many ideas
+        if let i = AltKeys.pick(code: Int(code), option: mods.contains(.maskAlternate), control: mods.contains(.maskControl),
+                                command: mods.contains(.maskCommand), shift: mods.contains(.maskShift), ghost: g.visible && !g.text.isEmpty,
+                                plain: g.action == nil && g.replace.isEmpty && !g.isDraft, on: Drafter.shared.settings.alternatives,
+                                count: ideaCount) {
+            DispatchQueue.main.async { self.showIdea(i) }; return nil
+        }
+        // long round: ⌃Tab takes up to the end of the sentence, ⌃⇧Tab shows the next idea; only on a plain ghost
+        switch GhostRules.longKey(code: Int(code), control: mods.contains(.maskControl), shift: mods.contains(.maskShift),
+                                  option: mods.contains(.maskAlternate), command: mods.contains(.maskCommand),
+                                  ghost: g.visible && !g.text.isEmpty, plain: g.action == nil && g.replace.isEmpty && !g.isDraft) {
+        case .sentence: let t = GhostRules.sentencePiece(g.text), rev = editRevision; DispatchQueue.main.async { self.accept(t, rev: rev) }; return nil
+        case .cycle: DispatchQueue.main.async { self.nextIdea() }; return nil
+        case .none: break
         }
         if g.visible, code == 48, mods.isEmpty {                                                            // Tab
             if let a = g.action { DispatchQueue.main.async { self.run(a) }; return nil }
@@ -283,9 +314,13 @@ final class Keys {
             // Return: the line he just finished (or the message he sends) goes to the local phrase memory
             let line = lastBefore.components(separatedBy: "\n").last ?? ""
             DispatchQueue.main.async { Snippets.remind(line) }
-            if line.split(separator: " ").count >= 3 { Engine.shared.post("/typed", ["text": String(line.suffix(600)), "app": lastApp, "context": String((context?.text ?? "").suffix(1500))]) }
+            // what he wrote, never the page around it, never cut mid-word (app/DraftCaptureRules.swift)
+            let sent = DraftCaptureRules.sentLine(start: draftStart, end: lastBefore, keys: draftKeys, inserted: Focus.ownChars - draftOwn, recent: kept, app: lastApp, now: Date().timeIntervalSince1970)
+            if sent.split(separator: " ").count >= 3 { Engine.shared.post("/typed", ["text": sent, "app": lastApp, "context": String(ScreenContext.shared.journal(context?.text ?? "").suffix(1500))]) }   // screen context: never picture text to data/
             lastBefore = ""
+            if mods.isEmpty { draftOpen = false; draftStart = nil; draftKeys = 0; draftOwn = Focus.ownChars; draftFirstKey = nil; draftLastKey = nil }   // sent: the next message starts here
         }
+        if code == 9, mods == .maskCommand { noteDraftInput(0); Focus.wrote(NSPasteboard.general.string(forType: .string)?.count ?? 0); PasteWatch.keyPaste() }   // ⌘V: his paste (soft round: + the paste trail, PasteWatch)
         if code == 53, mods.isEmpty, KeyHooks.escTwice(ghostVisible: g.visible) { return nil }      // Esc twice: ghosts paused here (app/KeyHooks.swift)
         if !mods.subtracting(.maskShift).isEmpty || code == 53 {   // shortcuts and Esc: stay out of the way
             cancel()
@@ -294,6 +329,7 @@ final class Keys {
         }
         if code == 51, mods.isEmpty, KeyHooks.tabUndo != nil, KeyHooks.tabBack() { return nil }                  // Backspace right after Tab
         if code == 51, mods.isEmpty, Autocorrect.last != nil, Autocorrect.takeBack() { cancel(); return nil }   // Backspace right after a fix
+        if code == 51, mods.isEmpty, Typography.last != nil, Typography.takeBack() { cancel(); return nil }     // ... or a typography swap
         if code == 51, mods.isEmpty, Translate.last != nil, Translate.takeBack() { cancel(); return nil }       // ... or after a translation
         if code == 51, mods.isEmpty, Rework.last != nil, Rework.takeBack() { cancel(); return nil }             // ... or after a rework
         if code == 51, mods.isEmpty, Entities.last != nil, Entities.takeBack() { cancel(); return nil }         // ... or an entity or context block
@@ -301,6 +337,9 @@ final class Keys {
         var len = 0; var chars = [UniChar](repeating: 0, count: 4)
         event.keyboardGetUnicodeString(maxStringLength: 4, actualStringLength: &len, unicodeString: &chars)
         let typed = String(utf16CodeUnits: chars, count: len)
+        if let u = typed.unicodeScalars.first, u.value >= 0x20, u.value != 0x7F { noteDraftInput(typed.count) }   // his letters (DraftCaptureRules)
+        if let l = gaps.key(at: event.timestamp, rev: keyRevision, field: fieldGen, unit: typed.utf16.first, secure: IsSecureEventInputEnabled(), ghost: g.visible) { DispatchQueue.global(qos: .utility).async { log(l) } }   // key gaps, a histogram a minute (app/KeyGapRules.swift)
+        if Typography.noteKey(typed, rev: editRevision), typed != " ", Drafter.shared.active { Typography.afterKey(typed, revision: inputRevision, at: Date()) }   // — « » … as he types (app/Typography.swift); space: Snippets.afterSpace
         if typed == " " {
             let revision = inputRevision, field = Focus.focused()
             DispatchQueue.main.async { Snippets.afterSpace(revision: revision, expected: field) }
@@ -314,10 +353,13 @@ final class Keys {
             if let r = lastRead, r.rev == keyRevision - 1 { lastRead = (Keys.typed(typed, into: r.spot), keyRevision, Date()) }
             stat?.typed += typed.count
             timer?.invalidate()
-            if g.visible { DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { self.realign() } } else { schedule() }
+            if g.visible { DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { self.realign(); self.roll() } } else { schedule() }
             return pass
         }
-        cancel(); predict(typed, mods: mods); schedule()
+        let fut = g.visible && mods.subtracting(.maskShift).isEmpty ? futureFor(typed) : nil
+        cancel()
+        if let fut { showFuture(fut, typed: typed) }
+        predict(typed, mods: mods); schedule()
         return pass
     }
 
@@ -338,6 +380,11 @@ final class Keys {
     /// Screen context for this field: the cached text when it is the same field, else empty while a fresh read runs
     /// in the background (the next keystroke gets it).
     func contextFor(_ s: Spot, refresh: Bool = true) -> String {
+        // >>> screen context (opus/screen, 2026-11-14): a key only notes the time; captures run on their own clock
+        // (app/ScreenContext.swift), and the newest picture text kept for this field wins over an older read
+        ScreenContext.shared.touch(s)
+        if let kept = ScreenContext.shared.kept(s), !contextBusy { return kept }
+        // <<< screen context
         let same = context.map { CFEqual($0.el, s.el) } ?? false
         // read again for a new field, or at the start of a new line after 30 s (a new message may have come in);
         // never mid-sentence, where a changed context would make the engine read it all again
@@ -366,15 +413,11 @@ final class Keys {
         remember(key, text)
     }
 
-    /// Accessibility first (~25 ms); when the app gives less than a few lines, the screen above the caret is read
-    /// on-device instead (Screen.swift, ~0.2-0.5 s, background only).
+    /// >>> screen context (opus/screen, 2026-11-14): Accessibility where its text is clean, else the messages on screen
+    /// read from a picture (app/ScreenContext.swift: kept per field, used at once, a capture waited for only on a new
+    /// field). Background only. <<<
     static func readContext(_ el: AXUIElement, pid: pid_t, caret: CGRect?) -> String {
-        let t0 = Date()
-        let ax = Focus.screenContext(el)
-        guard ax.count < 120, Drafter.shared.settings.screen, let caret else { return ax }
-        let seen = Screen.textAbove(pid: pid, caret: caret)
-        if debugLog { log(String(format: "screen read %.0f ms, %d chars (ax %d)", Date().timeIntervalSince(t0) * 1000, seen.count, ax.count)) }
-        return seen.count > ax.count ? String(seen.suffix(2500)) : ax
+        ScreenContext.shared.read(el, pid: pid, caret: caret)
     }
 
     /// The focused field is an empty chat box (Tab then asks for a reply). Set on a click, an app switch, after Return.
@@ -446,7 +489,9 @@ final class Keys {
     /// His next message for this screen (engine /reply, Claude Haiku; the same screen is answered from the cache),
     /// shown as a card over the empty box; Tab puts it in.
     func draft(_ ctx: String, _ s: Spot, ai: Bool, auto: Bool, seq: Int) {
-        Engine.shared.post("/reply", ["context": ctx, "app": s.app.localizedName ?? "", "title": s.title, "ai": ai], timeout: 45) { j in
+        let st = Drafter.shared.settings
+        Engine.shared.post("/reply", ["context": ctx, "app": s.app.localizedName ?? "", "title": s.title, "ai": ai,
+                                      "notes": WritingNotes.forApp(s.app.bundleIdentifier ?? "", global: st.writingNote, perApp: st.appNotes)], timeout: 45) { j in
             if !auto { Pill.shared.hide() }
             var opts = ((j?["options"] as? [[String: Any]]) ?? []).compactMap { o -> [String: String]? in
                 guard let t = (o["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty else { return nil }
@@ -475,14 +520,39 @@ final class Keys {
     /// A text he typed and left without sending (2026-10-21, Andrii: "save my typing history entirely"): when the caret
     /// moves to another field or app, what he had typed there goes to data/drafts.jsonl (local only, same rules as the
     /// sent lines: "Learn from what I send" on, never skipped apps or secure input). Sent lines stay in typed.jsonl.
+    /// Since 2026-11-14 (app/DraftCaptureRules.swift): only what he wrote since his first key in the field; past what
+    /// his keys, pastes and Drafter's writes explain, an estimate ("est"), never nothing. A draft he goes on with
+    /// replaces its row, the same adds nothing.
     func keepDraft() {
-        let text = lastBefore.trimmingCharacters(in: .whitespacesAndNewlines)
-        defer { lastBefore = "" }
-        guard Drafter.shared.settings.learn, !IsSecureEventInputEnabled(), !lastTest, text.split(separator: " ").count >= 3, text != lastDraftKept else { return }
-        lastDraftKept = text
-        History.draft(String(text.suffix(2000)), app: lastApp)
+        let end = lastBefore, start = draftStart, keys = draftKeys, inserted = Focus.ownChars - draftOwn, now = Date().timeIntervalSince1970
+        let first = draftFirstKey, last = draftLastKey
+        defer { lastBefore = ""; draftOpen = false; draftStart = nil; draftKeys = 0; draftOwn = Focus.ownChars; draftFirstKey = nil; draftLastKey = nil }
+        guard Drafter.shared.settings.learn, !IsSecureEventInputEnabled(), !lastTest else { return }
+        let text: String, at: (t0: Double?, t: Double)
+        switch DraftCaptureRules.record(start: start, end: end, keys: keys, inserted: inserted, recent: kept, app: lastApp, now: now) {
+        case .skip: return
+        case .add(let t, let est):
+            text = t; at = DraftCaptureRules.stamps(firstKey: first, lastKey: last, now: now)
+            History.draft(t, app: lastApp, at: at.t, started: at.t0, est: est)
+        case .replace(let t, let was, let est):
+            text = t; at = DraftCaptureRules.stamps(firstKey: first, lastKey: last, now: now, continued: kept.first { $0.t == was })
+            History.draft(t, app: lastApp, at: at.t, started: at.t0, est: est, replacing: was); kept.removeAll { $0.t == was }
+        }
+        kept = Array((kept + [.init(text: text, t: at.t, app: lastApp, t0: at.t0)]).suffix(8))
     }
-    private var lastDraftKept = ""
+    /// The field's text before the caret at his first key (nil: not read yet), his letters since, Focus.ownChars then,
+    /// and the drafts kept this run.
+    private var draftOpen = false, draftStart: String?, draftKeys = 0, draftOwn = 0, kept: [DraftCaptureRules.Kept] = []
+    private var draftFirstKey: Double?, draftLastKey: Double?   // seconds since 1970, as a row's "t"
+    func noteDraftInput(_ n: Int) {
+        let now = Date().timeIntervalSince1970
+        draftLastKey = now; if draftFirstKey == nil { draftFirstKey = now }
+        if !draftOpen {
+            draftOpen = true; draftOwn = Focus.ownChars
+            draftStart = lastRead.flatMap { $0.rev == keyRevision - 1 ? $0.spot.before : nil }   // read right before this key
+        }
+        draftKeys += n
+    }
 
     func warmField() {
         keepDraft()
@@ -493,7 +563,12 @@ final class Keys {
         if emptyChat { autoDraft() }
         lastRead = (s, keyRevision, Date())   // round five: the first key in this field is asked for at once
         let el = s.el, pid = s.app.processIdentifier, rect = s.rect, key = Keys.screenKey(s)
-        let warm = { (t: String) in Engine.shared.post("/prefill", ["before": String(s.before.suffix(1500)), "app": s.app.localizedName ?? "", "title": s.title, "context": t]) }
+        let warm = { (t: String) in
+            // the same clip and notes as the first /complete will carry (requestBody), so the warm prompt is that one
+            var b: [String: Any] = ["before": String(s.before.suffix(1500)), "app": s.app.localizedName ?? "", "title": s.title, "context": t]
+            for k in ["clip", "notes"] { if let v = self.requestBody(s, before: s.before, ctx: t)[k] { b[k] = v } }
+            Engine.shared.post("/prefill", b)
+        }
         let known = screens[key]
         if let known { warm(known) }   // a screen seen before: its prompt is (still) warm before the fresh read lands
         contextReads += 1
@@ -525,14 +600,14 @@ final class Keys {
         let v = s.value as NSString
         let value = s.caret >= 0 && s.caret <= v.length ? v.replacingCharacters(in: NSRange(location: s.caret, length: 0), with: t) : s.value
         return Spot(app: s.app, el: s.el, value: value, caret: s.caret + t.utf16.count, before: s.before + t, title: s.title,
-                    rect: s.rect, role: s.role, viaMarkers: s.viaMarkers)
+                    rect: s.rect, role: s.role, viaMarkers: s.viaMarkers, lineAfter: s.lineAfter, mid: s.mid)
     }
 
     /// Put the ghost exactly at the caret again after letters were typed into it.
     func realign() {
-        guard Ghost.shared.visible, let s = Focus.spot(skip: Drafter.shared.settings.skip).0, let r = s.rect else { return }
+        guard Ghost.shared.visible, let s = Focus.spot(skip: Drafter.shared.settings.skip, midLine: Keys.midLine).0, let r = s.rect else { return }
         spot = s
-        Ghost.shared.show(Ghost.shared.text, action: Ghost.shared.action, at: r, replace: Ghost.shared.replace)
+        Ghost.shared.show(Ghost.shared.text, action: Ghost.shared.action, at: r, replace: Ghost.shared.replace, mid: s.mid)
     }
 
     var chipTimer: Timer?
@@ -562,6 +637,7 @@ final class Keys {
         PeopleCards.clear(); EntityCard.shared.hide()
         endStat()
         timer?.invalidate(); chipTimer?.invalidate(); pauseTimer?.invalidate(); Proof.cancel(); Facts.cancel(); Translate.cancel(); seq += 1
+        ghostAsk = nil; futureList = []; ideaList = []; ideaIndex = 0
         if Ghost.shared.visible { Ghost.shared.hide() }
     }
 
@@ -574,7 +650,8 @@ final class Keys {
         guard Talk.shared.state == .idle else { return }
         seq += 1; let mine = seq
         let tAX = Date()
-        let (s, why) = Focus.spot(skip: Drafter.shared.settings.skip)
+        let (s, why) = Focus.spot(skip: Drafter.shared.settings.skip, midLine: Keys.midLine)
+        if let l = gaps.field(s.map { Entities.kind($0) }, rev: keyRevision) { log(l) }   // nil: skipped app, password, secure input
         let ax = Int(Date().timeIntervalSince(tAX) * 1000)   // the first Accessibility read (logged with "shown", round two)
         if why == "no caret rect", let s0 = s { Caret.note(s0.app, s0.role, ok: false) }
         // no suggestion possible here: one Accessibility reading of the field per app per run says why (data/app.log)
@@ -585,6 +662,7 @@ final class Keys {
         if debugLog, why != "ok" { log("quiet \(Focus.lastApp?.bundleIdentifier ?? "?"): \(why)") }
         guard let s, let rect = s.rect, !KeyHooks.paused(s) else { return }   // Esc twice paused this field
         lastRead = (s, keyRevision, Date())
+        if s.mid { askMid(s, rect: rect, mine: mine, ax: ax); return }   // mid-line: the plain ghost only
         Entities.wordEnd(s)                                       // a name just typed in an AI app: the quiet mark (app/Entities.swift)
         if let lookup = LookupQuery.parse(s.before), LocalConfig.available("gam") {   // optional integration: off, no chip
             chipTimer?.invalidate(); shownSeq = mine; spot = s
@@ -605,8 +683,11 @@ final class Keys {
             Ghost.shared.unsure = 0; Ghost.shared.show("", action: action, at: rect)
             return
         }
+        // typo hold: no grey text while the word just typed is a suspected typo; a plain ghost on screen goes
+        let held = typoHold(s)
+        if held != .none { hidePlainGhost() }
         Snippets.refreshEndings()
-        if Drafter.shared.settings.learn, let ending = Snippets.endings.suffix(s.before), Keys.letters(ending) >= Keys.minLetters {
+        if held == .none, Drafter.shared.settings.learn, let ending = Snippets.endings.suffix(s.before), Keys.letters(ending) >= Keys.minLetters {
             chipTimer?.invalidate(); shownSeq = mine; spot = s
             beginStat(s.app, "ending", ending)
             Ghost.shared.unsure = 0; Ghost.shared.show(ending, action: nil, at: rect)
@@ -616,13 +697,17 @@ final class Keys {
         Caret.note(s.app, s.role, ok: true)
         let before = s.before
         lastBefore = before; lastApp = s.app.localizedName ?? ""; lastTest = s.value.contains("⟦drafter-test⟧")
+        if draftOpen, draftStart == nil { draftStart = String(before.dropLast(draftKeys)) }   // no read just before his first key
         let ctx = contextFor(s)
         guard before.trimmingCharacters(in: .whitespacesAndNewlines).count >= 2 else { return }
         let t0 = Date()
         scheduleChip()
-        schedulePause(s, before, ctx, mine)
+        if held == .none { schedulePause(s, before, ctx, mine) }
         if !Translate.schedule(s, context: ctx, seq: mine) { Proof.schedule(s, seq: mine) }
         Facts.schedule(s, context: ctx, seq: mine)
+        // held: no ask, except for a word still being typed, whose "→ word" fix comes from the same ask (answer() drops
+        // its plain grey text)
+        if held != .none, held != .word || !Drafter.shared.settings.fixWord { return }
         // the same text was asked for at the key itself (predict): its answer is on the way, nothing to ask again
         // round five: also once that answer came (it was asked again here, 38 of 90 such asks 13-14 Nov: the same
         // ghost drawn twice, and the newer ask stopped the branches the first answer had started in the gap)
@@ -632,6 +717,65 @@ final class Keys {
     }
 
     static func norm(_ s: String) -> String { s.replacingOccurrences(of: "\u{A0}", with: " ") }
+
+    /// Setting `midLine` (2026-11-15, default off): the ghost paths read a caret mid-line too (Focus.spot).
+    static var midLine: Bool { Drafter.shared.settings.midLine }
+
+    /// Mid-line (the caret at a gap with text after it on its line): only the local plain ghost is asked for. No chips,
+    /// snippets, endings, lookups, Claude pause, proofread, translate or facts: each of those reads the line as ending
+    /// at the caret. The read stands for the field as before (lastBefore and the draft start are left as they were, so
+    /// a line sent with Return is never cut at the caret).
+    private func askMid(_ s: Spot, rect: CGRect, mine: Int, ax: Int) {
+        chipTimer?.invalidate(); pauseTimer?.invalidate()
+        guard Engine.shared.ready else { return }
+        lastTest = lastTest || s.value.contains("⟦drafter-test⟧")
+        let held = typoHold(s)
+        if held != .none { hidePlainGhost(); return }
+        guard s.before.trimmingCharacters(in: .whitespacesAndNewlines).count >= 2 else { return }
+        if let p = predicted, GhostRules.askedAtKey(before: p.before, rev: p.rev, pending: p.pending, now: s.before, keyRev: keyRevision) { return }
+        predicted = nil
+        complete(s, before: s.before, ctx: contextFor(s), mine: mine, rect: rect, t0: Date(), ax: ax)
+    }
+
+    /// Typo hold (15 November 2026, Cotypist Pro): where the caret sits relative to a suspected typo (TypoHold) in
+    /// `before` (default: the field as read). The typo check is the app's own: his words, names, words he took a fix
+    /// back on and words either Mac dictionary knows are never typos; a whole word is one when the ranked fix has a
+    /// candidate for it, a word still being typed when no word starts with its letters. Ukrainian words only with
+    /// `autocorrectUk`, as the fix. One "ghost hold typo len=N at=…" line per hold, never the word.
+    func typoHold(_ s: Spot, before given: String? = nil) -> TypoHold.At {
+        let st = Drafter.shared.settings
+        let before = Keys.norm(given ?? s.before), id = s.app.bundleIdentifier ?? ""
+        guard st.typoHold, !TypoRules.codeApps.contains(id), !TypoRules.inCode(before) else { holdLogged = nil; return .none }
+        let line = before.components(separatedBy: "\n").last ?? ""
+        let held: (at: TypoHold.At, len: Int)
+        if let m = holdMemo, m.line == line { held = (m.at, m.len) } else {
+            var kind: String?
+            held = TypoHold.at(line) { core, prev, complete in
+                let uk = TypoRules.isUkrainian(core)
+                guard st.autocorrectUk || !uk else { return false }
+                return TypoHold.suspect(core, complete: complete,
+                    spared: { Autocorrect.spared.contains($0) || (!Fixer.refused.isEmpty && $0.hasPrefix(Fixer.refused)) },
+                    known: Autocorrect.known, spell: Spell.known,
+                    starts: { Spell.starts($0, uk ? "uk" : "en") || Autocorrect.nameStarts($0) || TypoEngine.hisStart($0) },
+                    hasFix: { w in
+                        if kind == nil { kind = AppKind.of(id, title: s.title, ai: Keys.aiApps, chats: Keys.chatApps, browsers: Keys.browsers, aiTitle: Keys.aiTitle) }
+                        return TypoEngine.hasFix(w, prev: prev, kind: kind ?? "other")
+                    })
+            }
+            holdMemo = (line, held.at, held.len)
+        }
+        if let k = TypoHold.key(before, held.at) {
+            if k != holdLogged { holdLogged = k; log("ghost hold typo len=\(held.len) at=\(held.at.rawValue)") }
+        } else { holdLogged = nil }
+        return held.at
+    }
+
+    /// The typo hold takes a plain grey ghost away; a fix "→ word", a chip or a next-message card stays.
+    func hidePlainGhost() {
+        let g = Ghost.shared
+        guard g.visible, g.action == nil, g.replace.isEmpty, !g.isDraft else { return }
+        g.hide(); painted = nil; endStat()
+    }
 
     /// The engine's own split of its time (round three): " t lock 0 switch 0 fed 3 first 14 part 31 prep 1 queue 0 early 0 all 33"
     static func timing(_ j: [String: Any]) -> String {
@@ -654,6 +798,8 @@ final class Keys {
               !IsSecureEventInputEnabled(), let rect = r.spot.rect else { return }
         let s = r.spot, before = s.before + typed
         guard before.trimmingCharacters(in: .whitespacesAndNewlines).count >= 2 else { return }
+        let held = typoHold(s, before: before)
+        if held != .none, held != .word || !Drafter.shared.settings.fixWord { return }
         seq += 1; let mine = seq
         predicted = (before, mine, true, keyRevision)
         complete(s, before: before, ctx: contextFor(s, refresh: false), mine: mine, rect: rect, t0: Date(), predicted: true)
@@ -662,20 +808,36 @@ final class Keys {
     /// One local suggestion for `before` (engine /complete) and what to do with the answer.
     func complete(_ s: Spot, before: String, ctx: String, mine: Int, rect: CGRect, t0: Date, predicted isPrediction: Bool = false, ax: Int? = nil) {
         let keyAt = self.keyAt, rev = self.keyRevision
-        // the same 4000 characters as a pause sends, so an early Claude answer (engine, at a word end) matches it later
-        let body: [String: Any] = ["before": String(before.suffix(4000)), "app": s.app.localizedName ?? "", "title": s.title,
-                                         "context": ctx, "context_fresh": !contextBusy && (context.map { CFEqual($0.el, s.el) } ?? false), "max_tokens": Keys.tokens, "chips": false, "fix": Drafter.shared.settings.fixWord,
-                                         "min_letters": Keys.minLetters,
-                                         "early": Drafter.shared.settings.claudeTyping && Drafter.shared.settings.claudePause && !IsSecureEventInputEnabled(), "after": Keys.after(s), "field": fieldGen].merging(Keys.length(s.app.bundleIdentifier ?? "")) { a, _ in a }
+        let body = requestBody(s, before: before, ctx: ctx)
         let reply = { (j: [String: Any]?, final: Bool) in
             self.answer(j, s, before: before, ctx: ctx, mine: mine, rect: rect, t0: t0, keyAt: keyAt, predicted: isPrediction, tries: 0, ax: ax, final: final, rev: rev)
         }
         // two-step ghost (round two): the first words are drawn as soon as the engine has them, the rest grows in place
-        if Drafter.shared.settings.streamGhost {
+        // mid-line: the whole answer at once, so it is trimmed to one line before the rest (GhostRules.midText) once
+        if Drafter.shared.settings.streamGhost, !s.mid {
             Engine.shared.stream("/complete", body, each: { reply($0, false) }) { reply($0, true) }
         } else {
             Engine.shared.post("/complete", body) { reply($0, true) }
         }
+    }
+
+    /// The /complete body for `before`. The rolling ghost and /futures send the very same fields, so the engine finds
+    /// the answers it prepared for them (engine/server.py ahead_key).
+    func requestBody(_ s: Spot, before: String, ctx: String) -> [String: Any] {
+        // the same 4000 characters as a pause sends, so an early Claude answer (engine, at a word end) matches it later
+        var body: [String: Any] = ["before": String(before.suffix(4000)), "app": s.app.localizedName ?? "", "title": s.title,
+                                         "context": ctx, "context_fresh": !contextBusy && (context.map { CFEqual($0.el, s.el) } ?? false), "max_tokens": Keys.tokens, "chips": false, "fix": Drafter.shared.settings.fixWord,
+                                         "min_letters": Keys.minLetters,
+                                         "early": Drafter.shared.settings.claudeTyping && Drafter.shared.settings.claudePause && !IsSecureEventInputEnabled(), "after": Keys.after(s), "field": fieldGen].merging(Keys.length(s.app.bundleIdentifier ?? "")) { a, _ in a }
+        // parity round: the fresh copy and his writing instructions for this app (sent only when there are some, so the
+        // prompt and the engine's look-ahead keys stay as before without them)
+        if let clip = Clip.forPrompt(before) { body["clip"] = clip }
+        let st = Drafter.shared.settings, notes = WritingNotes.forApp(s.app.bundleIdentifier ?? "", global: st.writingNote, perApp: st.appNotes)
+        if !notes.isEmpty { body["notes"] = notes }
+        // mid-line (setting midLine): the rest of the caret's line first, at most two lines more; the engine fills the
+        // gap between `before` and `after_line` (fields it ignores until engine/ learns them; no early Claude here)
+        guard s.mid else { return body }
+        return body.merging(["mid": true, "after": GhostRules.midAfter(Keys.after(s)), "after_line": s.lineAfter, "early": false]) { _, b in b }
     }
 
     func answer(_ j: [String: Any]?, _ s: Spot, before: String, ctx: String, mine: Int, rect: CGRect, t0: Date, keyAt: Date,
@@ -702,7 +864,7 @@ final class Keys {
         }
         guard !text.isEmpty || action != nil else { settle(); return }
         let tAX = Date()
-        let (now, _) = Focus.spot(skip: Drafter.shared.settings.skip)
+        let (now, _) = Focus.spot(skip: Drafter.shared.settings.skip, midLine: Keys.midLine)
         let ax2 = Int(Date().timeIntervalSince(tAX) * 1000)
         guard let now, CFEqual(now.el, s.el), now.app.processIdentifier == s.app.processIdentifier else { settle(); return }
         if isPrediction, !Keys.norm(now.before).hasPrefix(Keys.norm(before)) {
@@ -722,6 +884,8 @@ final class Keys {
         if let rev, GhostRules.fieldBehind(revAsked: rev, revNow: keyRevision, asked: before, now: now.before) { return }
         // the read stands for the key it was asked at, never for a newer one (predict() trusts lastRead's revision)
         if rev == nil || rev == keyRevision { self.lastRead = (now, self.keyRevision, Date()) }
+        // mid-line: a plain ghost only (a fix or a chip reads the line as ending at the caret), on the same rest
+        if now.mid, action != nil || j["replace"] != nil || !s.mid || now.lineAfter != s.lineAfter { return }
         if let old = j["replace"] as? String {
             // a fix for the word being typed: only at the very spot it was asked for
             let kind = j["kind"] as? String ?? "typo"
@@ -733,6 +897,8 @@ final class Keys {
             self.shownAt = Date()
             return
         }
+        // typo hold: a plain ghost never shows after a suspected typo (an answer asked before it, a future, a fix-only ask)
+        if action == nil, typoHold(now) != .none { return }
         let raw = text
         let typedSince = String(now.before.dropFirst(before.count))
         if !typedSince.isEmpty {
@@ -746,6 +912,7 @@ final class Keys {
             text = String(text.dropFirst(typedSince.count))
         }
         if now.before.last?.isWhitespace == true { text = String(text.drop(while: { $0 == " " })) }   // never two spaces
+        if now.mid { text = GhostRules.midText(text, rest: now.lineAfter) }   // one line, never the rest again
         guard !text.isEmpty || action != nil else { return }
         // too short to be worth a Tab (setting minGhost): the engine already tried to make it longer
         if action == nil, Keys.letters(text) < Keys.minLetters { return }
@@ -755,8 +922,14 @@ final class Keys {
         let unsure = (j["unsure"] as? String).map { text.hasSuffix($0) ? $0.count : 0 } ?? 0
         Ghost.shared.unsure = unsure
         if action == nil { self.beginStat(now.app, j["src"] as? String ?? "model", text) }
-        Ghost.shared.show(text, action: action, at: now.rect ?? rect)
+        Ghost.shared.show(text, action: action, at: now.rect ?? rect, mid: now.mid)
         self.shownAt = Date()
+        if now.mid { log("ghost mid after=\(now.lineAfter.count) len=\(text.count)") }
+        // long round: what this ghost was asked with, for the rolling ghost, its futures and ⌃⇧Tab's other ideas
+        ghostAsk = action == nil && typedSince.isEmpty && !now.mid ? (body: requestBody(s, before: before, ctx: ctx), before: before, ctx: ctx) : nil
+        futureList = []; ideaList = []; ideaIndex = 0; rollAsked = nil
+        if final { fetchFutures() }
+        if action == nil, let t = tabAt { tabAt = nil; if Date().timeIntervalSince(t) < 3 { log("tabnext \(now.app.bundleIdentifier ?? "?") \(Int(Date().timeIntervalSince(t) * 1000))ms\(j["ahead"] as? Bool == true ? " ahead" : "")") } }
         Stats.add(ms: Date().timeIntervalSince(t0) * 1000, engineMs: j["ms"] as? Double ?? 0)
         let src = (j["src"] as? String).map { " " + $0 } ?? ""
         let gp = (j["gate"] as? Double).map { String(format: " %.2f", $0) } ?? ""
@@ -775,6 +948,7 @@ final class Keys {
         painted = (mine, text, p.drop, p.full + more)
         stat?.len = p.full.count + more.count
         if final {
+            fetchFutures()
             log("grown \(s.app.bundleIdentifier ?? "?") \(Int(Date().timeIntervalSince(t0) * 1000))ms engine \(Int(j["ms"] as? Double ?? 0))ms len \(p.full.count + more.count) lighter \(unsure)")
         }
     }
@@ -800,7 +974,8 @@ final class Keys {
             guard mine == self.seq, Ghost.shared.action == nil, Talk.shared.state == .idle else { return }
             let t0 = Date()
             Engine.shared.post("/pause", ["before": String(before.suffix(4000)), "app": s.app.localizedName ?? "", "title": s.title,
-                                          "context": ctx, "model": st.claudeModel, "after": Keys.after(s), "field": self.fieldGen], timeout: 8) { j in
+                                          "context": ctx, "model": st.claudeModel, "after": Keys.after(s), "field": self.fieldGen,
+                                          "notes": WritingNotes.forApp(s.app.bundleIdentifier ?? "", global: st.writingNote, perApp: st.appNotes)], timeout: 8) { j in
                 guard mine == self.seq, var text = j?["text"] as? String, !text.isEmpty, Ghost.shared.action == nil else { return }
                 let (now, _) = Focus.spot(skip: Drafter.shared.settings.skip)
                 guard let now, let r = now.rect, CFEqual(now.el, s.el), now.app.processIdentifier == s.app.processIdentifier, now.before == before else { return }
@@ -828,11 +1003,12 @@ final class Keys {
         var piece = given
         let full = Ghost.shared.text
         let tabRev = keyRevision
+        lastTab = Date()
         // word by word, the rest of the ghost moves right at once instead of blinking out for 80 ms (Codex review,
         // 2026-10-31, the iPad feel); the real caret puts it in place a beat later, or it goes if the word did not land
         if given.count >= full.count || !Ghost.shared.consume(given) { Ghost.shared.hide() }
         // read the field again: Chromium apps update it a beat late, so letters typed meanwhile (a space) are taken off
-        guard let cur = Focus.spot(skip: Drafter.shared.settings.skip).0, CFEqual(cur.el, s.el),
+        guard let cur = Focus.spot(skip: Drafter.shared.settings.skip, midLine: Keys.midLine).0, CFEqual(cur.el, s.el),
               cur.app.processIdentifier == s.app.processIdentifier, cur.before.hasPrefix(s.before) else { Ghost.shared.hide(); return }
         do {
             let typedSince = String(cur.before.dropFirst(s.before.count))
@@ -851,6 +1027,7 @@ final class Keys {
         // the whole grey text taken: ask for the next words at once, so Tab, Tab, Tab keeps going (Cotypist's flow,
         // Andrii 2026-10-21); it waits for nothing he types
         if given.count >= full.count {
+            tabAt = Date()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { if !Ghost.shared.visible { self.ask() } }
         }
         // after a single word, put the rest where the caret really is (a paste can land late: one more look)
@@ -859,15 +1036,141 @@ final class Keys {
             func place(_ again: Bool) {
                 // he typed or it changed meanwhile; a streamed answer's last words may have grown it (Argon 13)
                 guard Ghost.shared.visible, Ghost.shared.action == nil, Ghost.shared.text.hasPrefix(rest) else { return }
-                let (now, _) = Focus.spot(skip: Drafter.shared.settings.skip)
+                let (now, _) = Focus.spot(skip: Drafter.shared.settings.skip, midLine: Keys.midLine)
                 if let now, let r = now.rect, now.before.hasSuffix(piece) {
-                    self.spot = now; Ghost.shared.show(Ghost.shared.text, action: nil, at: r)   // its lighter tail kept
+                    self.spot = now; Ghost.shared.show(Ghost.shared.text, action: nil, at: r, mid: now.mid)   // its lighter tail kept
                     if self.keyRevision == tabRev { self.lastRead = (now, tabRev, Date()) }   // round five: the next key at once
+                    self.roll()                                                                    // long round: the sentence keeps coming
                 } else if again { DispatchQueue.main.asyncAfter(deadline: .now() + 0.17) { place(false) } }
                 else { Ghost.shared.hide() }
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { place(true) }
         }
+    }
+
+    // MARK: long round (2026-11-14): the rolling ghost, futures, other ideas
+
+    /// The ask behind the plain ghost on screen (nil for a chip, a fix, an ending or a ghost he had typed into).
+    var ghostAsk: (body: [String: Any], before: String, ctx: String)?
+    /// Answers the engine prepared for other next letters after this ghost (engine /futures), and ⌃⇧Tab's list.
+    var futureList: [(letter: String, text: String, unsure: String)] = []
+    var ideaList: [(text: String, unsure: Int)] = [], ideaIndex = 0
+    var rollAsked: String?
+    var lastTab = Date.distantPast
+    /// The whole ghost was taken: the time to the next ghost goes to the log ("tabnext").
+    var tabAt: Date?
+
+    /// Futures take the gap after the ghost to work out (a sentence is ~0.5-1 s): read what is ready now, and twice later.
+    func fetchFutures(_ then: (() -> Void)? = nil) {
+        guard let a = ghostAsk else { return }
+        let base = a.before
+        func read(_ done: (() -> Void)?) {
+            Engine.shared.post("/futures", a.body, timeout: 1) { j in
+                guard self.ghostAsk?.before == base, let fs = j?["futures"] as? [[String: Any]] else { done?(); return }
+                self.futureList = fs.compactMap { f in
+                    guard let l = f["letter"] as? String, let t = f["text"] as? String else { return nil }
+                    return (l, t, f["unsure"] as? String ?? "")
+                }
+                if self.ideaIndex == 0 { self.ideaList = [] }
+                self.markIdeas()
+                done?()
+            }
+        }
+        if let then { read(then); return }
+        read(nil)
+        for d in [0.3, 0.9] { DispatchQueue.main.asyncAfter(deadline: .now() + d) { if self.ghostAsk?.before == base { read(nil) } } }
+    }
+
+    /// The prepared answer for the letter he just typed over the ghost (GhostRules.future), with the ask's screen text.
+    func futureFor(_ typed: String) -> (text: String, unsure: String, spot: Spot, ctx: String)? {
+        guard let a = ghostAsk, let s = spot,
+              let f = GhostRules.future(base: a.before, before: s.before, typed: typed, futures: futureList) else { return nil }
+        return (f.text, f.unsure, s, a.ctx)
+    }
+
+    /// Shown at once, no request: drawn as soon as the field holds his letter (the predicted path's wait).
+    func showFuture(_ f: (text: String, unsure: String, spot: Spot, ctx: String), typed: String) {
+        guard let rect = f.spot.rect else { return }
+        seq += 1
+        let mine = seq, before = f.spot.before + typed, keyAt = self.keyAt, rev = keyRevision
+        let j: [String: Any] = ["text": f.text, "unsure": f.unsure, "src": "future", "ms": 0]
+        DispatchQueue.main.async {
+            self.answer(j, f.spot, before: before, ctx: f.ctx, mine: mine, rect: rect, t0: keyAt, keyAt: keyAt, predicted: true, tries: 0, final: true, rev: rev)
+        }
+    }
+
+    /// The rolling ghost: two words or fewer left of a final ghost, the words after it are asked for and added at its
+    /// end. The engine prepared that answer when the ghost showed (look-ahead "next"), so it mostly comes at once.
+    func roll() {
+        let g = Ghost.shared
+        guard g.visible, let s = spot, let a = ghostAsk else { return }
+        let wanted = s.before + g.text
+        guard GhostRules.rollWanted(rest: g.text, mode: Drafter.shared.settings.ghostLength, final: finishedSeq >= shownSeq,
+                                    plain: g.action == nil && g.replace.isEmpty && !g.isDraft, wanted: wanted, askedFor: rollAsked) else { return }
+        rollAsked = wanted
+        let t0 = Date(), tab = lastTab
+        Engine.shared.post("/complete", requestBody(s, before: wanted, ctx: a.ctx)) { j in
+            guard let j, j["action"] == nil, j["replace"] == nil, var more = j["text"] as? String, !more.isEmpty else { return }
+            let g = Ghost.shared
+            guard g.visible, g.action == nil, let cur = self.spot, GhostRules.rollFits(asked: wanted, now: cur.before + g.text) else { return }
+            if wanted.last?.isWhitespace == true { more = String(more.drop(while: { $0 == " " })) }
+            guard !more.isEmpty else { return }
+            let unsure = (j["unsure"] as? String).map { more.hasSuffix($0) ? $0.count : 0 } ?? 0
+            g.extend(more, unsure: GhostRules.rollUnsure(old: g.unsure, more: more.count, moreUnsure: unsure))
+            self.stat?.len += more.count
+            let ms = Int(Date().timeIntervalSince(t0) * 1000), sinceTab = Int(Date().timeIntervalSince(tab) * 1000)
+            log("rolled \(s.app.bundleIdentifier ?? "?") \(ms)ms\(sinceTab < 3000 ? " tab \(sinceTab)ms" : "")\(j["ahead"] as? Bool == true ? " ahead" : "") len \(more.count)")
+        }
+    }
+
+    /// How many ideas ⌥1-⌥3 can pick now (the shown ghost and the prepared futures, at most 3); 0 without an ask.
+    var ideaCount: Int {
+        let g = Ghost.shared
+        guard ghostAsk != nil, g.visible else { return 0 }
+        return min(3, ideaList.isEmpty ? GhostRules.ideas(shown: g.text, futures: futureList).count : ideaList.count)
+    }
+
+    /// Parity round: the quiet "1/3" after the grey words once other ideas are ready (setting `alternatives`).
+    func markIdeas() {
+        let g = Ghost.shared
+        guard g.visible, g.action == nil, g.replace.isEmpty, !g.isDraft, ghostAsk != nil else { return }
+        g.hint(AltKeys.hint(index: ideaList.isEmpty ? 0 : ideaIndex, count: ideaCount, on: Drafter.shared.settings.alternatives))
+    }
+
+    /// ⌥1 ⌥2 ⌥3: that idea in place of the ghost (0 = the one the engine showed first).
+    func showIdea(_ i: Int) {
+        let g = Ghost.shared
+        guard g.visible, g.action == nil, g.replace.isEmpty, !g.isDraft, let a = ghostAsk, let s = spot,
+              Keys.norm(s.before) == Keys.norm(a.before) else { return }
+        if ideaList.isEmpty { ideaList = GhostRules.ideas(shown: g.text, futures: futureList); ideaList[0].unsure = g.unsure; ideaIndex = 0 }
+        guard i < ideaList.count, i != ideaIndex else { return }
+        putIdea(i, s)
+    }
+
+    /// ⌃⇧Tab: the next prepared idea for this spot in place of the ghost; none ready yet: read them, then try once more.
+    func nextIdea(_ again: Bool = true) {
+        let g = Ghost.shared
+        guard g.visible, g.action == nil, g.replace.isEmpty, !g.isDraft, let a = ghostAsk, let s = spot,
+              Keys.norm(s.before) == Keys.norm(a.before) else { return }
+        if ideaList.isEmpty { ideaList = GhostRules.ideas(shown: g.text, futures: futureList); ideaList[0].unsure = g.unsure; ideaIndex = 0 }
+        guard let i = GhostRules.cycle(index: ideaIndex, count: ideaList.count) else {
+            if again { fetchFutures { self.nextIdea(false) } }
+            return
+        }
+        putIdea(i, s)
+    }
+
+    private func putIdea(_ i: Int, _ s: Spot) {
+        let g = Ghost.shared
+        guard let r = s.rect else { return }
+        ideaIndex = i
+        let idea = ideaList[i]
+        painted = nil; rollAsked = nil
+        g.unsure = idea.unsure
+        g.show(idea.text, action: nil, at: r)
+        markIdeas()
+        beginStat(s.app, i == 0 ? "model" : "idea", idea.text)
+        log("idea \(s.app.bundleIdentifier ?? "?") \(i + 1) of \(ideaList.count)")
     }
 
     func run(_ a: [String: Any]) {

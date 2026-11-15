@@ -211,6 +211,86 @@ def settled(raw, shown, min_letters=0):
     return bool(m) and (bool(m.group(2)) or bool(END_RE.search(m.group(1))))
 
 
+# Sentence-length ghosts (long round, 2026-11-14, Andrii: "it also gotta suggest more words ... full sentences i could
+# finish quickly"). The show decision stays on the first word (the gate); after it the ghost runs on while the running
+# chance that he gets that far (the product of each later word's probability, the first word left out: the gate
+# already judged it) stays at or above a floor, to the end of the sentence or clause, a line end, or a word cap. One
+# unsure function word does not cut it (a per-token bar did); a run of weak words does. bench/long_ghosts.py picked
+# the numbers.
+SENT_END = re.compile(r"[.!?…][\"'»”)\]]*$")
+RUN_MODES = {"phrase": {"words": 6, "stops": ",;:", "comma_words": 0},
+             "sentence": {"words": 24, "stops": ";", "comma_words": 8}}
+RUN_FLOOR, RUN_CAP, RUN_LIKELY, RUN_GARBAGE = 0.1, 24, 0.3, 0.005
+
+
+def word_p(toks, pos, end):
+    """The model's probability of the whole word raw[pos:end]: the product of its token probabilities."""
+    span = word_ps(toks, pos, end)
+    p = 1.0
+    for x in span: p *= x
+    return p if span else 0.0
+
+
+def run_words(toks, mode="sentence", floor=RUN_FLOOR, words=None, closed=None, likely=RUN_LIKELY, garbage=RUN_GARBAGE,
+              min_letters=0, grow=0.05, kind="prod"):
+    """The ghost of a sentence-length run on the recorded tokens, once the gate said yes to the first word.
+    -> (text, sure part length, why it ended, [running chance after each later word]).
+    closed: None while the model is still writing; "eos" when it ended the text (the last word is whole); "cap" when
+    the token cap stopped it (a last word with nothing after it may be cut, so it is left out).
+    why: "open" (the next word is still being written: wait for more tokens), "sentence" (. ! ? … ended it), "clause"
+    (; or, in phrase mode, , :), "comma" (a comma after `comma_words` words), "line" (a line break follows), "floor"
+    (the running chance fell under `floor`, or one word under `garbage`), "words" (the word cap), "end" (the model
+    ended the text), "cap" (the token cap)."""
+    raw = toks[-1][0] if toks else ""
+    m = RUN_MODES[mode]
+    cap = words or m["words"]
+    first = next_word(raw)
+    w0 = first.strip()
+    if not w0: return "", 0, ("open" if not closed else closed if closed == "cap" else "end"), []
+    if len(first) >= len(raw) and not first.endswith(" ") and not END_RE.search(w0) and closed != "eos":
+        return "", 0, ("open" if not closed else "cap"), []
+    text, pos, n, cum, confs, sure = first, len(first), 1, 1.0, [], len(first)
+    logs = 0.0
+    if SENT_END.search(w0): return text, sure, "sentence", confs
+    if w0[-1:] in m["stops"]: return text, sure, "clause", confs
+    why = None
+    for ww in re.findall(r"\s*\S+ ?", raw[pos:]):
+        if "\n" in ww[: len(ww) - len(ww.lstrip())]: why = "line"; break
+        end = pos + len(ww.rstrip())
+        if end >= len(raw) and not END_RE.search(ww) and closed != "eos": why = "cap" if closed else "open"; break
+        wp = word_p(toks, pos, end)
+        if min_letters and letters(text) < min_letters:
+            span = word_ps(toks, pos, end)
+            if not span or min(span) < grow: why = "floor"; break
+        elif wp < garbage or running(kind, cum * wp, logs + math.log(max(wp, 1e-9)), n) < floor: why = "floor"; break
+        if n >= cap: why = "words"; break
+        cum *= wp; logs += math.log(max(wp, 1e-9)); text += ww; pos += len(ww); n += 1; confs.append(round(cum, 4))
+        if cum >= likely: sure = len(text)
+        w = ww.strip()
+        if SENT_END.search(w): why = "sentence"; break
+        if w[-1:] in m["stops"]: why = "clause"; break
+        if m["comma_words"] and w.endswith(",") and n >= m["comma_words"]: why = "comma"; break
+    if why is None:
+        if raw[pos:].startswith("\n") or raw[pos:].lstrip(" ").startswith("\n"): why = "line"
+        else: why = "open" if not closed else ("end" if closed == "eos" else "cap")
+    return text, min(sure, len(text)), why, confs
+
+
+RUN_PRIOR, RUN_PRIOR_P = 2, 0.7
+
+
+def running(kind, cum, logs, n):
+    """The running confidence after n later words: the product `cum`, or the geometric mean of their probabilities
+    (log sum `logs`) pulled towards RUN_PRIOR_P by RUN_PRIOR words."""
+    if kind == "prod": return cum
+    return math.exp((logs + RUN_PRIOR * math.log(RUN_PRIOR_P)) / (n + RUN_PRIOR))
+
+
+def run_settled(why):
+    """The run can no longer change: the model may stop (only "open" waits for more tokens)."""
+    return why != "open"
+
+
 def extend(toks, first, more, max_words):
     """Further words after the first while each of their tokens is at least `more` sure."""
     raw = toks[-1][0]

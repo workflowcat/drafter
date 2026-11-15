@@ -39,8 +39,8 @@ The first source wins a duplicate. The filters drop:
 - any line in Russian.
 
 A typed line that matches a take is marked as dictated. `bench/make_train.py --corpus data/corpus.jsonl` turns the
-corpus into training lines, with a weight per source (`corpus.WEIGHTS`). Typed lines count twice; takes, notes and
-posts count half.
+corpus into training lines, with a weight per source (`corpus.WEIGHTS`). Typed lines count twice; notes and posts
+count half; chat messages count a tenth, so they do not drown the prompts; voice takes are left out (they add fillers).
 
 ## The weekly retrain
 

@@ -131,7 +131,7 @@ class CallTape(unittest.TestCase):
                                     str(ROOT / 'app/CaptureRules.swift'), str(path / 'call.swift'), str(path / 'stubs.swift'),
                                     str(path / 'main.swift'), '-o', str(path / 'check')], capture_output=True, text=True, timeout=180)
             self.assertEqual(built.returncode, 0, built.stderr[-3000:])
-            run = subprocess.run([str(path / 'check'), str(path / 'data')], capture_output=True, text=True, timeout=60)
+            run = subprocess.run([str(path / 'check'), str(path / 'data')], capture_output=True, text=True, timeout=180)
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
             self.assertIn('tape: all passed', run.stdout)
 

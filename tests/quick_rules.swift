@@ -9,7 +9,7 @@ struct QuickRuleChecks {
     static func check(_ ok: Bool, _ what: String) { if !ok { print("FAIL: " + what); failures += 1 } }
 
     static func main() {
-        keySequences(); clips(); fold(); filter(); rank(); merge(); keep(); secrets(); rewrites(); times(); keys(); speed()
+        keySequences(); clips(); fold(); filter(); rank(); merge(); keep(); secrets(); rewrites(); times(); keys(); picker(); speed()
         if failures > 0 { print("\(failures) failed"); exit(1) }
         print("quick rules: all passed")
     }
@@ -89,6 +89,23 @@ struct QuickRuleChecks {
         check(run(&k, [.down(V, "⌘⇧"), .down(V, "⌘⇧"), .down(M, "⌘⇧")]) == [.openSwitch, .step(1), .toPanel(M)], "by key code, whatever the layout")
         k = machine()
         check(run(&k, [.down(V, "⌃⌥")]) == [.togglePanel], "⌃⌥V on any layout")
+        // wire round: ← → step through the chosen clip's written forms
+        let L = 123, R = 124
+        k = machine(); k.panelOpen = true; k.forms = 3
+        check(run(&k, [.down(R), .down(R), .down(L)]) == [.form(1), .form(1), .form(-1)], "panel, a clip with forms: → → ← step forms")
+        check(run(&k, [.down(R, "⇧"), .down(R, "⌘")]) == [.pass, .pass], "⇧→ and ⌘→ are not form steps")
+        k = machine(); k.panelOpen = true; k.forms = 0
+        check(run(&k, [.down(R), .down(L)]) == [.pass, .pass], "a clip without forms: the arrows as before")
+        k = machine(); k.forms = 2
+        check(run(&k, [.down(R)]) == [.pass], "panel closed: → goes to the app")
+        k = machine(); k.forms = 2
+        check(run(&k, [.down(V, "⌘⇧"), .down(R, "⌘⇧"), .down(V, "⌘⇧"), .down(L, "⌘⇧"), .flags("")]) == [.openSwitch, .form(1), .step(1), .form(-1), .put],
+              "switcher with forms: → ← step forms, V the next copy, the release puts")
+        k = machine(); k.forms = 0
+        check(run(&k, [.down(V, "⌘⇧"), .down(R, "⌘⇧"), .down(L, "⌘⇧"), .flags("")]) == [.openSwitch, .step(1), .step(-1), .put], "switcher without forms: → ← move copies as before")
+        check(QuickRules.stepForm(0, by: 1, forms: 3) == 1 && QuickRules.stepForm(3, by: 1, forms: 3) == 0 && QuickRules.stepForm(0, by: -1, forms: 3) == 3,
+              "forms wrap: as copied, 1, 2, 3, as copied")
+        check(QuickRules.stepForm(2, by: 1, forms: 0) == 0, "no forms: always as copied")
     }
 
     static func fold() {
@@ -219,6 +236,54 @@ struct QuickRuleChecks {
         check(QuickRules.hotkey("⌘⇧Space") != nil, "another Space key is fine")
         check(QuickRules.hotkey("") == nil && QuickRules.hotkey("V") == nil && QuickRules.hotkey("⇧V") == nil, "off, or no ⌃ ⌥ ⌘")
         check(QuickRules.hotkey("⌃⌥Ж") == nil, "unknown key")
+    }
+
+    /// The picker round: the quick form's rows, its step, the buttons on the foot, the row's second line.
+    static func picker() {
+        var pinned = item(.copied, "pinned copy", 50); pinned.pinned = true
+        let rows = [pinned, item(.copied, "newest", 40), item(.typed, "typed", 39),
+                    QuickItem(kind: .copied, text: "Image · 4 × 3", app: "Sample", at: 38, image: true, picture: "c-x.png"),
+                    item(.copied, "b", 37), item(.voice, "said", 36), item(.copied, "c", 35), item(.copied, "d", 34), item(.copied, "e", 33), item(.copied, "f", 32)]
+        check(QuickRules.quickRows(rows, count: 5) == [1, 4, 6, 7, 8], "quick form: the five newest copies, no pin, picture, typed or voice")
+        check(QuickRules.quickRows([], count: 5).isEmpty && QuickRules.quickRows(rows, count: 2) == [1, 4], "quick form: none, or fewer")
+        check(QuickRules.wrap(4, by: 1, count: 5) == 0 && QuickRules.wrap(0, by: -1, count: 5) == 4 && QuickRules.wrap(1, by: 1, count: 5) == 2, "quick step wraps both ways")
+        check(QuickRules.wrap(3, by: 1, count: 0) == 0, "quick step with no rows")
+
+        func ids(_ g: [[QuickRules.PickerButton]]) -> [[String]] { g.map { $0.map(\.id) } }
+        let text = QuickRules.PickerRow()
+        check(ids(QuickRules.buttons(text, quick: false)) == [["put", "copy"], ["rewrite", "pick"], ["pin", "remove"]], "a text: paste, copy | rewrite, pick | pin, remove")
+        var formed = text; formed.forms = 3
+        check(ids(QuickRules.buttons(formed, quick: false))[1] == ["form", "rewrite", "pick"], "a text with forms: ← → first in its group")
+        var linkIn = text; linkIn.target = .link
+        check(ids(QuickRules.buttons(linkIn, quick: false))[2] == ["open", "markdown", "untracked"], "a text holding a link: the link's keys")
+        let link = QuickRules.PickerRow(clip: .link)
+        check(ids(QuickRules.buttons(link, quick: false)) == [["put", "copy"], ["rewrite"], ["open", "markdown", "untracked"], ["pin", "remove"]], "a link: no Pick parts")
+        let file = QuickRules.PickerRow(clip: .file)
+        check(ids(QuickRules.buttons(file, quick: false)) == [["put"], ["reveal", "path"], ["pin", "remove"]], "a file: paste, reveal, copy path")
+        check(QuickRules.buttons(file, quick: false)[1].map(\.key) == ["⌘R", "⌘C"], "a file's keys as ClipRules has them")
+        let pic = QuickRules.PickerRow(clip: .image, image: true, picture: true)
+        check(ids(QuickRules.buttons(pic, quick: false)) == [["put", "withText", "copy"], ["text", "save"], ["pin", "remove"]], "a picture: paste, with text, copy | copy text, save")
+        let sized = QuickRules.PickerRow(clip: .image, image: true, picture: false)
+        check(ids(QuickRules.buttons(sized, quick: false)) == [["pin", "remove"]], "a picture kept as its size only: pin and remove")
+        check(ids(QuickRules.buttons(nil, quick: false)) == [["close"]], "nothing chosen: close")
+        check(QuickRules.buttons(text, quick: false).flatMap { $0 }.filter(\.primary).map(\.id) == ["put"], "one main button")
+        var pinnedRow = text; pinnedRow.pinned = true
+        check(QuickRules.buttons(pinnedRow, quick: false).last?.first?.word == "Unpin", "a pinned row says unpin")
+        check(ids(QuickRules.buttons(text, quick: true)) == [["put"], ["next"], ["search", "close"]], "quick: let go, next, search, close")
+        check(ids(QuickRules.buttons(formed, quick: true))[1] == ["next", "form"], "quick with forms: ← → too")
+        check(QuickRules.buttons(text, quick: true)[0][0].key == "⌘" && QuickRules.buttons(nil, quick: true)[0][0].primary == false, "quick: ⌘ under the paste")
+        check(ids(QuickRules.buttons(text, quick: false, rework: true)) == [["run"], ["list"]], "rewrite menu")
+        check(ids(QuickRules.buttons(text, quick: false, rework: true, result: true)) == [["put", "copy"], ["back", "list"]], "rewrite result")
+        // every key on a button is one the picker reads (Quick.key and QuickKeys.route)
+        let known: Set<String> = ["↵", "⇧↵", "⌘C", "← →", "⇥", "⌘E", "⌘P", "⌘⌫", "⌘O", "⌘M", "⌘T", "⌘R", "⌘S", "⌫", "esc", "⌘", "V", "A–Z"]
+        for r in [text, formed, linkIn, link, file, pic, sized] {
+            for b in QuickRules.buttons(r, quick: false).flatMap({ $0 }) + QuickRules.buttons(r, quick: true).flatMap({ $0 }) {
+                check(known.contains(b.key), "a known key: \(b.key) on \(b.id)")
+                check(!b.glyph.isEmpty && b.glyph != "more", "a glyph for \(b.id)")
+            }
+        }
+        check(QuickRules.meta(app: "Safari", at: 0, now: 240, extra: ["example.com"]) == "Safari · 4m · example.com", "the second line")
+        check(QuickRules.meta(app: "", at: 0, now: 30, extra: ["", "2 KB"]) == "now · 2 KB", "the second line without an app")
     }
 
     /// Made-up rows; each key of a typed query filters the whole list again, as the panel does.
