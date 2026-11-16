@@ -37,7 +37,7 @@ def rec(a):
     checks()
     label = "big-" + (a.label or (a.candidate + ("-" + Path(a.adapter).name if a.adapter else "-base")))
     if a.smoke: label += "-smoke"
-    extra = ["--tokens", "24"] + (["--no-stable"] if a.no_stable else [])
+    extra = ["--tokens", "24"] + (["--no-stable"] if a.no_stable else []) + (["--strength", str(a.strength)] if a.strength != 1.0 else [])
     t = time.time()
     p, lines = S.record(label, a.candidate, adapter=a.adapter, set_path=a.set, smoke=a.smoke, extra=extra)
     (LOGS).mkdir(parents=True, exist_ok=True)
@@ -79,7 +79,7 @@ def train(a):
     args = ["--model", model, "--train", "--data", str(ROOT / a.data), "--adapter-path", str(out),
             "-c", str(out / "recipe.yaml"), "--fine-tune-type", "lora", "--num-layers", str(a.layers), "--learning-rate", str(a.lr),
             "--iters", str(iters), "--batch-size", str(min(4, c["batch"]) if a.batch is None else a.batch),
-            "--grad-checkpoint", "--grad-accumulation-steps", str(a.accum), "--steps-per-report", "10", "--val-batches", "20", "--save-every", str(iters), "--seed", "7"]
+            "--grad-checkpoint", "--grad-accumulation-steps", str(a.accum), "--steps-per-report", "10", "--val-batches", "20", "--save-every", str(min(iters, 400)), "--seed", "7"]
     if a.plain:
         # the live layer's own recipe (bench/train.py): {"text"} rows from bench/make_train.py, 256 tokens, no mask
         script, args = "-m", ["mlx_lm.lora", *args, "--max-seq-length", "256", "--steps-per-eval", "10" if a.smoke else "200"]
@@ -91,7 +91,8 @@ def train(a):
     from retrain import sleeping_engine
     t = time.time()
     with (sleeping_engine() if a.sleep_engine else nullcontext()):
-        code, lines = S.W.guarded(script, args, cap, timeout=6 * 3600, log=LOGS / f"train-{out.name}.log")
+        env = {"DRAFTER_MLX_CACHE_GB": str(a.mlx_cache)} if a.mlx_cache else None
+        code, lines = S.W.guarded(script, args, cap, timeout=6 * 3600, env=env, log=LOGS / f"train-{out.name}.log")
     info = {"name": out.name, "candidate": a.candidate, "data": a.data, "seconds": round(time.time() - t), "cap_gb": cap,
             "plain": a.plain, "batch": a.batch, "accum": a.accum, "lr": a.lr, "scale": a.scale, "layers": a.layers, "attn_only": a.attn_only, "iters": iters, "exit": code, **S.W.peak_and_loss(lines), "adapter": str(out.relative_to(ROOT))}
     (out / "train-info.json").write_text(json.dumps(info, indent=1))
@@ -104,12 +105,14 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("rec"); p.add_argument("candidate"); p.add_argument("--adapter"); p.add_argument("--label")
     p.add_argument("--smoke", action="store_true"); p.add_argument("--no-stable", action="store_true")
+    p.add_argument("--strength", type=float, default=1.0, help="his layer's merge scale 0..1 (engine strength)")
     p.add_argument("--set", default=None, help="another held set, e.g. data/bench/big/held-slice.json (bench/big/slice.py)")
     p = sub.add_parser("train"); p.add_argument("candidate"); p.add_argument("--data", required=True); p.add_argument("--name", required=True)
     p.add_argument("--smoke", action="store_true"); p.add_argument("--sleep-engine", action="store_true")
     p.add_argument("--plain", action="store_true", help="live recipe on {text} rows (data/train), as bench/train.py")
     p.add_argument("--accum", type=int, default=1, help="gradient accumulation (batch 2 x 2 = the live batch 4)")
     p.add_argument("--iters", type=int, default=1500); p.add_argument("--batch", type=int, default=None); p.add_argument("--cap", type=float, default=None)
+    p.add_argument("--mlx-cache", type=float, default=None, help="MLX buffer cache limit in GB (footprint under the cap)")
     p.add_argument("--lr", type=float, default=1e-4); p.add_argument("--scale", type=float, default=20.0)
     p.add_argument("--layers", type=int, default=16, help="last N layers get LoRA (Qwen3.5 has 24)")
     p.add_argument("--attn-only", action="store_true", help="LoRA keys = self_attn q/k/v/o only (Qwen3.5: the 6 full-attention layers with --layers 24)")

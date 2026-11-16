@@ -32,9 +32,13 @@ class Shape(unittest.TestCase):
             self.assertGreaterEqual(m["cap_gb"], m["memory_gb"])
             self.assertTrue(m["repo"].count("/") == 1)
 
-    def test_only_live_has_his_layer_and_the_live_gate(self):
+    def test_only_live_has_the_live_layer_and_gate_others_a_folder_under_layers(self):
         for m in C.load():
-            self.assertEqual(m["layer"], m["id"] == C.LIVE)
+            self.assertEqual(m["layer"] is True, m["id"] == C.LIVE)
+            if isinstance(m["layer"], str):
+                self.assertTrue(m["layer"].startswith(C.LAYERS + "/"), m["id"])
+                self.assertNotIn("adapters", m["layer"])
+                self.assertIsNotNone(C.layer_dir(m, "/data"))
             self.assertEqual(m["gate"] == "live", m["id"] == C.LIVE)
             if m["gate"] != "live":
                 g = json.loads((ROOT / "engine/defaults" / m["gate"]).read_text())
@@ -50,8 +54,15 @@ class Shape(unittest.TestCase):
 class Recommend(unittest.TestCase):
     def test_this_mac_gets_live(self):
         mid, why = C.recommend(C.load(), 24.0, free_gb=10.0, current_gb=2.7)
-        self.assertEqual(mid, C.LIVE)
-        self.assertIn("own layer", why)
+        self.assertEqual(mid, C.LIVE)                              # the 4B with his layer is better but p95 244 > 150
+        self.assertIn("own layer", why); self.assertNotIn("only one", why)
+        self.assertEqual(C.best_quality(C.load()), "qwen3-4b-mine")
+
+    def test_the_4b_with_his_layer_numbers(self):
+        m = C.entry(C.load(), "qwen3-4b-mine")
+        self.assertEqual((m["words_all"], m["kept_per_1k"], m["first_word_pct"], m["p95_ms"]), (0.97, 318, 45.9, 165))
+        self.assertEqual((m["repo"], m["layer"], m["gate"]), (C.entry(C.load(), "qwen3-4b")["repo"], "layers/qwen3-4b",
+                                                             "gates/qwen3-4b-layer.json"))
 
     def test_budget(self):
         self.assertEqual(C.budget_gb(24.0), 6.0)                  # a quarter of 24
@@ -88,7 +99,10 @@ class Recommend(unittest.TestCase):
     def test_marks(self):
         ms = C.load()
         live = C.entry(ms, C.LIVE)
-        self.assertEqual((C.speed_mark(live), C.quality_mark(ms, live)), (3, 3))
+        self.assertEqual((C.speed_mark(live), C.quality_mark(ms, live)), (3, 2))     # 0.91 against 0.97: within 12 %
+        mine = C.entry(ms, "qwen3-4b-mine")
+        self.assertEqual((C.speed_mark(mine), C.quality_mark(ms, mine)), (1, 3))
+        self.assertEqual([m["id"] for m in ms if C.quality_mark(ms, m) == 3], ["qwen3-4b-mine"])   # the one best
         self.assertEqual(C.speed_mark(C.entry(ms, "qwen3-4b")), 1)
         self.assertEqual(C.quality_mark(ms, C.entry(ms, "gemma4-e2b")), 1)
 
@@ -156,6 +170,92 @@ class Downloads(unittest.TestCase):
             fake_snapshot(tmp, m["repo"]); p.code = 0
             self.assertEqual(d.state(m), {"state": "done", "pct": 100})
             self.assertEqual(d.start(m)["state"], "done")             # already here: no process
+
+
+def fake_layer(data, name="layers/mine"):
+    d = Path(data) / name
+    d.mkdir(parents=True)
+    (d / "adapters.safetensors").write_bytes(b"x"); (d / "adapter_config.json").write_text("{}")
+    return d
+
+
+class Layer(unittest.TestCase):
+    """An entry's own layer under data/layers/ (16 November 2026); live keeps the live layer."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.data = self.tmp.name
+        self.mine = {**row("mine", 4.2, 244, 0.97), "layer": "layers/mine", "gate": "gates/mine-layer.json"}
+        self.base = {**row("base", 2.9, 228, 0.87), "repo": self.mine["repo"], "gate": "gates/base.json"}
+
+    def tearDown(self): self.tmp.cleanup()
+
+    def test_live_and_no_layer_unchanged(self):
+        live = row("live", 2.7, 126, 0.91, layer=True)
+        self.assertEqual(C.adapter_for(live, "/data/adapters", self.data), "/data/adapters")
+        self.assertIsNone(C.adapter_for(row("x", 2, 100, 0.8), "/data/adapters", self.data))
+        self.assertEqual(C.gate_name([live], live, True), "live")
+        self.assertTrue(C.has_layer(live, None, self.data))
+
+    def test_an_entry_with_a_layer_gets_it(self):
+        d = fake_layer(self.data)
+        self.assertEqual(C.adapter_for(self.mine, "/data/adapters", self.data), str(d.resolve()))
+        self.assertTrue(C.has_layer(self.mine, None, self.data))
+        self.assertEqual(C.gate_name([self.base, self.mine], self.mine, True), "gates/mine-layer.json")
+
+    def test_a_missing_layer_runs_the_base_with_the_base_gate_and_a_log_line(self):
+        import io, contextlib
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out): got = C.adapter_for(self.mine, "/data/adapters", self.data)
+        self.assertIsNone(got)
+        self.assertIn("model layer: mine has no layer here", out.getvalue())
+        self.assertFalse(C.has_layer(self.mine, None, self.data))
+        self.assertEqual(C.gate_name([self.base, self.mine], self.mine, False), "gates/base.json")
+        self.assertIsNone(C.gate_name([self.mine], self.mine, False))              # no base entry: the shipped default
+        (Path(self.data) / "layers/mine").mkdir(parents=True)                       # a folder without the weights
+        self.assertIsNone(C.adapter_for(self.mine, None, self.data, log=False))
+
+    def test_a_layer_never_leaves_data_layers(self):
+        fake_layer(self.data, "adapters")
+        for bad in ("adapters", "layers/../adapters", "layers", "/etc", "layers/"):
+            self.assertIsNone(C.adapter_for({**self.mine, "layer": bad}, None, self.data, log=False), bad)
+
+    def test_switch_and_back(self):
+        d = fake_layer(self.data)
+        live = row("live", 2.7, 126, 0.91, layer=True); live["repo"] = "org/live"
+        m = StandIn()
+        got, err, _ = C.switch(m, self.mine, live, "/live-layer", rebuild=lambda: None, set_cap=lambda gb: None,
+                               data=self.data, src_for=lambda e: "/snap" if e["id"] != "live" else None)
+        self.assertEqual((got["id"], err), ("mine", None))
+        self.assertIn(f"load org/mine {d.resolve()} /snap", m.log)
+        got, err, _ = C.switch(m, live, live, "/live-layer", rebuild=lambda: None, set_cap=lambda gb: None,
+                               data=self.data, src_for=lambda e: "/snap" if e["id"] != "live" else None)
+        self.assertEqual(m.log[-1], "load org/live /live-layer None")
+
+    def test_switch_with_the_layer_missing_loads_the_base(self):
+        live = row("live", 2.7, 126, 0.91, layer=True); live["repo"] = "org/live"
+        m = StandIn()
+        got, err, _ = C.switch(m, self.mine, live, "/live-layer", rebuild=lambda: None, set_cap=lambda gb: None,
+                               data=self.data, src_for=lambda e: "/snap" if e["id"] != "live" else None)
+        self.assertEqual((got["id"], err, m.log[-1]), ("mine", None, "load org/mine None /snap"))
+
+    def test_server_start_and_gate_use_the_entry_layer(self):
+        # the start path is module code in server.py: the non-live pick loads with its own layer
+        src = (ROOT / "engine/server.py").read_text()
+        self.assertIn("Model(REPO, catalog.adapter_for(_pick, ADAPTER, DATA), strength=strength_setting(), src=", src)
+        self.assertNotIn("Model(REPO, None, strength", src)
+        self.assertIn("catalog.switch(model, target, LIVE_ENTRY, ADAPTER", src)
+        import ast, types
+        path = ROOT / "engine/server.py"
+        nodes = [n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name in ("gate_file", "fitted")]
+        defaults = Path(self.data) / "defaults"; (defaults / "gates").mkdir(parents=True)
+        for f in ("gate.json", "gates/mine-layer.json", "gates/base.json"): (defaults / f).write_text("{}")
+        ns = {"DATA": Path(self.data), "DEFAULTS": defaults, "catalog": C, "CATALOG": [self.base, self.mine],
+              "CURRENT": {"entry": self.mine}, "model": types.SimpleNamespace(adapter="/x")}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), ns)
+        self.assertEqual(ns["gate_file"](), defaults / "gates/mine-layer.json")
+        ns["model"] = types.SimpleNamespace(adapter=None)                      # the layer was missing at load
+        self.assertEqual(ns["gate_file"](), defaults / "gates/base.json")
+        ns["CURRENT"] = {"entry": row("live", 2.7, 126, 0.91, layer=True)}
+        self.assertEqual(ns["gate_file"](), defaults / "gate.json")           # live: data/gate.json, else the default
 
 
 class StandIn:

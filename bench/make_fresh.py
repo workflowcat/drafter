@@ -16,13 +16,14 @@ parser.add_argument("claude_n", nargs="?", type=int, default=60)
 parser.add_argument("beeper_n", nargs="?", type=int, default=40)
 parser.add_argument("--output", type=Path, default=ROOT / "data/replay-fresh.json")
 parser.add_argument("--min-items", type=int, default=50)
+parser.add_argument("--since", type=float, default=None, help="unix seconds: lines after this instead of the last retrain")
 args = parser.parse_args()
 CLAUDE_N, BEEPER_N = args.claude_n, args.beeper_n
 
 
-def since():
+def since(given=None):
     """Only lines newer than the current layer or the last completed comparison."""
-    cut = last_retrain(ROOT)
+    cut = given or last_retrain(ROOT)
     if not cut: raise RuntimeError("No training cutoff: current adapter and retrain stamp are missing")
     return datetime.datetime.fromtimestamp(cut, datetime.timezone.utc)
 
@@ -47,7 +48,7 @@ def publish(items, target, minimum):
     return True
 
 
-cut = since()
+cut = since(args.since)
 rnd = random.Random(31)
 out = []
 try:

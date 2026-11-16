@@ -3,6 +3,8 @@ own trial recording (the big round, held-137, 24 tokens a key), the same fit as 
 model is loaded. Numbers only go out (the weights), as the shipped default gate.
 
     .venv/bin/python -B bench/catalog_gates.py [--root <checkout with data/>] [--out engine/defaults/gates]
+    .venv/bin/python -B bench/catalog_gates.py --rec qwen3-4b-layer=big-q4b-lr5-s10.jsonl --out bench/out/q4b
+        (--rec id=recording, repeatable: fit only these, e.g. a model with his layer; q4b round 2026-11-16)
 
 The live model keeps data/gate.json; these are for the others (engine/catalog.json "gate")."""
 import json, sys
@@ -26,7 +28,8 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     W = ngram.Words(ngram.corpus(last_retrain(ROOT)))
     th = gate.saved_th(ROOT / "data/gate.json")
-    for mid, rec in RECORDINGS.items():
+    recs = dict(a.split("=", 1) for i, a in enumerate(sys.argv) if i and sys.argv[i - 1] == "--rec") or RECORDINGS
+    for mid, rec in recs.items():
         path = ROOT / "data/bench" / rec
         if not path.exists(): print(f"{mid}: no recording {rec}"); continue
         items, rows = ts.load(str(path))

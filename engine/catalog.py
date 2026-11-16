@@ -84,7 +84,9 @@ def recommend(models, total_gb, free_gb=None, current_gb=0.0, speed_scale=1.0, p
         best = max(quick, key=quality)
         why = (f"best words in a row ({best['words_all']:.2f}) of the models that answer in time "
                f"(p95 {round(best['p95_ms'] * speed_scale)} ms, under {p95_limit}) and fit {budget:.1f} GB")
-        if best.get("layer"): why += "; the only one with his own layer"
+        if best.get("layer"):
+            others = [m for m in models if m.get("layer") and m is not best]
+            why += "; with his own layer" if others else "; the only one with his own layer"
         return best["id"], why
     if fits:
         best = min(fits, key=lambda m: m["p95_ms"])
@@ -223,9 +225,48 @@ def start_pick(models, settings, data, env_repo=None, cache=None):
     return pick, "picked"
 
 
-def adapter_for(m, live_adapter):
-    """His layer only for the model it was trained on."""
-    return live_adapter if m.get("layer") else None
+LAYERS = "layers"     # data/layers/<name>: a layer trained for a catalog model other than live (never data/adapters*)
+
+
+def layer_dir(m, data):
+    """The folder of an entry's own layer (`"layer": "layers/<name>"`, under data/layers/ only), or None for live's
+    `true`, no layer, or a path that leaves data/layers/."""
+    lay = m.get("layer")
+    if not isinstance(lay, str) or not lay or data is None: return None
+    root = (Path(data) / LAYERS).resolve()
+    d = (Path(data) / lay).resolve()
+    return d if d != root and root in d.parents else None
+
+
+def adapter_for(m, live_adapter, data=None, log=True):
+    """His layer only for the model it was trained on: `true` = the live layer (data/adapters, DRAFTER_ADAPTER);
+    a string = that folder under data/layers/ when it holds a layer, else None (the model runs as its base, one log
+    line, its base gate: gate_name)."""
+    lay = m.get("layer")
+    if lay is True: return live_adapter
+    d = layer_dir(m, data)
+    if d is not None and (d / "adapters.safetensors").exists() and (d / "adapter_config.json").exists(): return str(d)
+    if lay and log: print(f"model layer: {m['id']} has no layer here, its base model without it", flush=True)
+    return None
+
+
+def has_layer(m, live_adapter, data=None):
+    """For /models: whether this entry runs with his layer on this Mac (the Personal style slider is on for it)."""
+    if m.get("layer") is True: return True
+    return adapter_for(m, live_adapter, data, log=False) is not None
+
+
+def gate_name(models, m, layered):
+    """The gate file an entry uses: its own; an entry whose layer is missing here takes the gate of the catalog entry
+    with the same weights and no layer (fitted on that base), else None (the shipped default gate)."""
+    if layered or not isinstance(m.get("layer"), str): return m.get("gate")
+    base = next((x for x in models if x["repo"] == m["repo"] and not x.get("layer")), None)
+    return base["gate"] if base else None
+
+
+def best_quality(models):
+    """The entry with the best words in a row (then first words, kept letters): the picker marks it."""
+    return max(models, key=quality)["id"] if models else None
 
 
 def switch(model, target, live, live_adapter, *, rebuild, set_cap, data, cache=None, src_for=None, free_gb=None):
@@ -245,7 +286,7 @@ def switch(model, target, live, live_adapter, *, rebuild, set_cap, data, cache=N
             mk.parent.mkdir(parents=True, exist_ok=True); mk.write_text(json.dumps({"id": target["id"], "t": time.time()}))
         model.unload()
         set_cap(target["cap_gb"])
-        model.load_as(target["repo"], adapter_for(target, live_adapter), src)
+        model.load_as(target["repo"], adapter_for(target, live_adapter, data), src)
         rebuild()
         mk.unlink(missing_ok=True)
         return target, None, time.time() - t
@@ -254,7 +295,7 @@ def switch(model, target, live, live_adapter, *, rebuild, set_cap, data, cache=N
         print(f"model switch: {target['id']} failed ({err}), back to live", flush=True)
         model.unload()
         set_cap(live["cap_gb"])
-        model.load_as(live["repo"], adapter_for(live, live_adapter), None)
+        model.load_as(live["repo"], adapter_for(live, live_adapter, data), None)
         rebuild()
         mk.unlink(missing_ok=True)
         return live, err, time.time() - t

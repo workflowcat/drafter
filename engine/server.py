@@ -125,8 +125,11 @@ def gate_file():
     another catalog model its own fit (engine/defaults/gates/, bench/catalog_gates.py), else the shipped default."""
     e = globals().get("CURRENT", {}).get("entry")
     if e is None or e.get("gate", "live") == "live": return fitted("gate.json")
-    p = DEFAULTS / e["gate"]
-    return p if p.exists() else DEFAULTS / "gate.json"
+    m = globals().get("model")
+    name = catalog.gate_name(globals().get("CATALOG", []), e, bool(getattr(m, "adapter", None)) if m is not None else True)
+    if name == "live": return fitted("gate.json")
+    p = DEFAULTS / name if name else None
+    return p if p is not None and p.exists() else DEFAULTS / "gate.json"
 
 
 def gate():
@@ -212,7 +215,8 @@ def strength_setting(st=None):
 
 
 # Model catalog (2026-11-15, engine/catalog.py): the model he picked in Settings > Typing > Model (settings
-# "typingModel"), when its weights are here; DRAFTER_MODEL (benches) wins; else live. His layer only on live.
+# "typingModel"), when its weights are here; DRAFTER_MODEL (benches) wins; else live. His layer: live's data/adapters,
+# or an entry's own folder under data/layers/ (catalog.adapter_for; 16 November 2026), merged at Personal style.
 CATALOG = catalog.load()
 LIVE_ENTRY = catalog.entry(CATALOG, catalog.LIVE)
 try: _st0 = json.loads((DATA / "settings.json").read_text())
@@ -225,7 +229,7 @@ if _pick is not None and _pick["id"] != catalog.LIVE:
     catalog.marker_path(DATA).parent.mkdir(parents=True, exist_ok=True)
     catalog.marker_path(DATA).write_text(json.dumps({"id": _pick["id"]}))   # the guard may stop this load: next start is live
     try:
-        model = Model(REPO, None, strength=strength_setting(), src=str(catalog.local_path(_pick)))
+        model = Model(REPO, catalog.adapter_for(_pick, ADAPTER, DATA), strength=strength_setting(), src=str(catalog.local_path(_pick)))
     except Exception as e:
         print(f"drafter engine: {_pick['id']} did not load ({type(e).__name__}), live instead", flush=True)
         REPO, CURRENT["entry"] = LIVE_ENTRY["repo"], LIVE_ENTRY
@@ -233,7 +237,7 @@ if _pick is not None and _pick["id"] != catalog.LIVE:
         model = Model(REPO, ADAPTER, strength=strength_setting())
     catalog.marker_path(DATA).unlink(missing_ok=True)
 else:
-    model = Model(REPO, catalog.adapter_for(_pick, ADAPTER) if _pick else ADAPTER, strength=strength_setting())
+    model = Model(REPO, catalog.adapter_for(_pick, ADAPTER, DATA) if _pick else ADAPTER, strength=strength_setting())
 builder = Builder(model, FMT)
 model.warm(builder.head_ids)
 model.pieces()
@@ -1003,9 +1007,11 @@ def models_view():
     rows = []
     for m in CATALOG:
         d = DOWNLOADS.state(m)
-        rows.append({**m, "downloaded": d["state"] == "done", "download": d, "speed": catalog.speed_mark(m),
-                     "quality": catalog.quality_mark(CATALOG, m)})
+        # "layer" goes out as true/false (the app reads a bool): his layer is here for this model
+        rows.append({**m, "layer": catalog.has_layer(m, ADAPTER, DATA), "downloaded": d["state"] == "done", "download": d,
+                     "speed": catalog.speed_mark(m), "quality": catalog.quality_mark(CATALOG, m)})
     return {"models": rows, "current": cur["id"] if cur else None, "recommended": rec, "why": why,
+            "best_quality": catalog.best_quality(CATALOG),
             "machine": {**mac, "budget_gb": catalog.budget_gb(mac["total_gb"], mac["free_gb"], cur_gb)},
             "switching": SWITCH["busy"] or model.loading}
 

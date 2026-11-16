@@ -3,7 +3,7 @@
     .venv/bin/python -B bench/weights/guarded.py <cap GB> <script.py | -m module> [args ...]
 The guard exits the process when its footprint stays over the cap for 2 s or ever passes cap + 0.5 GB (the Mac froze
 on 2026-10-06 during a local model run)."""
-import atexit, runpy, sys
+import atexit, os, runpy, sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -12,6 +12,9 @@ import guard
 
 cap, target, rest = float(sys.argv[1]), sys.argv[2], sys.argv[3:]
 guard.start(cap)
+if os.environ.get("DRAFTER_MLX_CACHE_GB"):   # smaller MLX buffer cache: keeps the footprint under the cap (Qwen3.5 training)
+    import mlx.core as _mx
+    _mx.set_cache_limit(int(float(os.environ["DRAFTER_MLX_CACHE_GB"]) * 2**30))
 
 
 @atexit.register
