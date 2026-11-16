@@ -32,20 +32,27 @@ enum Proof {
     static func schedule(_ s: Spot, seq mine: Int) {
         timer?.invalidate()
         let st = Drafter.shared.settings
-        guard st.claudeTyping, st.proofread, !IsSecureEventInputEnabled(), !st.proofreadOff.contains(kind(s)) else { return }
+        guard st.claudeTyping, st.proofread || st.sentenceProof, !IsSecureEventInputEnabled(), !st.proofreadOff.contains(kind(s)) else { return }
         let text = span(s.before)
+        // the cloud sentence pass (setting sentenceProof, engine/sentence.py): at a sentence end, or a rest after 6+
+        // words, only the last sentence goes out (no screen text); the rest of this path (chip, Tab) is the proofread's
+        let sent = st.sentenceProof ? GhostRules.sentenceWait(text) : nil
+        guard sent != nil || st.proofread else { return }
         // web fields are edited by text markers from the caret, so the text must be the whole field before it
-        guard text.split(whereSeparator: { $0 == " " || $0 == "\n" }).count >= 4, text != checked,
+        guard text.split(whereSeparator: { $0 == " " || $0 == "\n" }).count >= (sent != nil ? 3 : 4), text != checked,
               !s.viaMarkers || text == s.before else { return }
-        timer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { _ in
+        let path = sent != nil ? "/sentence" : "/proofread"
+        timer = Timer.scheduledTimer(withTimeInterval: sent?.wait ?? delay, repeats: false) { _ in
             let k = Keys.shared, g = Ghost.shared
             // only when nothing else is offered: a chip, or local words he may still take (Claude's guess may go)
             guard mine == k.seq, Talk.shared.state == .idle, g.action == nil, !g.visible || k.stat?.src == "claude" else { return }
             checked = text
             let t0 = Date()
-            Engine.shared.post("/proofread", ["text": text, "app": s.app.localizedName ?? ""], timeout: 10) { j in
+            let body: [String: Any] = sent.map { ["text": text, "app": s.app.localizedName ?? "", "rested": $0.rested] }
+                ?? ["text": text, "app": s.app.localizedName ?? "", "kb": KeyLayout.language, "context": k.screenText(s.el)]
+            Engine.shared.post(path, body, timeout: 10) { j in
                 let edits = j?["edits"] as? [[String: Any]] ?? []
-                log("proofread \(s.app.bundleIdentifier ?? "?") \(Int(Date().timeIntervalSince(t0) * 1000))ms engine \(j?["ms"] as? Int ?? 0)ms \(edits.count) fixes" + (j?["cached"] as? Bool == true ? " cached" : ""))
+                log("proofread \(s.app.bundleIdentifier ?? "?") \(Int(Date().timeIntervalSince(t0) * 1000))ms engine \(j?["ms"] as? Int ?? 0)ms \(edits.count) fixes" + (j?["cached"] as? Bool == true ? " cached" : "") + (path == "/sentence" ? " sentence " + (j?["model"] as? String ?? "") : ""))
                 guard !edits.isEmpty, mine == k.seq, Ghost.shared.action == nil,
                       let now = Focus.spot(skip: Drafter.shared.settings.skip).0, let r = now.rect,
                       CFEqual(now.el, s.el), now.app.processIdentifier == s.app.processIdentifier, now.before == s.before else { return }

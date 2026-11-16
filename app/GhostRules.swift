@@ -27,6 +27,36 @@ enum GhostRules {
         revNow != revAsked && norm(now) == norm(asked)
     }
 
+    /// Idle ghost (step 7): may the local model draft his next message here, with the caret resting? Only with the
+    /// switch on, in a chat or AI box (AppKind via Keys.boxKind), never in a skipped app, a password field, under
+    /// secure input or mid-line, and only in an empty box, after a finished sentence and a space, or on a new line
+    /// (engine gatecore.idle_spot).
+    static func idleAllowed(on: Bool, secure: Bool, password: Bool, skipped: Bool, chatBox: Bool, mid: Bool, before: String) -> Bool {
+        guard on, !secure, !password, !skipped, chatBox, !mid else { return false }
+        if before.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+        if before.hasSuffix("\n") { return true }
+        guard let last = before.last, last == " " else { return false }
+        var t = Substring(before.dropLast())
+        while let c = t.last, c == " " { t = t.dropLast() }
+        while let c = t.last, "\"'»”)".contains(c) { t = t.dropLast() }
+        return t.last.map { ".!?…".contains($0) } ?? false
+    }
+    /// How long the caret rests before the idle ghost is asked (bench: live key gaps, docs/rounds/2026-11-16-earlier.md).
+    static let idleDelay = 0.6
+    /// The idle request: the local model only (no Claude early lane, no kept-in-flight answer).
+    static func idleBody(_ base: [String: Any]) -> [String: Any] {
+        var b = base
+        b["idle"] = true; b["early"] = false; b["keep_on"] = nil; b["mid"] = nil
+        return b
+    }
+
+    /// An answer asked at an older key than the grey text on screen never replaces it (Codex review 2026-11-16: an
+    /// answer kept running while he typed, step 2 `keepTyping`, may come back after a newer one was drawn).
+    static func olderThanShown(askedRev: Int?, shownRev: Int?, visible: Bool) -> Bool {
+        guard visible, let a = askedRev, let s = shownRev else { return false }
+        return a < s
+    }
+
     /// Tab's word, read when the key came, is still what the ghost shows when the main queue gets to it: the ghost
     /// was not hidden meanwhile and a second fast Tab does not put the same word in twice (Argon 12).
     static func tabStillValid(visible: Bool, shown: String, isDraft: Bool, given: String) -> Bool {
@@ -60,6 +90,50 @@ enum GhostRules {
     /// Setting `ghostLength`: "word" (round five's short ghost), "phrase", "sentence" (default). Anything else reads as
     /// the default.
     static func lengthMode(_ s: String) -> String { ["word", "phrase", "sentence"].contains(s) ? s : "sentence" }
+
+    /// The shortest ghost shown (earlier round step 2): `minGhostShort` while `shortGhosts` is on, else `minGhost`.
+    static func minLetters(minGhost: Int, short: Bool, minShort: Int) -> Int { max(0, short ? minShort : minGhost) }
+
+    /// The cloud sentence pass (earlier round step 5, setting `sentenceProof`): how long to wait before the last
+    /// sentence goes out. A sentence end (. ! ? … then maybe quotes and spaces) after 3+ words: at once (0.15 s, a quick
+    /// next key cancels). No end but 6+ words since the last end or line: after a 1.2 s rest. Else nil. The engine
+    /// cuts the same sentence (engine/sentence.py last).
+    static func sentenceWait(_ text: String) -> (wait: Double, rested: Bool)? {
+        let t = text.replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression)
+        let ends = Set<Character>(".!?…"), closers = Set<Character>("\"'»”)")
+        var body = Substring(t)
+        while let c = body.last, closers.contains(c) { body = body.dropLast() }
+        let ended = body.last.map { ends.contains($0) } ?? false
+        while let c = body.last, ends.contains(c) { body = body.dropLast() }
+        var start = body.startIndex
+        if let nl = body.lastIndex(of: "\n") { start = body.index(after: nl) }
+        var i = body.endIndex
+        while i > start {
+            let j = body.index(before: i)
+            if ends.contains(body[j]), i < body.endIndex, body[i].isWhitespace || closers.contains(body[i]) { start = i; break }
+            i = j
+        }
+        let words = body[start...].split(whereSeparator: { $0.isWhitespace }).count
+        if ended { return words >= 3 ? (0.15, false) : nil }
+        return words >= 6 ? (1.2, true) : nil
+    }
+
+    /// Earlier round (2026-11-16): what the request says about length and the lower gate. Outside "word" length (and
+    /// outside Zoom, which stays strict) `words` sends the 3-5 words run ("length": "words", words_min, words_max);
+    /// else the run of `mode` as before. `guess` asks for the lower gate's guesses, `shade` for them drawn lighter.
+    /// `early` (setting earlyStart, step 6): the guesses' bar one notch lower, lower still after a space (engine
+    /// gatecore.early_bar); only with `guess`.
+    static func runBody(mode: String, words: Bool, minWords: Int, maxWords: Int, guess: Bool, shade: Bool, strict: Bool, early: Bool = false) -> [String: Any]? {
+        let m = lengthMode(mode)
+        guard m != "word", !strict else { return nil }
+        var b: [String: Any] = ["length": m, "floor": 0.1, "cap": 24]
+        if words {
+            let lo = min(5, max(1, minWords))
+            b["length"] = "words"; b["words_min"] = lo; b["words_max"] = min(8, max(lo, maxWords))
+        }
+        if guess { b["guess"] = true; b["guess_shade"] = shade; if early { b["early_start"] = true } }
+        return b
+    }
 
     /// ⌃Tab: the ghost up to the end of its first sentence (. ! ? … with closing quotes and the space after), or all of
     /// it when it has no sentence end. ⇧Tab still takes all of it, which after a roll can run past the sentence.

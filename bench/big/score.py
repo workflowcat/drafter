@@ -5,6 +5,8 @@ model text only (no phrase memory, no word finisher), so the models compare and 
     .venv/bin/python -B bench/big/score.py data/bench/<base>.jsonl data/bench/<other>.jsonl ... [--out data/bench/big/x.json]
 
 The first recording is the baseline for the paired 95 % intervals (whole lines resampled together).
+The default historical-big preserves this table. --policy-mode current-2026-11-16 changes the replay's
+request flags only; gates remain out-of-fold, and static replay cannot exercise keep-in-flight.
 Per app kind (claude = AI apps, beeper = chats) and language:
   first right %   at every key: the model's first word is his next word (no gate)
   run all         at every key: words right in a row from the caret (mean, p50, p90, 3+ %, 5+ %), as Tab, Tab, Tab
@@ -23,7 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent.parent
 for p in (ROOT / "bench", ROOT / "engine"):
     if str(p) not in sys.path: sys.path.insert(0, str(p))
-import gatecore, measure
+import gatecore, measure, request_policy
 
 END = re.compile(r"[.!?…)\n]")
 TH = 0.4
@@ -66,15 +68,21 @@ def first_ok(row, text, pos):
 
 
 class Sentence:
-    """The engine's sentence-mode model path with this recording's own gate (out-of-fold P >= TH)."""
+    """Recorded model path: historical sentence mode by default, or the dated current request mode."""
 
-    def __init__(self, P, cap=24, floor=gatecore.RUN_FLOOR):
+    def __init__(self, P, cap=24, floor=gatecore.RUN_FLOOR, policy_mode=request_policy.BIG):
+        self.request_policy = request_policy.build(policy_mode)
+        self.run = self.request_policy.run_kwargs()
+        self.run.pop("cap")
+        self.run["floor"] = floor
+        if "max_words" in self.run: self.run["words"] = self.run.pop("max_words")
         self.P, self.cap, self.floor, self.info = P, cap, floor, None
 
     def __call__(self, row, before, src):
         self.info = None
         p = self.P.get(row.get("_key"))
-        if p is None or p < TH: return "", 0
+        bar = self.request_policy.guess_bar
+        if p is None or p < (TH if bar is None else min(TH, bar)): return "", 0
         consumed, count, decided = [], 0, False
         for tok in row["toks"]:
             consumed.append(tok)
@@ -82,14 +90,14 @@ class Sentence:
             count += 1
             if not decided and (gatecore.word_done(tok[0]) or END.search(tok[0])): decided = True
             if decided:
-                _, _, why, _ = gatecore.run_words(consumed, "sentence", self.floor, min_letters=5)
+                _, _, why, _ = gatecore.run_words(consumed, **self.run)
                 if gatecore.run_settled(why): break
             if count >= self.cap: break
         if not consumed or not consumed[-1][0]: return "", 0
         closed = "eos" if len(consumed) == len(row["toks"]) and ended_by_model(row) else ("cap" if count >= self.cap or len(consumed) == len(row["toks"]) else None)
-        text, sure, why, confs = gatecore.run_words(consumed, "sentence", self.floor, closed=closed, min_letters=5)
+        text, sure, why, confs = gatecore.run_words(consumed, closed=closed, **self.run)
         out = measure.clean(before, text)
-        if out and gatecore.letters(out) < 5: return "", 0
+        if out and gatecore.letters(out) < self.run["min_letters"]: return "", 0
         d = decision(consumed)
         self.info = {"first_ms": consumed[d][3], "full_ms": consumed[-1][3], "src": "model"}
         return out, consumed[-1][3]
@@ -146,11 +154,11 @@ def boot(a_lines, b_lines, fn, n=1000, seed=7):
     return round(vals[int(.025 * n)], 3), round(vals[int(.975 * n)], 3)
 
 
-def score_one(rec):
+def score_one(rec, policy_mode=request_policy.BIG):
     import gate
     items, rows, P = oof(rec)
     lines = per_line(items, rows, P)
-    pol = Sentence(P)
+    pol = Sentence(P, policy_mode=policy_mode)
     res, per = measure.replay(items, rows, pol)
     out = {"rec": Path(rec).name, "groups": {}}
     for key in ("all", "claude", "beeper", "claude/en", "claude/uk", "beeper/uk"):
@@ -178,11 +186,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("recs", nargs="+")
     ap.add_argument("--out", default=None)
+    request_policy.add_argument(ap, request_policy.BIG)
     a = ap.parse_args()
     base = None
     table = []
     for rec in a.recs:
-        s, items, lines, per = score_one(rec)
+        s, items, lines, per = score_one(rec, a.policy_mode)
         if base is None: base = (items, lines, per)
         else:
             bi, bl, bp = base

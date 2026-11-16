@@ -39,6 +39,10 @@ struct Settings: Codable {
     var claudeTyping = false   // on a pause Claude writes the rest of the sentence with today's context (his signed-in claude CLI)
     var claudeModel = "sonnet" // sonnet or haiku (haiku answers ~0.5 s sooner)
     var proofread = false      // at a 1.2 s rest Claude proofreads the message; a "Fix N" chip, Tab puts the fixes in (app/Proof.swift)
+    /// Earlier round step 5 (an experiment, 2026-11-16): when he ends a sentence (. ! ? …) or rests after 6+ words, that
+    /// sentence alone goes to the cloud for minimal edits (Haiku races Workers AI, engine/sentence.py); the same "Fix N"
+    /// chip as the proofread, Tab puts the fixes in. Under claudeTyping, off by default.
+    var sentenceProof = false
     var proofreadOff: [String] = ["ai"] // app kinds (AppKind: ai, chat, mail, other) where proofread stays quiet: a prompt to an AI needs no clean spelling
     var rework = false         // ⌥Tab on a selection: shorter, fix, clearer, warmer, formal, list, translate or his own words (app/Rework.swift)
     var fixWord = true         // the word being typed is no word he writes but one is a letter or a layout away: "→ word" at the caret, Tab swaps it (app/Fixer.swift)
@@ -59,6 +63,27 @@ struct Settings: Codable {
     /// How far a ghost runs after the gate's first word (long round, 14 November 2026): "word" (round five's few words),
     /// "phrase" (to a comma, 6 words), "sentence" (to the sentence end while the running chance holds; default).
     var ghostLength = "sentence"
+    /// Earlier round (2026-11-16, Andrii: "lets do 3-5 words and lessen the confidence"): outside "word" length the
+    /// ghost shows at least `ghostMinWords` words when the model has them and at most `ghostMaxWords`; only a sentence
+    /// end or a line break ends it sooner (engine gatecore "words" run). Off = `ghostLength` as before.
+    var ghostWords = true
+    var ghostMinWords = 3, ghostMaxWords = 5
+    /// The lower gate (earlier round): a first word the gate scores a little under its bar still shows, as a guess;
+    /// `guessShade` draws the whole guess lighter. Tab takes either. The bar per model is in engine/server.py GUESS.
+    var guessGhosts = true
+    var guessShade = true
+    /// Earlier round step 2: ghosts of `minGhostShort` letters or more (in place of `minGhost`, which his settings
+    /// file holds at 5), and a request still running when he types a few more letters runs on (engine keep_on).
+    /// Earlier round step 6: the guesses' bar one notch lower (0.25) and lower still right after a space (0.2),
+    /// engine gatecore.early_bar. Only with guessGhosts.
+    var earlyStart = true
+    /// Step 7, the idle ghost (Andrii: "start predicting and suggesting the next message even when the cursor is just
+    /// blinking"): the caret rests in a chat or AI box, empty or after a finished sentence, and the local model drafts
+    /// his next message from the screen above the field and his earlier lines there. Nothing leaves the Mac.
+    var idleGhost = true
+    var shortGhosts = true
+    var minGhostShort = 3
+    var keepTyping = true
     var claudePause = false    // Claude's rest of the sentence on a typing pause (under claudeTyping); round two proposes off
     var facts = false          // a question on screen that his calendar or saved texts answer: the answer as a chip (app/Facts.swift)
     var callOff: [String] = ["notion.id"]   // call apps that never get a record offer (Notion: its own meeting notes hold the mic)
@@ -118,7 +143,7 @@ struct Settings: Codable {
         typoEngine = pick(.typoEngine, ["system"], "ranked")
         layoutFix = v(.layoutFix, z.layoutFix); autocorrectUk = v(.autocorrectUk, z.autocorrectUk)
         claudeTyping = v(.claudeTyping, z.claudeTyping); claudeModel = v(.claudeModel, z.claudeModel)
-        proofread = v(.proofread, z.proofread); proofreadOff = v(.proofreadOff, z.proofreadOff)
+        proofread = v(.proofread, z.proofread); sentenceProof = v(.sentenceProof, z.sentenceProof); proofreadOff = v(.proofreadOff, z.proofreadOff)
         clipContext = v(.clipContext, z.clipContext); writingNote = v(.writingNote, z.writingNote); appNotes = v(.appNotes, z.appNotes)
         personalStrength = min(100, max(0, v(.personalStrength, z.personalStrength))); alternatives = v(.alternatives, z.alternatives)
         typingModel = v(.typingModel, z.typingModel)
@@ -126,6 +151,9 @@ struct Settings: Codable {
         predictKeys = v(.predictKeys, z.predictKeys); streamGhost = v(.streamGhost, z.streamGhost)
         longGhostsAI = v(.longGhostsAI, z.longGhostsAI); longGhostsChats = v(.longGhostsChats, z.longGhostsChats)
         ghostLength = pick(.ghostLength, ["word", "phrase"], "sentence")   // same rule as GhostRules.lengthMode; kept here so Settings decodes alone
+        shortGhosts = v(.shortGhosts, z.shortGhosts); minGhostShort = max(0, v(.minGhostShort, z.minGhostShort)); keepTyping = v(.keepTyping, z.keepTyping)
+        ghostWords = v(.ghostWords, z.ghostWords); guessGhosts = v(.guessGhosts, z.guessGhosts); guessShade = v(.guessShade, z.guessShade); earlyStart = v(.earlyStart, z.earlyStart); idleGhost = v(.idleGhost, z.idleGhost)
+        ghostMinWords = min(5, max(1, v(.ghostMinWords, z.ghostMinWords))); ghostMaxWords = min(8, max(ghostMinWords, v(.ghostMaxWords, z.ghostMaxWords)))
         claudePause = v(.claudePause, z.claudePause); translate = v(.translate, z.translate)
         fixWord = v(.fixWord, z.fixWord); rework = v(.rework, z.rework)
         callOff = v(.callOff, z.callOff); calendarsOff = v(.calendarsOff, z.calendarsOff)
@@ -159,8 +187,8 @@ struct Settings: Codable {
     /// Claude switches (engine/cloud.py) are off for a new install since 2026-11-14. Once, before decoding, a file
     /// written earlier gets today's effective value (on) of each one it does not name, and the mark; cloud.migrate()
     /// in the engine does the same, whichever runs first.
-    static let cloudKeys = ["claudeTyping", "claudePause", "proofread", "facts", "translate", "rework", "nextMessage", "callNotes", "entityClassify"]
-    static let neverOn: Set<String> = ["entityClassify"]   // new that day, never on before: stays off (engine/cloud.py NEVER_ON)
+    static let cloudKeys = ["claudeTyping", "claudePause", "proofread", "facts", "translate", "rework", "nextMessage", "callNotes", "entityClassify", "sentenceProof"]
+    static let neverOn: Set<String> = ["entityClassify", "sentenceProof"]   // new that day, never on before: stays off (engine/cloud.py NEVER_ON)
     var cloudDefaults = "off"
     /// "Connect a model" (app/Connect.swift, engine/provider.py): which way is connected, never a key. Empty = local only.
     struct Connection: Codable, Equatable {

@@ -39,8 +39,10 @@ final class Keys {
     // (engine/gatecore.py run_words). "word" keeps round five's rule below. Zoom stays strict.
     static func length(_ id: String) -> [String: Any] {
         let st = Drafter.shared.settings
-        let mode = GhostRules.lengthMode(st.ghostLength)
-        if mode != "word", id != "us.zoom.xos" { return ["length": mode, "floor": 0.1, "cap": 24] }
+        // earlier round (2026-11-16): 3-5 words (ghostWords) and the lower gate's lighter guesses (guessGhosts, guessShade)
+        if let run = GhostRules.runBody(mode: st.ghostLength, words: st.ghostWords, minWords: st.ghostMinWords, maxWords: st.ghostMaxWords,
+                                        guess: st.guessGhosts, shade: st.guessShade, strict: id == "us.zoom.xos",
+                                        early: st.earlyStart) { return run }
         let tail: [String: Any] = ["tail": 0.3, "tail_words": 8]
         if aiApps.contains(id) { return ["max_words": 3, "soft": 0.25, "soft_from": 1].merging(st.longGhostsAI ? tail : [:]) { a, _ in a } }
         if id == "us.zoom.xos" { return ["max_words": 3] }
@@ -48,7 +50,10 @@ final class Keys {
     }
     /// Fewer letters than this and a ghost is not shown (2026-11-13: he took one under 5 letters 3% of the time, and
     /// typed 79% of them by hand). Setting `minGhost` (data/settings.json, 0 = all).
-    static var minLetters: Int { max(0, Drafter.shared.settings.minGhost) }
+    static var minLetters: Int {
+        let st = Drafter.shared.settings
+        return GhostRules.minLetters(minGhost: st.minGhost, short: st.shortGhosts, minShort: st.minGhostShort)
+    }
     static func letters(_ s: String) -> Int { s.reduce(0) { $1.isWhitespace ? $0 : $0 + 1 } }
     /// keyDown events only (a Shift press does not count) and when the last one came: key-to-ghost in the log
     var keyRevision = 0
@@ -446,7 +451,7 @@ final class Keys {
         guard Drafter.shared.active, let s = Focus.spot(skip: Drafter.shared.settings.skip).0 else { emptyChat = false; return }
         let kind = Keys.boxKind(s)
         emptyChat = kind != nil; emptyAI = kind ?? false
-        if emptyChat { autoDraft() }
+        if emptyChat { scheduleIdle(s, before: s.before, ctx: contextFor(s), mine: seq); autoDraft() }
     }
 
     /// An empty box: after a short pause his likely next message shows by itself. In an AI app it waits until the
@@ -455,7 +460,8 @@ final class Keys {
         guard Drafter.shared.settings.nextMessage, Talk.shared.state == .idle else { return }
         draftSeq += 1; let mine = draftSeq
         DispatchQueue.main.asyncAfter(deadline: .now() + (tries == 0 ? 0.8 : 2.5)) {
-            guard mine == self.draftSeq, !Ghost.shared.visible, let s = Focus.spot(skip: Drafter.shared.settings.skip).0,
+            // the local idle ghost may be up: Claude's draft (nextMessage on) still replaces it, as before step 7
+            guard mine == self.draftSeq, !Ghost.shared.visible || self.idleShown, let s = Focus.spot(skip: Drafter.shared.settings.skip).0,
                   let ai = Keys.boxKind(s), !KeyHooks.paused(s) else { return }
             let el = s.el, pid = s.app.processIdentifier, rect = s.rect ?? Focus.fieldStart(s.el)
             self.contextQueue.async {
@@ -560,7 +566,7 @@ final class Keys {
               let s = Focus.spot(skip: Drafter.shared.settings.skip).0 else { emptyChat = false; return }
         let kind = Keys.boxKind(s)
         emptyChat = kind != nil; emptyAI = kind ?? false
-        if emptyChat { autoDraft() }
+        if emptyChat { scheduleIdle(s, before: s.before, ctx: contextFor(s), mine: seq); autoDraft() }
         lastRead = (s, keyRevision, Date())   // round five: the first key in this field is asked for at once
         let el = s.el, pid = s.app.processIdentifier, rect = s.rect, key = Keys.screenKey(s)
         let warm = { (t: String) in
@@ -613,6 +619,7 @@ final class Keys {
     var chipTimer: Timer?
     var pauseTimer: Timer?
     var shownSeq = 0
+    var shownRev: Int?       // keyRevision the grey text on screen was asked at (GhostRules.olderThanShown)
 
     /// After 0.6 s without a key: is the line a task (event, reminder, draft…)? Asked apart from suggestions, so a chip
     /// read (0.3-1 s) never holds up the next suggestion; any key stops it in the engine too.
@@ -636,13 +643,32 @@ final class Keys {
     func cancel() {
         PeopleCards.clear(); EntityCard.shared.hide()
         endStat()
-        timer?.invalidate(); chipTimer?.invalidate(); pauseTimer?.invalidate(); Proof.cancel(); Facts.cancel(); Translate.cancel(); seq += 1
+        timer?.invalidate(); chipTimer?.invalidate(); pauseTimer?.invalidate(); idleTimer?.invalidate(); Proof.cancel(); Facts.cancel(); Translate.cancel(); seq += 1
         ghostAsk = nil; futureList = []; ideaList = []; ideaIndex = 0
         if Ghost.shared.visible { Ghost.shared.hide() }
     }
 
+    var idleTimer: Timer?
+    var idleShown = false     // the grey text on screen is an idle ghost (Claude's draft may replace it)
+
+    /// Step 7, the idle ghost: after GhostRules.idleDelay with no key, in a chat or AI box that is empty or ends a
+    /// sentence, the local model drafts his next message (one request per rest; any key cancels it). Focus.spot gives
+    /// no spot in skipped apps and password fields; secure input is checked again when the timer fires.
+    func scheduleIdle(_ s: Spot, before: String, ctx: String, mine: Int) {
+        idleTimer?.invalidate()
+        let st = Drafter.shared.settings
+        guard GhostRules.idleAllowed(on: st.idleGhost, secure: IsSecureEventInputEnabled(), password: false, skipped: false,
+                                     chatBox: Keys.boxKind(s) != nil, mid: s.mid, before: before) else { return }
+        idleTimer = Timer.scheduledTimer(withTimeInterval: GhostRules.idleDelay, repeats: false) { _ in
+            guard mine == self.seq, Talk.shared.state == .idle, !Ghost.shared.visible, Engine.shared.ready, !IsSecureEventInputEnabled(),
+                  let now = Focus.spot(skip: Drafter.shared.settings.skip).0, CFEqual(now.el, s.el), now.before == before,
+                  !KeyHooks.paused(now), let r = now.rect ?? Focus.fieldStart(now.el) else { return }
+            self.complete(now, before: before, ctx: ctx, mine: mine, rect: r, t0: Date(), idle: true)
+        }
+    }
+
     func schedule() {
-        timer?.invalidate(); pauseTimer?.invalidate()
+        timer?.invalidate(); pauseTimer?.invalidate(); idleTimer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: debounce, repeats: false) { _ in self.ask() }
     }
 
@@ -699,6 +725,7 @@ final class Keys {
         lastBefore = before; lastApp = s.app.localizedName ?? ""; lastTest = s.value.contains("⟦drafter-test⟧")
         if draftOpen, draftStart == nil { draftStart = String(before.dropLast(draftKeys)) }   // no read just before his first key
         let ctx = contextFor(s)
+        scheduleIdle(s, before: before, ctx: ctx, mine: mine)   // step 7: a rest after a finished sentence
         guard before.trimmingCharacters(in: .whitespacesAndNewlines).count >= 2 else { return }
         let t0 = Date()
         scheduleChip()
@@ -806,9 +833,9 @@ final class Keys {
     }
 
     /// One local suggestion for `before` (engine /complete) and what to do with the answer.
-    func complete(_ s: Spot, before: String, ctx: String, mine: Int, rect: CGRect, t0: Date, predicted isPrediction: Bool = false, ax: Int? = nil) {
+    func complete(_ s: Spot, before: String, ctx: String, mine: Int, rect: CGRect, t0: Date, predicted isPrediction: Bool = false, ax: Int? = nil, idle: Bool = false) {
         let keyAt = self.keyAt, rev = self.keyRevision
-        let body = requestBody(s, before: before, ctx: ctx)
+        let body = idle ? GhostRules.idleBody(requestBody(s, before: before, ctx: ctx)) : requestBody(s, before: before, ctx: ctx)
         let reply = { (j: [String: Any]?, final: Bool) in
             self.answer(j, s, before: before, ctx: ctx, mine: mine, rect: rect, t0: t0, keyAt: keyAt, predicted: isPrediction, tries: 0, ax: ax, final: final, rev: rev)
         }
@@ -823,15 +850,23 @@ final class Keys {
 
     /// The /complete body for `before`. The rolling ghost and /futures send the very same fields, so the engine finds
     /// the answers it prepared for them (engine/server.py ahead_key).
+    /// The text above this field read last (its chat), for the engine to find who the chat is with; "" when the cached
+    /// text belongs to another field. Only the engine reads it (engine/whom.py); proofread and rework do not send it on.
+    func screenText(_ el: AXUIElement) -> String {
+        guard let c = context, CFEqual(c.el, el) else { return "" }
+        return String(c.text.suffix(1500))
+    }
+
     func requestBody(_ s: Spot, before: String, ctx: String) -> [String: Any] {
         // the same 4000 characters as a pause sends, so an early Claude answer (engine, at a word end) matches it later
         var body: [String: Any] = ["before": String(before.suffix(4000)), "app": s.app.localizedName ?? "", "title": s.title,
                                          "context": ctx, "context_fresh": !contextBusy && (context.map { CFEqual($0.el, s.el) } ?? false), "max_tokens": Keys.tokens, "chips": false, "fix": Drafter.shared.settings.fixWord,
                                          "min_letters": Keys.minLetters,
-                                         "early": Drafter.shared.settings.claudeTyping && Drafter.shared.settings.claudePause && !IsSecureEventInputEnabled(), "after": Keys.after(s), "field": fieldGen].merging(Keys.length(s.app.bundleIdentifier ?? "")) { a, _ in a }
+                                         "early": Drafter.shared.settings.claudeTyping && Drafter.shared.settings.claudePause && !IsSecureEventInputEnabled(), "after": Keys.after(s), "field": fieldGen, "kb": KeyLayout.language].merging(Keys.length(s.app.bundleIdentifier ?? "")) { a, _ in a }
         // parity round: the fresh copy and his writing instructions for this app (sent only when there are some, so the
         // prompt and the engine's look-ahead keys stay as before without them)
         if let clip = Clip.forPrompt(before) { body["clip"] = clip }
+        if Drafter.shared.settings.keepTyping { body["keep_on"] = true }   // earlier round: an older ask runs on (engine keep_running)
         let st = Drafter.shared.settings, notes = WritingNotes.forApp(s.app.bundleIdentifier ?? "", global: st.writingNote, perApp: st.appNotes)
         if !notes.isEmpty { body["notes"] = notes }
         // mid-line (setting midLine): the rest of the caret's line first, at most two lines more; the engine fills the
@@ -863,6 +898,7 @@ final class Keys {
             }
         }
         guard !text.isEmpty || action != nil else { settle(); return }
+        if action == nil, GhostRules.olderThanShown(askedRev: rev, shownRev: shownRev, visible: Ghost.shared.visible && Ghost.shared.action == nil && !Ghost.shared.text.isEmpty) { settle(); return }
         let tAX = Date()
         let (now, _) = Focus.spot(skip: Drafter.shared.settings.skip, midLine: Keys.midLine)
         let ax2 = Int(Date().timeIntervalSince(tAX) * 1000)
@@ -921,6 +957,8 @@ final class Keys {
         painted = action == nil ? (mine, raw, raw.count - text.count, text) : nil
         let unsure = (j["unsure"] as? String).map { text.hasSuffix($0) ? $0.count : 0 } ?? 0
         Ghost.shared.unsure = unsure
+        self.shownRev = action == nil ? rev : nil    // the key this grey text was asked at
+        self.idleShown = action == nil && j["idle"] as? Bool == true
         if action == nil { self.beginStat(now.app, j["src"] as? String ?? "model", text) }
         Ghost.shared.show(text, action: action, at: now.rect ?? rect, mid: now.mid)
         self.shownAt = Date()
@@ -974,7 +1012,7 @@ final class Keys {
             guard mine == self.seq, Ghost.shared.action == nil, Talk.shared.state == .idle else { return }
             let t0 = Date()
             Engine.shared.post("/pause", ["before": String(before.suffix(4000)), "app": s.app.localizedName ?? "", "title": s.title,
-                                          "context": ctx, "model": st.claudeModel, "after": Keys.after(s), "field": self.fieldGen,
+                                          "context": ctx, "model": st.claudeModel, "after": Keys.after(s), "field": self.fieldGen, "kb": KeyLayout.language,
                                           "notes": WritingNotes.forApp(s.app.bundleIdentifier ?? "", global: st.writingNote, perApp: st.appNotes)], timeout: 8) { j in
                 guard mine == self.seq, var text = j?["text"] as? String, !text.isEmpty, Ghost.shared.action == nil else { return }
                 let (now, _) = Focus.spot(skip: Drafter.shared.settings.skip)

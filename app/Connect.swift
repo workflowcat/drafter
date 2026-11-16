@@ -95,7 +95,7 @@ enum Connect {
         for way in Way.allCases { deleteKey(for: way) }
         save { st in
             st.connect.provider = ""
-            st.claudeTyping = false; st.claudePause = false; st.proofread = false; st.facts = false
+            st.claudeTyping = false; st.claudePause = false; st.proofread = false; st.sentenceProof = false; st.facts = false
             st.translate = false; st.rework = false; st.nextMessage = false; st.callNotes = false
         }
         Engine.shared.post("/model-key", ["provider": ""], timeout: 3)

@@ -26,4 +26,21 @@ class Kept(unittest.TestCase):
         self.assertEqual(r.rework("text", "nope"), {})
 
 
+class HintInMessage(unittest.TestCase):
+    """The hint (keyboard line, person block; engine/whom.py) reaches the message to Claude. Made-up text."""
+    def test_hint_in_message(self):
+        import claude_type as ct
+        ct.CLI = sys.executable
+        got = []
+        class W:
+            def ask(self, user, *a, **k): got.append(user); return ("Вигаданий текст.", 5, 9)
+        saved = r._worker
+        r._worker = lambda *a, **k: W()
+        try: r.rework("Вигаданий довгий текст для перевірки тут", "shorter", hint="Keyboard now: Ukrainian. x\nChat with: Вигадана Особа\n")
+        finally: r._worker = saved
+        self.assertEqual(len(got), 1)
+        self.assertIn("Keyboard now: Ukrainian.", got[0])
+        self.assertIn("Chat with: Вигадана Особа", got[0])
+
+
 if __name__ == "__main__": unittest.main()

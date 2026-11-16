@@ -14,6 +14,7 @@ OWNERS = {
     "pause": ("claudeTyping", "claudePause"),       # Claude's rest of the sentence on a typing pause
     "early": ("claudeTyping", "claudePause"),       # the same, asked ahead at word ends; the focus warm-up too
     "proofread": ("claudeTyping", "proofread"),
+    "sentence": ("claudeTyping", "sentenceProof"),  # the last sentence on a sentence end, Haiku vs Workers AI (sentence.py)
     "facts": ("claudeTyping", "facts"),
     "translate": ("claudeTyping", "translate"),
     "rework": ("rework",),                           # ⌥Tab on a selection
@@ -27,11 +28,12 @@ OWNERS = {
 
 # Off for a new install since 2026-11-14 (open-source round): nothing goes to Claude until the user turns it on.
 DEFAULTS = {"claudeTyping": False, "claudePause": False, "proofread": False, "facts": False, "translate": False,
-            "rework": False, "nextMessage": False, "callNotes": False, "entityClassify": False}
+            "rework": False, "nextMessage": False, "callNotes": False, "entityClassify": False,
+            "sentenceProof": False}
 # What a missing key meant before that day. migrate() writes these into a settings file written before the change, once,
 # so an existing user keeps exactly what he had. MARK in the file says it is done (or that the file is new).
 # entityClassify (kinds for leftover names, engine/entities.py) came on that day and was never on: it stays off.
-NEVER_ON = {"entityClassify"}
+NEVER_ON = {"entityClassify", "sentenceProof"}   # sentenceProof: an experiment of 2026-11-16, never on before
 OLD_DEFAULTS = {k: k not in NEVER_ON for k in DEFAULTS}
 MARK = "cloudDefaults"
 

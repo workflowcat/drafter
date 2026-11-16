@@ -75,6 +75,7 @@ What goes out, per feature:
 | `pause` | Claude writes the rest of the sentence when you pause typing | `claudeTyping` (off) + `claudePause` (off) |
 | `early` | the same, asked ahead at word ends | `claudeTyping` (off) + `claudePause` (off) |
 | `proofread` | a proofread chip for the message you are typing | `claudeTyping` (off) + `proofread` (off) |
+| `sentence` | the sentence you just ended, checked for typos (an experiment; also to Cloudflare Workers AI only when a key is set) | `claudeTyping` (off) + `sentenceProof` (off) |
 | `facts` | an answer chip when the screen asks something your calendar or saved texts answer | `claudeTyping` (off) + `facts` (off) |
 | `translate` | the message in your other language as a chip | `claudeTyping` (off) + `translate` (off) |
 | `rework` | rework a selection (shorter, clearer, ...) with Option-Tab | `rework` (off) |

@@ -32,6 +32,15 @@ def finish_with_source(W, before, config=(2, 0.6, 1), knowledge=None):
     return word, "know" if word else ""
 
 
+def know_only(W, before, knowledge=None):
+    """A name from the names / knowledge pack for the word being typed, his own words left out (2026-11-16): with the
+    selector on, his words go through the selector and finish_with_source never ran, so no name was ever offered
+    (/health know.offered stayed 0). The server offers this when the model has nothing for the spot."""
+    if knowledge is None: return ""
+    with W.lock:
+        return knowledge.finish(before, W.own_folded, W.own_prefix) or ""
+
+
 def boost_targets(W, before, heal, k=8, knowledge=None, context="", title=""):
     """One distribution, one model mixing share. Reserve 20% of existing mass for matching capitalized half words.
     Without screen matches the previous word distribution is unchanged.

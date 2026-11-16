@@ -74,7 +74,7 @@ enum Translate {
             asked.insert(key)
             if asked.count > 200 { asked.removeAll() }
             let t0 = Date()
-            Engine.shared.post("/translate", ["text": text, "target": target, "context": String(ctx.suffix(1500)), "app": s.app.localizedName ?? ""], timeout: 14) { j in
+            Engine.shared.post("/translate", ["text": text, "target": target, "context": String(ctx.suffix(1500)), "app": s.app.localizedName ?? "", "kb": KeyLayout.language], timeout: 14) { j in
                 let out = (j?["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 log("translate \(id) \(target) \(Int(Date().timeIntervalSince(t0) * 1000))ms engine \(j?["ms"] as? Int ?? 0)ms " + (out.isEmpty ? "none" : "\(out.count) chars") + (j?["cached"] as? Bool == true ? " cached" : ""))
                 guard !out.isEmpty, mine == k.seq, Ghost.shared.action == nil,

@@ -15,6 +15,7 @@ SERVER = (ROOT / "engine/server.py").read_text()
 
 
 def server_fns(*names, **ns):
+    ns.setdefault("who", types.SimpleNamespace(hint=lambda req, task="type": ""))   # engine/whom.py
     fns = [n for n in ast.parse(SERVER).body if isinstance(n, ast.FunctionDef) and n.name in names]
     exec(compile(ast.Module(body=fns, type_ignores=[]), "server.py", "exec"), ns)
     return ns

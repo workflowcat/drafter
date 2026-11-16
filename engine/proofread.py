@@ -174,11 +174,11 @@ def edits(text, fixed, keep=None):
 def _u16(s): return len(s.encode("utf-16-le")) // 2
 
 
-def check(text, app="", model="sonnet", cancelled=lambda: False):
+def check(text, app="", model="sonnet", cancelled=lambda: False, hint=""):
     """-> {"edits": [{at, len (UTF-16), old, new}], "fixed", "ms", "model"} or None (no Claude, busy, error)."""
     text = text[-MAX_CHARS:]
     if len(text.split()) < 4: return {"edits": [], "fixed": text, "ms": 0, "model": model}
-    key = (text, model)
+    key = (text, model, hint)
     # the cache keeps Claude's answer, not the edits: a word he took back since is filtered out again (Codex review
     # 2026-11-01: an undone fix came back for the same text)
     cached = key in _cache
@@ -187,7 +187,7 @@ def check(text, app="", model="sonnet", cancelled=lambda: False):
         if not Path(ct.CLI).exists(): return None
         w = _worker(model)
         _stats["asked"] += 1
-        user = (f"App: {app}\n" if app else "") + "Text:\n" + text
+        user = (f"App: {app}\n" if app else "") + hint + "Text:\n" + text
         r = w.ask(user, cancelled, wait=1.0, deadline=9.0, whole=True)
         if r is None: return None
         raw, first, ms = r

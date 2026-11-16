@@ -30,6 +30,7 @@ final class Rework {
     var typed = ""                  // his own instruction
     private(set) var original = "", result = "", ran = "", by = "", ms = 0
     private var el: AXUIElement?, pid: pid_t = 0, app = "", bundle = "", anchor = CGRect.zero, seq = 0
+    private var screen = "", kb = ""   // the chat above and the keyboard when it opened (engine/whom.py; context stays on the Mac)
     struct Syn { let text: String; let base: Bool }
     private(set) var syns: [Syn] = []
     private var synAsked = false, synMs = 0, synPicked = 0
@@ -71,6 +72,7 @@ final class Rework {
         Keys.shared.cancel(); Ghost.shared.hide()
         self.el = el; pid = front.processIdentifier; app = front.localizedName ?? ""; bundle = front.bundleIdentifier ?? ""
         original = text; typed = ""; sel = 0; result = ""; ran = ""
+        screen = Keys.shared.screenText(el); kb = KeyLayout.language
         cmds[6].hint = Translate.lang(text, share: 0.6) == "uk" ? "→ English" : "→ Українська"
         anchor = Focus.selectionRect(el) ?? Focus.frame(el) ?? CGRect(x: NSEvent.mouseLocation.x, y: 200, width: 1, height: 18)
         state = .menu
@@ -163,7 +165,7 @@ final class Rework {
         draw()
         let st = Drafter.shared.settings
         Engine.shared.post("/rework", ["text": original, "cmd": cmd, "custom": cmd == "custom" ? typed : "", "app": app,
-                                       "notes": WritingNotes.forApp(bundle, global: st.writingNote, perApp: st.appNotes)], timeout: 45) { j in
+                                       "notes": WritingNotes.forApp(bundle, global: st.writingNote, perApp: st.appNotes), "kb": kb, "context": screen], timeout: 45) { j in
             guard mine == self.seq, self.state == .working else { return }
             let out = (j?["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             self.ms = Int(Date().timeIntervalSince(t0) * 1000)

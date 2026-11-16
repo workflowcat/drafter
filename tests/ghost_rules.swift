@@ -51,6 +51,39 @@ struct GhostRulesChecks {
         check(R.askedAtKey(before: "see\u{A0}you", rev: 4, pending: false, now: "see you", keyRev: 4), "no-break space counts as a space")
         // long round: sentence-length ghosts, rolling ghost, futures, other ideas, the two keys
         check(R.lengthMode("phrase") == "phrase" && R.lengthMode("word") == "word" && R.lengthMode("") == "sentence", "length setting reads, default sentence")
+        // earlier round: 3-5 words and the lower gate in the request
+        check(R.minLetters(minGhost: 5, short: true, minShort: 3) == 3 && R.minLetters(minGhost: 5, short: false, minShort: 3) == 5, "short ghosts switch picks the minimum")
+        check(R.minLetters(minGhost: -1, short: false, minShort: 3) == 0, "never under 0")
+        let idle = { (b: String) in R.idleAllowed(on: true, secure: false, password: false, skipped: false, chatBox: true, mid: false, before: b) }
+        check(idle("") && idle("Thanks. ") && idle("Done!  ") && idle("hi\n") && idle("Він сказав «так.» "), "idle ghost: empty box, sentence end, new line")
+        check(!idle("see you") && !idle("ok.") && !idle("so, "), "idle ghost: never mid-sentence or right on the stop")
+        check(!R.idleAllowed(on: true, secure: true, password: false, skipped: false, chatBox: true, mid: false, before: ""), "idle ghost: never under secure input")
+        check(!R.idleAllowed(on: true, secure: false, password: true, skipped: false, chatBox: true, mid: false, before: ""), "idle ghost: never in a password field")
+        check(!R.idleAllowed(on: true, secure: false, password: false, skipped: true, chatBox: true, mid: false, before: ""), "idle ghost: never in a skipped app")
+        check(!R.idleAllowed(on: false, secure: false, password: false, skipped: false, chatBox: true, mid: false, before: "") &&
+              !R.idleAllowed(on: true, secure: false, password: false, skipped: false, chatBox: false, mid: false, before: ""), "idle ghost: switch off, or not a chat box")
+        let ib = R.idleBody(["before": "", "early": true, "keep_on": true])
+        check(ib["idle"] as? Bool == true && ib["early"] as? Bool == false && ib["keep_on"] == nil, "idle request: local only, no Claude early lane")
+        check(R.olderThanShown(askedRev: 4, shownRev: 6, visible: true), "an older answer never replaces newer grey text")
+        check(!R.olderThanShown(askedRev: 6, shownRev: 6, visible: true) && !R.olderThanShown(askedRev: 7, shownRev: 6, visible: true), "the same or a newer key may")
+        check(!R.olderThanShown(askedRev: 4, shownRev: 6, visible: false) && !R.olderThanShown(askedRev: nil, shownRev: 6, visible: true), "nothing on screen, or no revision: as before")
+        check(R.sentenceWait("first one. we can meet tomorow.")?.wait == 0.15, "a sentence end asks at once")
+        check(R.sentenceWait("first one. we can meet tomorow. ")?.rested == false, "spaces after the end")
+        check(R.sentenceWait("ok.") == nil && R.sentenceWait("first one. ok!") == nil, "under 3 words: nothing")
+        check(R.sentenceWait("first one. we can meet tomorow at noon")?.rested == true, "6 words without an end: on a rest")
+        check(R.sentenceWait("first one. we can meet") == nil, "short, no end: nothing")
+        check(R.sentenceWait("hi\nthe build is redy now!")?.wait == 0.15, "a new line starts the sentence")
+        let w = R.runBody(mode: "sentence", words: true, minWords: 3, maxWords: 5, guess: true, shade: true, strict: false)!
+        check(w["length"] as? String == "words" && w["words_min"] as? Int == 3 && w["words_max"] as? Int == 5, "3-5 words asked")
+        check(w["guess"] as? Bool == true && w["guess_shade"] as? Bool == true, "guesses asked, lighter")
+        let off = R.runBody(mode: "sentence", words: false, minWords: 3, maxWords: 5, guess: false, shade: true, strict: false)!
+        check(off["length"] as? String == "sentence" && off["guess"] == nil && off["words_min"] == nil, "switches off: the sentence run as before")
+        check(R.runBody(mode: "word", words: true, minWords: 3, maxWords: 5, guess: true, shade: true, strict: false) == nil, "word length keeps its own rule")
+        check(R.runBody(mode: "sentence", words: true, minWords: 3, maxWords: 5, guess: true, shade: true, strict: false, early: true)?["early_start"] as? Bool == true, "early start asks the lower notch")
+        check(R.runBody(mode: "sentence", words: true, minWords: 3, maxWords: 5, guess: false, shade: true, strict: false, early: true)?["early_start"] == nil, "early start only with guesses")
+        check(R.runBody(mode: "sentence", words: true, minWords: 3, maxWords: 5, guess: true, shade: true, strict: true) == nil, "Zoom stays strict")
+        let odd = R.runBody(mode: "phrase", words: true, minWords: 9, maxWords: 2, guess: true, shade: false, strict: false)!
+        check(odd["words_min"] as? Int == 5 && odd["words_max"] as? Int == 5 && odd["guess_shade"] as? Bool == false, "numbers kept in range; shade off")
         check(R.sentencePiece("we can go. Then more") == "we can go. ", "⌃Tab: up to the sentence end and its space")
         check(R.sentencePiece("see you soon!\" ok") == "see you soon!\" ", "closing quote stays with the sentence")
         check(R.sentencePiece("version 3.5 is out") == "version 3.5 is out", "a dot inside a number is no sentence end")

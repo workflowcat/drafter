@@ -522,6 +522,13 @@ struct SettingsView: View {
                     row("Suggestions while typing", !s.paused, stat: LogStats.suggest, typing: true) { $0.paused = !$1 }
                     row("Longer suggestions in AI apps", s.longGhostsAI, typing: true) { $0.longGhostsAI = $1 }
                     row("Longer suggestions in chats", s.longGhostsChats, typing: true) { $0.longGhostsChats = $1 }
+                    row("Suggest 3 to 5 words", s.ghostWords, typing: true) { $0.ghostWords = $1 }
+                    row("Also show weaker guesses", s.guessGhosts, typing: true) { $0.guessGhosts = $1 }
+                    row("Draw weaker guesses lighter", s.guessShade, typing: true) { $0.guessShade = $1 }
+                    row("Start guessing earlier, right after a space", s.earlyStart, typing: true) { $0.earlyStart = $1 }
+                    row("Suggest my next message while the caret rests", s.idleGhost, typing: true) { $0.idleGhost = $1 }
+                    row("Show short suggestions (3 letters)", s.shortGhosts, typing: true) { $0.shortGhosts = $1 }
+                    row("Finish a suggestion while I type into it", s.keepTyping, typing: true) { $0.keepTyping = $1 }
                     row("No suggestions after a typo", s.typoHold, typing: true) { $0.typoHold = $1 }
                     row("Suggestions in the middle of a line", s.midLine, typing: true) { $0.midLine = $1 }
                     modelRows
@@ -529,6 +536,7 @@ struct SettingsView: View {
                     row("Claude finishes the sentence when I pause", s.claudeTyping, sends: true, typing: true) { $0.claudeTyping = $1 }
                     row("Claude writes the rest when I stop", s.claudePause, sends: true, stat: LogStats.claude, typing: true) { $0.claudePause = $1 }
                     row("Proofread the message when I rest", s.proofread, sends: true, stat: LogStats.proofread, typing: true) { $0.proofread = $1 }
+                    row("Check each sentence as I end it (Haiku or Workers AI)", s.sentenceProof, sends: true, typing: true) { $0.sentenceProof = $1 }
                     row("Offer my message in the chat's language", s.translate, sends: true, stat: LogStats.translate, typing: true) { $0.translate = $1 }
                     row("Answer questions from my calendar", s.facts, sends: true, stat: LogStats.facts, typing: true) { $0.facts = $1 }
                     row("Suggest the next message", s.nextMessage, sends: true, stat: LogStats.next, typing: true) { $0.nextMessage = $1 }

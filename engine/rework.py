@@ -100,7 +100,7 @@ def notes_text(notes):
     return " ".join((notes or "").split())[:300]
 
 
-def rework(text, cmd, custom="", app="", model="sonnet", online=True, local=None, cancelled=lambda: False, notes=""):
+def rework(text, cmd, custom="", app="", model="sonnet", online=True, local=None, cancelled=lambda: False, notes="", hint=""):
     """-> {"text", "cmd", "by", "ms"} or {} (nothing kept). `notes`: his writing instructions (Settings > Typing), added
     to the Claude and the local prompt only when there are some."""
     notes = notes_text(notes)
@@ -108,13 +108,13 @@ def rework(text, cmd, custom="", app="", model="sonnet", online=True, local=None
     if not text.strip() or len(text) > MAX_CHARS or (cmd not in COMMANDS and cmd != "custom"): return {}
     what = instruction(cmd, text, custom)
     if not what: return {}
-    key = hashlib.sha1(json.dumps([text, cmd, what, model] + ([notes] if notes else [])).encode()).hexdigest()
+    key = hashlib.sha1(json.dumps([text, cmd, what, model] + ([notes] if notes else []) + ([hint] if hint else [])).encode()).hexdigest()
     if key in _cache: return dict(_cache[key], cached=True)
     t0 = time.time()
     res = {}
     if online and Path(ct.CLI).exists():
         _stats["asked"] += 1
-        user = (f"App: {app}\n\n" if app else "") + (f"His writing instructions (follow them unless the task says otherwise): {notes}\n\n" if notes else "") + f"Task: {what}\n\nText:\n{text}"
+        user = (f"App: {app}\n\n" if app else "") + (hint + "\n" if hint else "") + (f"His writing instructions (follow them unless the task says otherwise): {notes}\n\n" if notes else "") + f"Task: {what}\n\nText:\n{text}"
         r = _worker(model).ask(user, cancelled, wait=1.0, deadline=20.0, whole=True)
         if r is not None:
             out = r[0].strip()

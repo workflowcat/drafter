@@ -33,6 +33,21 @@ enum Focus {
     /// Marks `pid` woken (or enhanced) under the lock. -> true the first time.
     private static func firstWake(_ pid: pid_t) -> Bool { stateLock.lock(); defer { stateLock.unlock() }; return woken.insert(pid).inserted }
     private static func firstEnhance(_ pid: pid_t) -> Bool { stateLock.lock(); defer { stateLock.unlock() }; return enhanced.insert(pid).inserted }
+    /// An Electron app asked while it is still starting forgets the ask (Beeper, 2026-11-16: asked in its first second,
+    /// both flags read 0 forty minutes later, no ghost since). So the ask repeats while the flag reads off, at most once
+    /// per `askGap` per process. -> true when it is time to ask again.
+    private static var asked: [pid_t: Date] = [:]
+    static let askGap: TimeInterval = 5
+    private static func askDue(_ pid: pid_t, now: Date = Date()) -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        if let t = asked[pid], now.timeIntervalSince(t) < askGap { return false }
+        asked[pid] = now; return true
+    }
+    private static func flagOff(_ a: AXUIElement, _ name: String) -> Bool {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(a, name as CFString, &v) == .success, let n = v as? NSNumber else { return true }
+        return !n.boolValue
+    }
 
     /// Drafter's own windows answer Accessibility on Drafter's main thread. Asked from any other thread, the call waits
     /// for main; when main is itself waiting in an AX call (the HIServices lock that background call holds), both wait
@@ -66,8 +81,11 @@ enum Focus {
 
     /// Chrome and Electron apps (Beeper) build their accessibility tree only when asked.
     static func wake(_ app: NSRunningApplication) {
-        guard app.processIdentifier != ownPid, firstWake(app.processIdentifier) else { return }
+        guard app.processIdentifier != ownPid else { return }
         let a = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(a, 0.15)
+        // the first time always; after that only while the app reads the flag as off (it forgot an early ask)
+        guard firstWake(app.processIdentifier) || (isWeb(app) && askDue(app.processIdentifier) && flagOff(a, "AXManualAccessibility")) else { return }
         AXUIElementSetAttributeValue(a, "AXManualAccessibility" as CFString, kCFBooleanTrue)
         let id = app.bundleIdentifier ?? ""
         if id.hasPrefix("com.google.Chrome") || id.hasPrefix("com.brave") || id.hasPrefix("com.microsoft.edgemac") || id.hasPrefix("company.thebrowser.") || id.hasPrefix("com.vivaldi") || id.hasPrefix("com.operasoftware") {
@@ -94,9 +112,12 @@ enum Focus {
             if AXUIElementCopyAttributeValue(a, kAXFocusedUIElementAttribute as CFString, &f) == .success, let f { return (f as! AXUIElement) }
             // an Electron app that ignores AXManualAccessibility (Codex, 2026-10-21: "no focus" on every key) builds its
             // tree for AXEnhancedUserInterface, as Chrome does; asked once per process
-            if isWeb(app), firstEnhance(app.processIdentifier) {
+            let pid = app.processIdentifier
+            let first = isWeb(app) && firstEnhance(pid)
+            if first || (isWeb(app) && askDue(pid) && flagOff(a, "AXEnhancedUserInterface")) {
+                AXUIElementSetAttributeValue(a, "AXManualAccessibility" as CFString, kCFBooleanTrue)
                 AXUIElementSetAttributeValue(a, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
-                log("accessibility: enhanced mode asked for \(app.bundleIdentifier ?? "?")")
+                log("accessibility: enhanced mode \(first ? "asked" : "asked again") for \(app.bundleIdentifier ?? "?")")
                 if AXUIElementCopyAttributeValue(a, kAXFocusedUIElementAttribute as CFString, &f) == .success, let f { return (f as! AXUIElement) }
             }
         }

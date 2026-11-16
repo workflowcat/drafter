@@ -18,6 +18,7 @@ SITES = {
     ("claude_type", "Worker"): "starts the process; reached only through the _worker functions below",
     ("claude_type", "_worker"): "server: pause / early / warm_claude",
     ("proofread", "_worker"): "server: proof",
+    ("sentence", "_worker"): "server: sentence_proof (sentence.check -> race -> ask_claude)",
     ("facts", "_worker"): "server: facts",
     ("translate", "_worker"): "server: translate",
     ("rework", "_worker"): "server: rework",
@@ -36,6 +37,7 @@ SINKS = {"claude_worker.ask", "ct.Worker", "Worker"}
 ENTRIES = {
     "claude_type": ({"answer", "early", "warm", "complete"}, {"pause", "early"}),
     "proofread": ({"check", "warm"}, {"proofread"}),
+    "sentence_mod": ({"check", "race", "ask_claude", "ask_cf"}, {"sentence"}),
     "facts_mod": ({"answer"}, {"facts"}),
     "translate_mod": ({"translate"}, {"translate"}),
     "rework_mod": ({"rework", "warm"}, {"rework"}),
@@ -169,7 +171,8 @@ class Server(unittest.TestCase):
                        claude_type=self.ct, claude_worker=self.cw, run=lambda *a, **k: self.local(), model=types.SimpleNamespace(tok=tok),
                        REPO="x", KEYS=[0], CLAUDE_CTX=2500, DATA=Path("/nonexistent"), REPLY_CACHE={}, OPTIONS="", re=__import__("re"),
                        time=__import__("time"), json=__import__("json"), Path=Path, _known=lambda w: False, local_rewrite=Mock(),
-                       prompt_examples=lambda: [])
+                       prompt_examples=lambda: [],
+                       who=types.SimpleNamespace(hint=Mock(return_value="Keyboard now: Ukrainian.\n")))
         exec(compile(ast.Module(body=body, type_ignores=[]), "server.py", "exec"), self.ns)
 
     def tearDown(self):
@@ -181,6 +184,16 @@ class Server(unittest.TestCase):
         self.assertEqual(self.ns["pause"]({"before": "made-up line here "})["src"], "off")
         self.ns["ask_early"]({"before": "a made-up line ", "early": True})
         self.ct.warm.assert_not_called(); self.ct.answer.assert_not_called(); self.ct.early.assert_not_called()
+
+    def test_keyboard_and_person_hint_only_with_the_switch_on(self):
+        # engine/whom.py: the keyboard line and the chat's person block never leave with the switches off
+        req = {"before": "made-up line here ", "early": True, "text": "made-up text for a check", "target": "en", "kb": "uk"}
+        self.settings = {"claudeTyping": False, "proofread": True, "translate": True, "claudePause": True}
+        for f in ("pause", "ask_early", "proof", "translate"): self.ns[f](dict(req))
+        self.ns["who"].hint.assert_not_called()
+        self.settings = {"claudeTyping": True, "proofread": True, "translate": True, "claudePause": True}
+        self.ns["pause"](dict(req))
+        self.assertEqual(self.ct.answer.call_args.kwargs["hint"], "Keyboard now: Ukrainian.\n")
 
     def test_pause_on_still_works(self):
         self.settings = {"claudeTyping": True, "claudePause": True}
@@ -206,6 +219,8 @@ class Server(unittest.TestCase):
         self.ns["rework"]({"text": "made-up text", "cmd": "shorter", "from": "quick"})
         self.rework_mod.rework.assert_called_once()
         self.assertIs(self.rework_mod.rework.call_args.kwargs["online"], False)
+        self.assertEqual(self.rework_mod.rework.call_args.kwargs["hint"], "")   # no keyboard or person hint offline
+        self.ns["who"].hint.assert_not_called()
         self.assertEqual(self.ns["rework"]({"text": "made-up text", "cmd": "shorter", "from": "quick", "warm": True}), {})
         self.rework_mod.warm.assert_not_called(); self.cw.ask.assert_not_called()
 

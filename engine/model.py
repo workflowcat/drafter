@@ -637,7 +637,8 @@ class Model:
                 if run:
                     text, sure, why, conf = gatecore.run_words(toks, run.get("mode", "sentence"), run.get("floor", gatecore.RUN_FLOOR),
                                                                closed=closed, likely=run.get("likely", gatecore.RUN_LIKELY),
-                                                               min_letters=min_letters, kind=run.get("kind", "prod"))
+                                                               min_letters=min_letters, kind=run.get("kind", "prod"),
+                                                               words=run.get("max_words"), min_words=run.get("min_words"))
                     self.last_conf, self.last_why = conf, why
                     return text, sure
                 return gatecore.shape(toks, more, max_words, grow, grow_words, min_letters, tail, tail_words)

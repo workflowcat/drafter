@@ -218,8 +218,12 @@ def settled(raw, shown, min_letters=0):
 # unsure function word does not cut it (a per-token bar did); a run of weak words does. bench/long_ghosts.py picked
 # the numbers.
 SENT_END = re.compile(r"[.!?…][\"'»”)\]]*$")
+# "words" (earlier round, 2026-11-16, Andrii: "lets do 3-5 words and lessen the confidence"): at least `min_words`
+# words when the model has them, whatever their chance, at most `words`; between the two the running chance decides;
+# only a sentence end or a line break ends it sooner (no clause or comma stop).
 RUN_MODES = {"phrase": {"words": 6, "stops": ",;:", "comma_words": 0},
-             "sentence": {"words": 24, "stops": ";", "comma_words": 8}}
+             "sentence": {"words": 24, "stops": ";", "comma_words": 8},
+             "words": {"words": 5, "stops": "", "comma_words": 0, "min_words": 3}}
 RUN_FLOOR, RUN_CAP, RUN_LIKELY, RUN_GARBAGE = 0.1, 24, 0.3, 0.005
 
 
@@ -232,7 +236,7 @@ def word_p(toks, pos, end):
 
 
 def run_words(toks, mode="sentence", floor=RUN_FLOOR, words=None, closed=None, likely=RUN_LIKELY, garbage=RUN_GARBAGE,
-              min_letters=0, grow=0.05, kind="prod"):
+              min_letters=0, grow=0.05, kind="prod", min_words=None):
     """The ghost of a sentence-length run on the recorded tokens, once the gate said yes to the first word.
     -> (text, sure part length, why it ended, [running chance after each later word]).
     closed: None while the model is still writing; "eos" when it ended the text (the last word is whole); "cap" when
@@ -240,10 +244,12 @@ def run_words(toks, mode="sentence", floor=RUN_FLOOR, words=None, closed=None, l
     why: "open" (the next word is still being written: wait for more tokens), "sentence" (. ! ? … ended it), "clause"
     (; or, in phrase mode, , :), "comma" (a comma after `comma_words` words), "line" (a line break follows), "floor"
     (the running chance fell under `floor`, or one word under `garbage`), "words" (the word cap), "end" (the model
-    ended the text), "cap" (the token cap)."""
+    ended the text), "cap" (the token cap).
+    min_words: words shown whatever their running chance (a word under `garbage` still ends it); default the mode's."""
     raw = toks[-1][0] if toks else ""
     m = RUN_MODES[mode]
     cap = words or m["words"]
+    least = m.get("min_words", 0) if min_words is None else min_words
     first = next_word(raw)
     w0 = first.strip()
     if not w0: return "", 0, ("open" if not closed else closed if closed == "cap" else "end"), []
@@ -259,7 +265,9 @@ def run_words(toks, mode="sentence", floor=RUN_FLOOR, words=None, closed=None, l
         end = pos + len(ww.rstrip())
         if end >= len(raw) and not END_RE.search(ww) and closed != "eos": why = "cap" if closed else "open"; break
         wp = word_p(toks, pos, end)
-        if min_letters and letters(text) < min_letters:
+        if n < least:
+            if wp < garbage: why = "floor"; break
+        elif min_letters and letters(text) < min_letters:
             span = word_ps(toks, pos, end)
             if not span or min(span) < grow: why = "floor"; break
         elif wp < garbage or running(kind, cum * wp, logs + math.log(max(wp, 1e-9)), n) < floor: why = "floor"; break
@@ -302,3 +310,79 @@ def extend(toks, first, more, max_words):
         if not span or min(span) < more: break
         out += ww; pos += len(ww); n += 1
     return out
+
+
+# The lower gate's bar per model (earlier round, 2026-11-16, bench/earlier.py on held-137 with each model's own refit
+# gate): a guess band [bar, the gate's own threshold). 0.3 on both: wrong offers per 1,000 letters 31.4 -> 43.5 (live
+# 1.7B) and 36.4 -> 50.9 (qwen3-4b-mine), under 1.5x today; 0.25 went over (52.7, 58.2). A gate file may carry its
+# own "guess"; DRAFTER_GUESS overrides all.
+GUESS = {"live": 0.3, "qwen3-4b-mine": 0.3}
+GUESS_DEFAULT = 0.3
+
+
+def guess_bar(g, model_id="live", env=None):
+    """The lower gate for the model loaded now: env, else the gate file's "guess", else the catalog id's, else 0.3."""
+    if env:
+        try: return float(env)
+        except ValueError: pass
+    if (g or {}).get("guess") is not None: return float(g["guess"])
+    return GUESS.get(model_id or "live", GUESS_DEFAULT)
+
+
+# Earlier round step 6 (2026-11-16, Andrii: "the lower confidence and longer completion is definitely working
+# better"): one notch lower, and lower still right after a space, where the gate said no 89% of the time
+# (bench/earlier6.py: a place bar is the gate refit with a place intercept). App switch `earlyStart`.
+EARLY_GUESS, EARLY_SPACE = 0.25, 0.2
+
+
+def early_bar(low, before, on):
+    """The lower gate with the step 6 notch: `low` (guess_bar, or None when guesses are off) stays as it is when `on`
+    is false; else at most EARLY_GUESS, and at most EARLY_SPACE right after a space or a line break."""
+    if low is None or not on: return low
+    low = min(low, EARLY_GUESS)
+    return min(low, EARLY_SPACE) if before[-1:].isspace() else low
+
+
+# Idle ghost (step 7, 2026-11-16, Andrii: "start predicting and suggesting the next message even when the cursor is
+# just blinking"): the caret rests in a chat box, empty or after a finished sentence; the local model drafts the next
+# message, shown when its first word scores at least IDLE_BAR (bench/idle.py on made-up chats). Step 7b: with the chat
+# prompt for an empty box (engine/idle_prompt.py) 0.2 shows 14 of 18 empty boxes, first word right 4/14, close 7/14;
+# after a finished sentence nothing clears it (0/6; at 0.05 4/6 shown, 1 right).
+IDLE_BAR = 0.2
+IDLE_END = re.compile(r"(^|[.!?…]['\"»”)]*\s+|\n)$")
+
+
+def idle_spot(before):
+    """An idle ghost may start here: nothing typed, or a finished sentence and a space, or a new line."""
+    return not before.strip() or bool(IDLE_END.search(before))
+
+
+def idle_bar(low, bar=None):
+    """The idle request's bar: the request's own (`idle_bar`) or IDLE_BAR, never above the guess bar in force."""
+    try: b = IDLE_BAR if bar is None else float(bar)
+    except (TypeError, ValueError): b = IDLE_BAR
+    return b if low is None else min(low, b)
+
+
+def ghost_words(req):
+    """The 3-5 words rule's numbers from the app (words_min / words_max, settings ghostMinWords / ghostMaxWords):
+    min 1-5, max min-8."""
+    try: lo = min(5, max(1, int(req.get("words_min", 3))))
+    except (TypeError, ValueError): lo = 3
+    try: hi = min(8, max(lo, int(req.get("words_max", 5))))
+    except (TypeError, ValueError): hi = max(lo, 5)
+    return {"min_words": lo, "max_words": hi}
+
+
+KEEP_LETTERS = 4
+
+
+def keeps(old_before, new_before, most=KEEP_LETTERS):
+    """Keep in flight (earlier round step 2): a typing request still running when a newer one comes runs on (instead of
+    stopping at the next token) when the newer text is the older one plus at most `most` typed characters on the same
+    line; the app then shows its rest if those characters are its start (app/Keys.swift answer, typedSince).
+    bench/earlier.py waits --keep: qwen3-4b-mine shown 21.9 -> 26.6 %, kept letters 306 -> 320 per 1,000, key to ghost
+    p50 / p95 68 / 151 -> 60 / 134 ms."""
+    if not old_before or not new_before.startswith(old_before): return False
+    typed = new_before[len(old_before):]
+    return 0 < len(typed) <= most and "\n" not in typed

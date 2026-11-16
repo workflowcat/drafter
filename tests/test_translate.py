@@ -27,5 +27,22 @@ class Kept(unittest.TestCase):
         self.assertFalse(t.kept("ок", "Okay, I will send the whole document and the notes in the evening", "en"))  # too long
 
 
+class HintInMessage(unittest.TestCase):
+    """The hint (keyboard line, person block; engine/whom.py) reaches the message to Claude. Made-up text."""
+    def test_hint_in_message(self):
+        import claude_type as ct
+        ct.CLI = sys.executable
+        got = []
+        class W:
+            def ask(self, user, *a, **k): got.append(user); return ("Made-up text to check here", 5, 9)
+        saved = t._worker
+        t._worker = lambda *a, **k: W()
+        try: t.translate("Вигаданий текст для перевірки тут", "en", hint="Keyboard now: Ukrainian. x\nChat with: Вигадана Особа\n")
+        finally: t._worker = saved
+        self.assertEqual(len(got), 1)
+        self.assertIn("Keyboard now: Ukrainian.", got[0])
+        self.assertIn("Chat with: Вигадана Особа", got[0])
+
+
 if __name__ == "__main__":
     unittest.main()

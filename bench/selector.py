@@ -9,6 +9,10 @@ one replay, against the live policy on the same lines. The target (Codex): 75% o
 least 90% of the letters saved.
 
     .venv/bin/python bench/selector.py data/bench/<recording>.jsonl [--gap 120] [--save bench/out/selector.json]
+
+Default historical-selector keeps the old tail/grow presets. --policy-mode current-2026-11-16 uses
+the shared request flags, including the model-guess fallback. This still fits a research selector;
+it does not load the shipped selector. Static replay does not simulate keep-in-flight.
 """
 import argparse, json, math, sys
 from pathlib import Path
@@ -17,7 +21,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "bench")); sys.path.insert(0, str(ROOT / "engine"))
-import gatecore, measure
+import gatecore, measure, request_policy
 
 NAMES = gatecore.SEL_NAMES
 MIN = {"model": 5, "memory": 5, "words": 3}
@@ -35,10 +39,23 @@ def model_p(row, before, src, W, gate):
 
 
 class Sources:
-    def __init__(self, W, M, gate, wordgate, knobs):
+    def __init__(self, W, M, gate, wordgate, knobs=None, policy_mode=request_policy.SELECTOR):
         import lengths, typescore as ts
+        self.request_policy = request_policy.build(policy_mode)
+        self.minimum = dict(MIN)
         open_gate = dict(gate, th={"ai": 0.0, "chat": 0.0})
-        self.model = lengths.policy(W, None, open_gate, **knobs)
+        if policy_mode == request_policy.CURRENT:
+            if knobs is not None: raise ValueError("current request mode does not accept historical length knobs")
+            from earlier import ghost
+            self.minimum = dict.fromkeys(MIN, self.request_policy.request["min_letters"])
+
+            def model(row, before, src):
+                # Static scorer keeps full recorded time; only earlier normalises cold prefill.
+                text, _, full = ghost(dict(row, prefill_ms=0), before, **self.request_policy.run_kwargs())
+                return text, full
+            self.model = model
+        else:
+            self.model = lengths.policy(W, None, open_gate, **(self.request_policy.request if knobs is None else knobs))
         self.W, self.M, self.gate, self.wg = W, M, gate, wordgate
 
     def offers(self, row, before, src):
@@ -47,7 +64,7 @@ class Sources:
         out = []
 
         def add(kind, text, ms, **f):
-            if not text or gatecore.letters(text) < MIN[kind]: return
+            if not text or gatecore.letters(text) < self.minimum[kind]: return
             out.append((kind, text, ms, gatecore.sel_features(kind, text, before, src == "claude", **f)))
         if self.M is not None:
             said, hits = self.M.suggest(before)
@@ -62,6 +79,13 @@ class Sources:
             p = model_p(row, before, src, self.W, self.gate)
             if p is not None: add("model", text, ms, model_p=p, model_low=float(p < self.gate["th"]["ai" if src == "claude" else "chat"]))
         return out
+
+    def guess(self, row, before, src):
+        bar = self.request_policy.guess_bar
+        if bar is not None and row is not None:
+            p = model_p(row, before, src, self.W, self.gate)
+            if p is not None and p >= bar: return self.model(row, before, src)
+        return "", 0
 
 
 def examples(items, rows, idx, S):
@@ -90,7 +114,7 @@ class Selector:
         for kind, g, ms, v in self.S.offers(row, before, src):
             p = 1 / (1 + math.exp(-float(np.dot(self.w, v))))
             if p >= self.th and (best is None or p > best[0]): best = (p, g, ms)
-        return (best[1], best[2]) if best else ("", 0)
+        return (best[1], best[2]) if best else self.S.guess(row, before, src)
 
 
 if __name__ == "__main__":
@@ -103,6 +127,7 @@ if __name__ == "__main__":
     ap.add_argument("--gap", type=float, default=None)
     ap.add_argument("--gate", default="data/gate.json")
     ap.add_argument("--save", default=None)
+    request_policy.add_argument(ap, request_policy.SELECTOR)
     a = ap.parse_args()
     items, rows = ts.load(a.path)
     cut = last_retrain(ROOT)
@@ -111,14 +136,13 @@ if __name__ == "__main__":
     gate = json.loads((ROOT / a.gate).read_text())
     cal, test = measure.split(items)
     wg = wgmod.fit_gate(items, W, cal, 0.85)
-    knobs = {"min_letters": 5, "grow": 0.05, "tail": 0.2, "tail_words": 8}
-    S = Sources(W, M, gate, wg, knobs)
+    S = Sources(W, M, gate, wg, policy_mode=a.policy_mode)
     X, y = examples(items, rows, cal, S)
     w = fit(X, y)
     print(f"selector fit on {len(y)} offers from {len(cal)} earlier lines ({100 * y.mean():.1f}% right)")
     ti, tr = wgmod.subset(items, rows, test)
     r0, p0 = measure.replay(ti, tr, measure.live_policy(a.path, a.gate), gap_ms=a.gap)
-    measure.show("live", r0)
+    measure.show("live" if a.policy_mode == request_policy.SELECTOR else "historical live baseline", r0)
     # the bar from the earlier half: the lowest one whose shown ghosts are 75% right there
     ci, cr = wgmod.subset(items, rows, cal)
     bars = {}
@@ -134,4 +158,4 @@ if __name__ == "__main__":
             print(f"    {k}: right {measure.paired(p0, p1, k, 'right')} saved {measure.paired(p0, p1, k, 'saved')} "
                   f"wrong/1k {measure.paired(p0, p1, k, 'wrong_1k')}  (saved kept {100 * r1[k]['saved'] / max(0.1, r0[k]['saved']):.0f}%)")
     if a.save:
-        Path(a.save).write_text(json.dumps({"names": NAMES, "w": [round(float(v), 4) for v in w], "wordgate": wg, "min": MIN}, indent=1))
+        Path(a.save).write_text(json.dumps({"names": NAMES, "w": [round(float(v), 4) for v in w], "wordgate": wg, "min": S.minimum}, indent=1))

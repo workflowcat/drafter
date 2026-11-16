@@ -109,6 +109,20 @@ class EarlyTest(unittest.TestCase):
         self.assertEqual(seen, ["one two ", "one two three four "])
 
 
+class HintTest(unittest.TestCase):
+    def test_hint_goes_after_notes_before_screen(self):
+        hint = "Keyboard now: Ukrainian. A hint.\nChat with: Вигадана Особа\n"
+        u = ct._user("привіт, як ", "Beeper", "", "рядок чату вище", notes="коротко", hint=hint)
+        self.assertLess(u.index("His writing instructions"), u.index("Keyboard now"))
+        self.assertLess(u.index("Chat with: Вигадана Особа"), u.index("On screen above the field"))
+        self.assertNotIn("Keyboard", ct._user("привіт, як ", "Beeper", "", ""))
+        self.assertIn("Chat with: X\nOn screen", ct._user("a", "B", "", "ctx", hint="Chat with: X"))   # a line end is added
+
+    def test_other_hint_is_another_place(self):
+        self.assertNotEqual(ct._where("Beeper", "", "c", "", "sonnet"), ct._where("Beeper", "", "c", "", "sonnet", hint="Keyboard now: English.\n"))
+        self.assertEqual(ct._where("Beeper", "", "c", "", "sonnet"), ct._where("Beeper", "", "c", "", "sonnet", hint=""))
+
+
 class GateTest(unittest.TestCase):
     W = [("let's", [0.4]), (" ship", [0.2, 0.3]), (" it", [0.002]), (" today", [0.6])]
 

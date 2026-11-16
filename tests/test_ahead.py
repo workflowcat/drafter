@@ -18,7 +18,7 @@ def load(fake_complete, latest):
     tree = ast.parse(source.read_text())
     fns = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in NAMES]
     ns = dict(words_mod=words_mod, knowledge=know.Pack(), earlier=Mock(return_value=""), json=json, time=time, threading=threading, OrderedDict=OrderedDict, latest=latest, _complete=fake_complete,
-              LATEST_LOCK=threading.Lock(), jobs=queue.Queue(), BRANCHES=0, re=__import__("re"), selector=lambda: None, word_first=lambda *a: "", JOB_ORDER=iter(range(1 << 30)),
+              LATEST_LOCK=threading.Lock(), jobs=queue.Queue(), RUNNING=[None], KEPT=set(), BRANCHES=0, re=__import__("re"), selector=lambda: None, word_first=lambda *a: "", JOB_ORDER=iter(range(1 << 30)),
               AHEAD=OrderedDict(), AHEAD_LOCK=threading.Lock(), AHEAD_TTL=30.0, AHEAD_STATS={"made": 0, "hit": 0}, AHEAD_KIND={},
               AHEAD_DAYS_FILE=Path(__import__("tempfile").mkdtemp()) / "ahead-days.json", _ahead_days=None, _ahead_saved=[0.0],
               model=types.SimpleNamespace(asleep=False, loading=False),

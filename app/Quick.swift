@@ -695,7 +695,7 @@ final class Quick {
         // the text leaves the Mac only here, after he picked; engine: Claude through claude_on("rework"), else local
         // writing instructions: the global one (a clipboard row knows the app's name, not its bundle id)
         let notes = WritingNotes.forApp("", global: Drafter.shared.settings.writingNote, perApp: [:])
-        Engine.shared.post("/rework", ["text": it.text, "cmd": id, "custom": id == "custom" ? custom : "", "app": it.app, "from": "quick", "notes": notes], timeout: 45) { j in
+        Engine.shared.post("/rework", ["text": it.text, "cmd": id, "custom": id == "custom" ? custom : "", "app": it.app, "from": "quick", "notes": notes, "kb": KeyLayout.language], timeout: 45) { j in
             guard mine == self.seq, self.isOpen, self.mode == .rework else { return }
             let out = (j?["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             self.ms = Int(Date().timeIntervalSince(t0) * 1000)

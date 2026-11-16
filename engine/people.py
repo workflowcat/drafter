@@ -7,6 +7,10 @@ Which chat is on screen: the Beeper window title never changes, so the lines of 
 against fingerprints (6-byte hashes) of each chat's recent lines. The other person's text is never stored, only those
 fingerprints; his own messages per chat are kept in data/people.json (local only, like data/phrases.jsonl).
 
+Who a chat is with (2026-11-16): each chat also keeps the display names of the other people who wrote there
+(`who`, at most WHO_KEPT, most messages first) and its title when Beeper lists it, so engine/whom.py can match the
+chat to the names reference. Names only, never their text.
+
 Built from the Beeper CLI (read only, BEEPER_READONLY=1) in the background: at start when the file is older than
 REFRESH, then every REFRESH; lines he sends while Drafter runs are added at once (/typed). Messages signed
 "Claude:" are Claude's, not his, and stay out.
@@ -36,6 +40,8 @@ KEEP = 600              # his lines kept per chat
 MARK_LINES = 80         # the last messages of a chat whose lines are fingerprinted
 MAX_EMPTY_MARKS = 4096  # retain recent collision protection without unbounded tombstones
 MIN_MARK = 8            # shorter lines ("ок", "дякую!") are in every chat and say nothing
+WHO_KEPT = 3            # other people's display names kept per chat
+BACKFILL = 40           # known chats without `who` read again per refresh, until all have it
 SIGNED = re.compile(r"^\s*(claude|клод)\s*:", re.I)
 
 
@@ -88,6 +94,19 @@ def earlier(mine, context, n=12, line_max=160, total=700):
     return "\n".join(reversed(out))
 
 
+def note_who(c, hist, listed=None):
+    """The chat's other people (display names, most messages first) and its title, into chat record `c`."""
+    names = Counter(" ".join((h.get("senderName") or "").split()) for h in hist if not h.get("isSender"))
+    names.pop("", None)
+    old = list(c.get("who") or [])
+    c["who"] = [n for n, _ in names.most_common(WHO_KEPT)] or old
+    if len(names) > 1: c["group"] = True
+    if listed:
+        title, group = listed
+        if title: c["title"] = title
+        if group: c["group"] = True
+
+
 def beeper(*a, timeout=90):
     out = subprocess.run([beeper_bin(), *a, "--json", "-q", "--read-only", "--full"], capture_output=True, text=True, stdin=subprocess.DEVNULL,
                          timeout=timeout, env=ENV, preexec_fn=lambda: os.nice(10)).stdout
@@ -124,6 +143,15 @@ class People:
                 self.blocks[chat] = (time.time(), mine)
         # Recheck the current screen even when using an hour-old snapshot of older messages.
         return earlier(mine, context) if len(mine) >= min_lines else ""
+
+    def info(self, chat):
+        """-> {"who": [their display names], "title", "group", "mine": [his lines]} for a chat id, or None."""
+        with self.lock:
+            c = self.chats.get(chat)
+            if not c: return None
+            who = list(c.get("who") or [])
+            return {"who": who, "title": c.get("title", ""), "group": bool(c.get("group")) or len(who) > 1,
+                    "mine": list(c.get("mine") or [])}
 
     # -- learning --------------------------------------------------------------------------------------------------
     def add(self, context, text):
@@ -166,12 +194,18 @@ class People:
         sent = beeper("messages", "search", "--sender", "me", "--after", after, "--limit", "3000", timeout=180)
         wrote = Counter(m["chatID"] for m in sent if m.get("type") == "TEXT")
         if not wrote and not self.chats: return 0     # Beeper not running (or nothing to read): try again later
+        titles = {}
         try:
-            active = {c["id"] for c in beeper("chats", "list", "--limit", "60")
+            listed = beeper("chats", "list", "--limit", "60")
+            titles = {c["id"]: (c.get("title") or "", c.get("type") == "group") for c in listed if c.get("id")}
+            active = {c["id"] for c in listed
                       if c.get("lastActivity") and calendar.timegm(time.strptime(c["lastActivity"][:19], "%Y-%m-%dT%H:%M:%S")) > t0}
         except Exception: active = set()
-        with self.lock: known = set(self.chats)
+        with self.lock:
+            known = set(self.chats)
+            unnamed = [c for c in self.chats if "who" not in self.chats[c]]
         todo = [c for c, _ in wrote.most_common(80)] + sorted((active & known) - set(wrote))
+        todo += [c for c in unnamed if c not in todo][:BACKFILL]
         for chat in todo:
             new = chat not in known
             try: hist = beeper("messages", "list", "--chat", chat, "--limit", "400" if new else str(MARK_LINES))
@@ -183,6 +217,7 @@ class People:
                 fresh = [clean(h["text"]) for h in hist if h.get("isSender") and int(h.get("sortKey") or 0) > last]
                 c["mine"] = (c["mine"] + [t for t in fresh if t and not signed(t)])[-KEEP:]
                 if hist: c["key"] = str(max(last, int(hist[-1].get("sortKey") or 0)))
+                note_who(c, hist, titles.get(chat))
                 for h in hist[-MARK_LINES:]:
                     for l in clean(h["text"]).splitlines():
                         m = mark(l)

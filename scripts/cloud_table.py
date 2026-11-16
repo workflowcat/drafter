@@ -16,6 +16,7 @@ WHAT = {
     "pause": "Claude writes the rest of the sentence when you pause typing",
     "early": "the same, asked ahead at word ends",
     "proofread": "a proofread chip for the message you are typing",
+    "sentence": "the sentence you just ended, checked for typos (an experiment; also to Cloudflare Workers AI only when a key is set)",
     "facts": "an answer chip when the screen asks something your calendar or saved texts answer",
     "translate": "the message in your other language as a chip",
     "rework": "rework a selection (shorter, clearer, ...) with Option-Tab",

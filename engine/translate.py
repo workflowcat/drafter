@@ -83,15 +83,15 @@ def _worker(model):
 # idle processes are stopped by claude_type's one reaper (10 idle minutes, or at once when memory is low)
 
 
-def translate(text, target, context="", app="", model="sonnet", cancelled=lambda: False):
+def translate(text, target, context="", app="", model="sonnet", cancelled=lambda: False, hint=""):
     """-> {"text", "target", "ms"} or {} (nothing kept)."""
     text = (text or "").strip()
     if target not in NAMES or not text or len(text) > MAX_CHARS: return {}
     if not Path(ct.CLI).exists(): return {}
-    key = hashlib.sha1(json.dumps([text, target, (context or "")[-800:], model]).encode()).hexdigest()
+    key = hashlib.sha1(json.dumps([text, target, (context or "")[-800:], model] + ([hint] if hint else [])).encode()).hexdigest()
     if key in _cache: return dict(_cache[key], cached=True)
     _stats["asked"] += 1
-    user = (f"App: {app}\n\n" if app else "") + f"Translate into {NAMES[target]}.\n\n" + \
+    user = (f"App: {app}\n\n" if app else "") + (hint + "\n" if hint else "") + f"Translate into {NAMES[target]}.\n\n" + \
            ("Conversation on screen (newest last):\n" + context.strip()[-800:] + "\n\n" if context.strip() else "") + \
            "His message:\n" + text
     r = _worker(model).ask(user, cancelled, wait=1.0, deadline=10.0, whole=True)

@@ -41,5 +41,22 @@ class Edits(unittest.TestCase):
         self.assertEqual(p._u16("👍 "), 3)
 
 
+class HintInMessage(unittest.TestCase):
+    """The hint (keyboard line, person block; engine/whom.py) reaches the message to Claude. Made-up text."""
+    def test_hint_in_message(self):
+        import claude_type as ct
+        ct.CLI = sys.executable
+        got = []
+        class W:
+            def ask(self, user, *a, **k): got.append(user); return ("✓", 5, 9)
+        saved = p._worker
+        p._worker = lambda *a, **k: W()
+        try: p.check("вигаданий текст для перевірки тут зараз", hint="Keyboard now: Ukrainian. x\nChat with: Вигадана Особа\n")
+        finally: p._worker = saved
+        self.assertEqual(len(got), 1)
+        self.assertIn("Keyboard now: Ukrainian.", got[0])
+        self.assertIn("Chat with: Вигадана Особа", got[0])
+
+
 if __name__ == "__main__":
     unittest.main()

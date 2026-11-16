@@ -63,6 +63,19 @@ enum KeyLayout {
     }
     static var ukrainianNow: Bool { ukIDs.contains(currentID) }
 
+    /// The current input source's language ("uk", "en", ...; 2026-11-16, Andrii: "pass the fact of my current language
+    /// setting to Claude"): sent as `kb` with requests that can reach Claude (engine/whom.py). Read on the main thread
+    /// (TIS); elsewhere the last value read there.
+    private static var lastLanguage = ""
+    static var language: String {
+        guard Thread.isMainThread else { return lastLanguage }
+        guard let s = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+              let raw = TISGetInputSourceProperty(s, kTISPropertyInputSourceLanguages),
+              let langs = Unmanaged<CFArray>.fromOpaque(raw).takeUnretainedValue() as? [String], let first = langs.first else { return lastLanguage }
+        lastLanguage = first
+        return first
+    }
+
     static func select(uk: Bool) {
         if let s = source(uk ? ukIDs : enIDs) { TISSelectInputSource(s) }
     }
