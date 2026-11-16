@@ -16,6 +16,8 @@ enum UIShots {
         NSApp.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         // PREVIEW_ONLY=quick (or window, settings, strip): one surface, for a quick look while working on it
         let only = ProcessInfo.processInfo.environment["PREVIEW_ONLY"] ?? ""
+        if only == "speed" { try speedRun(folder, dark: dark); return }
+        if only == "zoom" { try zoomShots(folder, dark: dark); return }   // the gallery's zoom levels (PreviewZoom.swift)   // the window's speed (PreviewSpeed.swift)
         if only == "soft" { try softShots(folder, dark: dark); return }   // the soft round: gallery, list, peek, Go to, scroll cost
         if only == "shotjournal" { try shotJournalShots(folder, dark: dark); return }   // the screenshot tool's journal cards
         if only == "knowledge" { try EntityPreview.run(folder); return }   // the entity card, the mark and the context preview

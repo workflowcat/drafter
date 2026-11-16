@@ -137,10 +137,6 @@ enum PK {
             }
         }
     }
-    /// A mark as an image (for SwiftUI rows).
-    static func markImage(_ name: String, size: CGFloat = 16, tint: NSColor? = nil) -> NSImage {
-        NSImage(size: NSSize(width: size, height: size), flipped: false) { r in drawMark(name, in: r, tint: tint, line: PK.ink); return true }
-    }
     private static var glyphCache: [String: NSImage] = [:]
     /// A PixelKit line glyph as a template image: it takes the colour of the text around it.
     static func glyph(_ name: String) -> NSImage {

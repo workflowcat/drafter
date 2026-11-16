@@ -22,7 +22,8 @@ class ServerRoutes(unittest.TestCase):
                                            wake=Mock(return_value=True), memory_gb=Mock(return_value=(0.1, 2.0)), asleep=False)
         self.claude = types.SimpleNamespace(reap=Mock(return_value=2))
         self.timer = Mock()
-        self.builder = types.SimpleNamespace(ids=Mock(return_value=([1, 2, 3], '')), refresh=Mock(), head_ids=[])
+        self.builder = types.SimpleNamespace(ids=Mock(return_value=([1, 2, 3], '')), refresh=Mock(), head_ids=[],
+                                             ids_stable=Mock(return_value=([1, 2, 3], '', 2)))
         self.actions = types.SimpleNamespace(queue_app=Mock(return_value={'slots': []}))
         self.notes = types.SimpleNamespace(make=Mock(side_effect=lambda text, ask, *args, **kw: {'title': ask(text)}))
         self.runner = Mock(side_effect=lambda fn, **kwargs: fn(lambda: False))
@@ -36,7 +37,9 @@ class ServerRoutes(unittest.TestCase):
                          threading=types.SimpleNamespace(Timer=self.timer),
                          earlier=Mock(return_value=''), people_mem=types.SimpleNamespace(chats={}, add=Mock()),
                          parts=lambda r: (r.get('before') or '', r.get('app', ''), r.get('title', ''), r.get('context') or '', ' · '),
-                         dictionary=types.SimpleNamespace(add=Mock(return_value={'text': 'Synthetic'})))
+                         dictionary=types.SimpleNamespace(add=Mock(return_value={'text': 'Synthetic'})),
+                         fast_drop=lambda cancelled=None: {'fast': False}, WANT=[''], ahead_key=lambda req, pack=None: req.get('before', ''),
+                         keep_running=Mock(), early_off_path=lambda r: self.order.append('early'), extras=lambda r: ('', ''))
         exec(compile(ast.Module(body=[handler], type_ignores=[]), str(source), 'exec'), namespace)
         self.ns = namespace
         self.earlier = namespace['earlier']
@@ -73,7 +76,7 @@ class ServerRoutes(unittest.TestCase):
 
     def test_prefill_uses_model_worker(self):
         self.assertEqual(self.post('/prefill', {'before': 'Synthetic text'}), (200, {'fed': 3}))
-        self.model.prefill.assert_called_once_with([1, 2, 3], screen=' · ')
+        self.model.prefill.assert_called_once_with([1, 2, 3], screen=' · ', stable=2)
         self.assertFalse(self.runner.call_args.kwargs['newest'])
         self.assertFalse(self.earlier.call_args.kwargs['remember'])
 
@@ -139,3 +142,7 @@ class ServerRoutes(unittest.TestCase):
         self.assertEqual(self.post('/complete', {'before': 'test'}), (200, {'text': ''}))
         self.assertEqual(self.order, ['cancel', 'early', 'complete'])
         self.assertEqual(self.complete.call_args.kwargs, {'seq': 7})
+
+
+if __name__ == '__main__':
+    unittest.main()

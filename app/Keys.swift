@@ -611,7 +611,7 @@ final class Keys {
 
     /// Put the ghost exactly at the caret again after letters were typed into it.
     func realign() {
-        guard Ghost.shared.visible, let s = Focus.spot(skip: Drafter.shared.settings.skip, midLine: Keys.midLine).0, let r = s.rect else { return }
+        guard Ghost.shared.visible, let s = Focus.spot(skip: Drafter.shared.settings.skip, midLine: Keys.midLine, anchor: Keys.fallbackAnchor).0, let r = s.rect else { return }
         spot = s
         Ghost.shared.show(Ghost.shared.text, action: Ghost.shared.action, at: r, replace: Ghost.shared.replace, mid: s.mid)
     }
@@ -643,7 +643,7 @@ final class Keys {
     func cancel() {
         PeopleCards.clear(); EntityCard.shared.hide()
         endStat()
-        timer?.invalidate(); chipTimer?.invalidate(); pauseTimer?.invalidate(); idleTimer?.invalidate(); Proof.cancel(); Facts.cancel(); Translate.cancel(); seq += 1
+        timer?.invalidate(); chipTimer?.invalidate(); pauseTimer?.invalidate(); idleTimer?.invalidate(); Proof.cancel(); Reader.cancel(); Facts.cancel(); Translate.cancel(); seq += 1
         ghostAsk = nil; futureList = []; ideaList = []; ideaIndex = 0
         if Ghost.shared.visible { Ghost.shared.hide() }
     }
@@ -676,7 +676,7 @@ final class Keys {
         guard Talk.shared.state == .idle else { return }
         seq += 1; let mine = seq
         let tAX = Date()
-        let (s, why) = Focus.spot(skip: Drafter.shared.settings.skip, midLine: Keys.midLine)
+        let (s, why) = Focus.spot(skip: Drafter.shared.settings.skip, midLine: Keys.midLine, anchor: Keys.fallbackAnchor)
         if let l = gaps.field(s.map { Entities.kind($0) }, rev: keyRevision) { log(l) }   // nil: skipped app, password, secure input
         let ax = Int(Date().timeIntervalSince(tAX) * 1000)   // the first Accessibility read (logged with "shown", round two)
         if why == "no caret rect", let s0 = s { Caret.note(s0.app, s0.role, ok: false) }
@@ -730,7 +730,7 @@ final class Keys {
         let t0 = Date()
         scheduleChip()
         if held == .none { schedulePause(s, before, ctx, mine) }
-        if !Translate.schedule(s, context: ctx, seq: mine) { Proof.schedule(s, seq: mine) }
+        if !Translate.schedule(s, context: ctx, seq: mine), !Reader.schedule(s, context: ctx, seq: mine) { Proof.schedule(s, seq: mine) }
         Facts.schedule(s, context: ctx, seq: mine)
         // held: no ask, except for a word still being typed, whose "→ word" fix comes from the same ask (answer() drops
         // its plain grey text)
@@ -747,6 +747,8 @@ final class Keys {
 
     /// Setting `midLine` (2026-11-15, default off): the ghost paths read a caret mid-line too (Focus.spot).
     static var midLine: Bool { Drafter.shared.settings.midLine }
+    /// Setting `fallbackAnchor` (round 2026-11-17-anchor, on): a field with no caret rect gets an estimate or a chip.
+    static var fallbackAnchor: Bool { Drafter.shared.settings.fallbackAnchor }
 
     /// Mid-line (the caret at a gap with text after it on its line): only the local plain ghost is asked for. No chips,
     /// snippets, endings, lookups, Claude pause, proofread, translate or facts: each of those reads the line as ending
@@ -1075,7 +1077,7 @@ final class Keys {
             func place(_ again: Bool) {
                 // he typed or it changed meanwhile; a streamed answer's last words may have grown it (Argon 13)
                 guard Ghost.shared.visible, Ghost.shared.action == nil, Ghost.shared.text.hasPrefix(rest) else { return }
-                let (now, _) = Focus.spot(skip: Drafter.shared.settings.skip, midLine: Keys.midLine)
+                let (now, _) = Focus.spot(skip: Drafter.shared.settings.skip, midLine: Keys.midLine, anchor: Keys.fallbackAnchor)
                 if let now, let r = now.rect, now.before.hasSuffix(piece) {
                     self.spot = now; Ghost.shared.show(Ghost.shared.text, action: nil, at: r, mid: now.mid)   // its lighter tail kept
                     if self.keyRevision == tabRev { self.lastRead = (now, tabRev, Date()) }   // round five: the next key at once
@@ -1276,6 +1278,7 @@ enum Actions {
         case "eventkit.reminder": reminder(r)
         case "open": Presets.open(r, expected: Keys.shared.spot)   // a quick start (app/Presets.swift)
         case "proofread": Proof.apply()                              // the Fix chip (app/Proof.swift)
+        case "reader.note": Ghost.shared.hide()                      // the reader's "they asked about" chip: Tab puts it away
         case "translate": Translate.apply()                          // the message in the chat's language (app/Translate.swift)
         default:
             Engine.shared.post("/act", ["id": a["id"] ?? "", "fields": a["fields"] ?? [:]], timeout: 15) { j in

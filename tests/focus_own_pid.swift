@@ -1,7 +1,7 @@
 import AppKit
 import ApplicationServices
 
-// swiftc -parse-as-library app/Focus.swift app/GhostRules.swift tests/focus_own_pid.swift -o app/build/focus-own-pid-test && app/build/focus-own-pid-test
+// swiftc -parse-as-library app/Focus.swift app/GhostRules.swift app/AnchorRules.swift tests/focus_own_pid.swift -o app/build/focus-own-pid-test && app/build/focus-own-pid-test
 // 3 November 2026: a background Accessibility read of Drafter's own window waited for the main thread while main
 // waited in another AX call, and his side of a 53-minute call was lost. Off the main thread, Focus must never ask its
 // own process, and must answer at once even while main is blocked. (No Accessibility grant is needed: the guard
@@ -12,6 +12,9 @@ import ApplicationServices
 // stopped compiling
 enum History { static let ownType = NSPasteboard.PasteboardType("drafter.test.own"); static func skipChange(_ count: Int) {} }
 enum Screen { static var allowed = true; static func textAbove(pid: pid_t, caret: CGRect) -> String { "" } }
+// Keys, Fields: Focus.replace (moved from Voice.swift, 2026-11-16) reads the input revision and selects with arrows
+final class Keys { static let shared = Keys(); var inputRevision = 0 }
+enum Fields { static func left(_ n: Int, shift: Bool) {}; static func right(_ n: Int) {} }
 var logged: [String] = []
 let logLock = NSLock()
 func log(_ s: String, file: String = "app.log") { logLock.lock(); logged.append(s); logLock.unlock() }

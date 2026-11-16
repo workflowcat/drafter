@@ -18,22 +18,25 @@ extension WindowModel {
     }
 
     /// Every recording as a document (any thread).
-    static func readDocs() -> [CallDoc] {
-        let notes = CallDoc.notesIndex(Home.data.appendingPathComponent("notes"))
-        let dirs = ((try? FileManager.default.contentsOfDirectory(at: Spool.root, includingPropertiesForKeys: nil)) ?? [])
+    static func readDocs(root: URL = Spool.root, notes folder: URL = Home.data.appendingPathComponent("notes")) -> [CallDoc] {
+        let notes = CallDoc.notesIndex(folder)
+        let dirs = ((try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? [])
             .filter { $0.hasDirectoryPath }.sorted { $0.lastPathComponent > $1.lastPathComponent }
         return dirs.map { CallDoc.load($0, notes: notes) }.filter { !$0.turns.isEmpty || $0.live || $0.secs >= 20 }   // not a few seconds of silence
     }
 
-    func applyDocs(_ list: [CallDoc]) {
-        docs = list
-        if let d = doc { doc = docs.first { $0.id == d.id } }
+    /// New recordings in; the journal is built again only when they changed (the 3 s and 30 s ticks read them all
+    /// and rebuilt the whole journal each time, even with nothing new) or `rebuild` says so.
+    func applyDocs(_ list: [CallDoc], rebuild: Bool = false) {
+        let changed = list != docs
+        if changed { docs = list }
+        if changed, let d = doc { let n = docs.first { $0.id == d.id }; if n != d { doc = n } }
         // Read again is under way until a transcript newer than the click is written (an hour at most)
         for (id, since) in rereading {
             let t = (try? FileManager.default.attributesOfItem(atPath: URL(fileURLWithPath: id).appendingPathComponent("transcript.txt").path)[.modificationDate] as? Date) ?? .distantPast
             if t > since || Date().timeIntervalSince(since) > 3600 { rereading[id] = nil }
         }
-        rebuildTape()
+        if changed || rebuild { rebuildTape() }
     }
 
     /// brief.md for a recording that has none yet (no screenshots, or recorded before briefs existed).
@@ -70,15 +73,21 @@ extension WindowModel {
         let at = lead.deviceCurrentTime + 0.05
         for p in ps { p.currentTime = min(max(0, t - 0.5), p.duration); p.prepareToPlay(); p.play(atTime: at) }
         players = ps; playing = d.id; playhead = t
+        let starts = d.turns.map { ($0.id, $0.start ?? .infinity) }
+        func turn(_ at: Double) -> Int? { starts.last { $0.1 <= at }?.0 }
+        playTurn = turn(t)
         playTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
             guard let self, let p = self.players.first else { return }
             if !self.players.contains(where: { $0.isPlaying }) { self.stopPlaying(); return }
             self.playhead = p.currentTime
+            let now = turn(p.currentTime)
+            if now != self.playTurn { self.playTurn = now }
         }
     }
 
     func stopPlaying() {
-        players.forEach { $0.stop() }; players = []; playTimer?.invalidate(); playTimer = nil; playing = nil
+        players.forEach { $0.stop() }; players = []; playTimer?.invalidate(); playTimer = nil
+        if playing != nil { playing = nil }; if playTurn != nil { playTurn = nil }
     }
 }
 
@@ -138,7 +147,7 @@ struct DocView: View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(Array(d.whyEmpty(warnings: m.warnings[d.id] ?? []).enumerated()), id: \.offset) { _, w in
                 HStack(alignment: .firstTextBaseline, spacing: 9) {
-                    Rectangle().fill(w.problem ? UIInk.coral : UIInk.faint).frame(width: 6, height: 6).offset(y: -2)
+                    Circle().fill(w.problem ? UIInk.coral : UIInk.faint).frame(width: 6, height: 6).offset(y: -2)
                         .accessibilityHidden(true)
                     Text(w.text).font(PKFont.text(14)).fixedSize(horizontal: false, vertical: true)
                 }
@@ -150,7 +159,7 @@ struct DocView: View {
                         Text("Reading again…").font(PKFont.text(13)).foregroundStyle(UIInk.muted)
                     } else {
                         Button { m.reread(Entry(id: d.id, when: d.started, app: d.app, text: "", audio: d.id)) } label: {
-                            Label { Text("Read again") } icon: { Glyph("refresh", size: 14) }
+                            Label("Read again", systemImage: "arrow.clockwise")
                         }.buttonStyle(.borderedProminent).keyboardShortcut("r", modifiers: .command).help("Read both sides with today's reader (⌘R)")
                     }
                 }.padding(.top, 6)
@@ -159,7 +168,7 @@ struct DocView: View {
     }
 
     var forAgent: some View {
-        Button { m.sendToAgent(d) } label: { Label { Text("For agent") } icon: { Glyph("external", size: 14) } }
+        Button { m.sendToAgent(d) } label: { Label("For agent", systemImage: "arrow.up.forward.square") }
             .keyboardShortcut("a", modifiers: [.command, .shift])
             .help("Copy a line that points Claude or Codex at everything said\(d.shots.isEmpty ? "" : " and the screenshots") (⇧⌘A)")
             .disabled(d.turns.isEmpty)
@@ -176,7 +185,7 @@ struct DocView: View {
                         HStack(spacing: 5) {
                             PixelMark(name: Kind.person.mark, tint: UIInk.blue)
                             Text(p).font(PKFont.text(12.5))
-                        }.padding(.leading, 4).padding(.trailing, 8).padding(.vertical, 2).background(RoundedRectangle(cornerRadius: 4).fill(UIInk.soft))
+                        }.padding(.leading, 4).padding(.trailing, 8).padding(.vertical, 2).background(Capsule().fill(UIInk.soft))
                     }
                 }
             }
@@ -187,11 +196,11 @@ struct DocView: View {
                 }
                 // one main button: For agent, unless there are no words yet (then Read again, below, is the main one)
                 if empty { forAgent.buttonStyle(.bordered) } else { forAgent.buttonStyle(.borderedProminent) }
-                Button { m.copyNotes(d) } label: { Label { Text("Copy notes") } icon: { Glyph("copy", size: 14) } }
+                Button { m.copyNotes(d) } label: { Label("Copy notes", systemImage: "doc.on.doc") }
                     .keyboardShortcut("c", modifiers: [.command, .shift]).help("Title, people, summary and to-dos as Markdown (⇧⌘C)")
                 if d.hasAudio {
                     Button { m.playing == d.id ? m.stopPlaying() : m.play(d, from: 0) } label: {
-                        Label { Text(m.playing == d.id ? "Stop · \(stamp(m.playhead))" : "Play") } icon: { Glyph(m.playing == d.id ? "pause" : "play", size: 14) }
+                        Label { PlayWord(live: m.live, on: m.playing == d.id) } icon: { Image(systemName: m.playing == d.id ? "pause.fill" : "play.fill") }
                             .monospacedDigit()
                     }.help(d.call ? "Both sides together" : "Play the recording")
                 }
@@ -200,7 +209,7 @@ struct DocView: View {
                     if !d.note.isEmpty { Button("Open the note file") { NSWorkspace.shared.open(URL(fileURLWithPath: d.note)) } }
                     if d.hasAudio, !empty { Button("Read again with the current reader") { m.reread(Entry(id: d.id, when: d.started, app: d.app, text: "", audio: d.id)) }.disabled(reading) }
                     Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([d.dir]) }
-                } label: { Glyph("more", size: 16) }.menuStyle(.borderlessButton).fixedSize().accessibilityLabel("More")
+                } label: { Image(systemName: "ellipsis.circle") }.menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().accessibilityLabel("More")
             }.padding(.top, 2)
         }
     }
@@ -214,14 +223,14 @@ struct DocView: View {
 
     func bullet(_ s: String, _ terms: [String]) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 9) {
-            Rectangle().fill(UIInk.ink).frame(width: 4, height: 4).offset(y: -3)
+            Circle().fill(UIInk.ink).frame(width: 5, height: 5).offset(y: -3)
             Text(Mark.text(s, terms)).font(PKFont.text(14)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
         }
     }
 
     func todo(_ s: String, _ terms: [String]) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 9) {
-            Rectangle().stroke(UIInk.muted, lineWidth: 1).frame(width: 10, height: 10).offset(y: 1)
+            Circle().strokeBorder(UIInk.muted, lineWidth: 1).frame(width: 11, height: 11).offset(y: 1)
             Text(Mark.text(s, terms)).font(PKFont.text(14)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -246,7 +255,7 @@ struct DocView: View {
         let terms = CallDoc.terms(m.query)
         let hits = Set(d.hits(terms).map(\.id))
         let starts = d.turns.compactMap(\.start)
-        let now: Int? = m.playing == d.id ? d.turns.last(where: { ($0.start ?? .infinity) <= m.playhead })?.id : nil
+        let now: Int? = m.playing == d.id ? m.playTurn : nil
         return VStack(alignment: .leading, spacing: 2) {
             if !d.timed, !d.shots.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -271,6 +280,13 @@ struct DocView: View {
     }
 }
 
+/// Play, or Stop with the playhead's time: the one view the playhead's tick redraws.
+struct PlayWord: View {
+    @ObservedObject var live: LiveLine
+    let on: Bool
+    var body: some View { Text(on ? "Stop · \(stamp(live.playhead))" : "Play") }
+}
+
 struct TurnRow: View {
     @EnvironmentObject var m: WindowModel
     let d: CallDoc
@@ -288,7 +304,7 @@ struct TurnRow: View {
             }
             if !t.who.isEmpty {
                 HStack(spacing: 5) {
-                    Rectangle().fill(t.who == "Я" ? UIInk.blue : UIInk.coral).frame(width: 6, height: 6)
+                    Circle().fill(t.who == "Я" ? UIInk.blue : UIInk.coral).frame(width: 6, height: 6)
                     Text(CallDoc.who(t.who)).font(PKFont.mono(11)).foregroundStyle(UIInk.muted)
                 }.frame(width: 50, alignment: .leading)
             }
@@ -305,26 +321,36 @@ struct ShotThumb: View {
     let shot: Shot
     let width: CGFloat
     static let cache = NSCache<NSString, NSImage>()
-    var image: NSImage? {
-        let path = dir.appendingPathComponent(shot.file).path as NSString
-        if let i = Self.cache.object(forKey: path) { return i }
+    private static let decode = DispatchQueue(label: "drafter.shot-thumbs", qos: .userInitiated, attributes: .concurrent)
+    @State private var loaded: NSImage?
+    var path: NSString { dir.appendingPathComponent(shot.file).path as NSString }
+    /// The thumbnail, decoded off the main thread (native round: a recording with 40 screenshots decoded them all on
+    /// it as it opened); the same box holds its place meanwhile, so nothing moves when it comes.
+    static func thumb(_ path: NSString) -> NSImage? {
         guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path as String) as CFURL, nil),
               let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: 720] as CFDictionary)
         else { return nil }
         let i = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
-        Self.cache.setObject(i, forKey: path); return i
+        cache.setObject(i, forKey: path); return i
     }
     var body: some View {
+        let image = loaded ?? Self.cache.object(forKey: path)
         VStack(alignment: .leading, spacing: 4) {
             Button { NSWorkspace.shared.open(dir.appendingPathComponent(shot.file)) } label: {
                 Group {
                     if let i = image { Image(nsImage: i).resizable().aspectRatio(contentMode: .fit) }
                     else { Rectangle().fill(UIInk.soft).aspectRatio(16 / 10, contentMode: .fit) }
                 }
-                .frame(width: width).overlay { Rectangle().stroke(UIInk.line, lineWidth: 1) }
+                .frame(width: width).clipShape(RoundedRectangle(cornerRadius: 6))
+                .overlay { RoundedRectangle(cornerRadius: 6).strokeBorder(UIInk.line, lineWidth: 0.5) }
             }.buttonStyle(.plain).help("Open the screenshot")
             Text([shot.app, shot.title].filter { !$0.isEmpty }.joined(separator: " · ")).font(PKFont.mono(11)).foregroundStyle(UIInk.faint)
                 .lineLimit(1).frame(width: width, alignment: .leading)
+        }
+        .onAppear {
+            guard image == nil else { return }
+            let p = path
+            Self.decode.async { let i = Self.thumb(p); DispatchQueue.main.async { loaded = i } }
         }
     }
 }

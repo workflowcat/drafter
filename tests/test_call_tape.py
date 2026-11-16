@@ -154,7 +154,7 @@ class CallStatic(unittest.TestCase):
             self.assertIn('offLimits', body, name)
 
     def test_recording_is_written_off_main_and_kept_at_the_end(self):
-        voice = (ROOT / 'app/Voice.swift').read_text()
+        voice = ''.join((ROOT / 'app' / f).read_text() for f in ('Voice.swift', 'TalkLive.swift', 'TalkRecord.swift', 'TalkFlow.swift'))
         call = (ROOT / 'app/Call.swift').read_text()
         heard = voice.split('    func heard(', 1)[1].split('\n    }\n', 1)[0]
         self.assertNotIn('spool?.add', heard, 'the main thread must not write the recording')

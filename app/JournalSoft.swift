@@ -27,7 +27,23 @@ extension WindowModel {
         DispatchQueue.main.async { if let c = self.chosen { self.scrollToChosen(c) } }
         status = v == "gallery" ? "Gallery · ⌥⌘2 the list" : "List · ⌥⌘1 the gallery"
     }
+    /// The gallery's place on the zoom ladder (GalleryZoom): days and lines are held here for the session, the card
+    /// sizes are the setting.
+    var galleryLevel: GalleryZoom.Level { galleryFar ?? .cards(settings.cardSize) }
+    /// A step along the ladder: a pinch (at the pointer) or ⌘+ ⌘-. The card sizes keep their setting.
+    func zoomGallery(_ d: Int, at point: NSPoint? = nil) {
+        let now = galleryLevel, next = GalleryZoom.step(now, by: d)
+        guard next != now else { return }
+        galleryView?.prepareZoom(at: point, nearer: next > now)
+        if let s = next.cardSize {
+            galleryFar = nil
+            if s != settings.cardSize { setSetting { $0.cardSize = s } }
+        } else { galleryFar = next }
+        tapeTick += 1
+        status = next.name + " · pinch, or ⌘+ ⌘-"
+    }
     func setCardSize(_ d: Int) {
+        if gallery { zoomGallery(d); return }
         let n = JournalLayout.step(settings.cardSize + d)
         guard n != settings.cardSize else { return }
         setSetting { $0.cardSize = n }

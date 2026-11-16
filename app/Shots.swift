@@ -127,13 +127,13 @@ final class Shots {
         }
     }
 
-    /// The display under the mouse, without Drafter's own windows (the strip would sit on every shot).
+    /// The display under the mouse, without the strip and the capture's chrome (OwnChrome); Drafter's window shows.
+    /// Main thread.
     static func target(_ c: SCShareableContent) -> (SCDisplay, SCContentFilter)? {
         let mouse = NSEvent.mouseLocation
         let id = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) })?.number
         guard let d = c.displays.first(where: { $0.displayID == id }) ?? c.displays.first else { return nil }
-        let mine = c.applications.filter { $0.processID == getpid() }
-        return (d, SCContentFilter(display: d, excludingApplications: mine, exceptingWindows: []))
+        return (d, OwnChrome.filter(d, c, hide: OwnChrome.ids()))
     }
 
     // MARK: pictures

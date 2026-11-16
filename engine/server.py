@@ -1266,6 +1266,17 @@ def sentence_proof(req):
     return r
 
 
+def reader_check(req):
+    """A last look before he sends a chat message (engine/reader.py): slips and a question left open. Local only, no
+    model, nothing sent; off unless `readerCheck`."""
+    st = settings_load()
+    if not st.get("readerCheck"): return {"edits": [], "ask": "", "src": "off"}
+    import reader
+    r = reader.check(str(req.get("text") or ""), str(req.get("context") or "")[-3000:], finisher)
+    if (DATA / "debug").exists(): print("reader:", r["ms"], len(r["edits"]), bool(r["ask"]), flush=True)
+    return r
+
+
 def facts(req):
     """A question on screen that his calendar or saved texts answer (engine/facts.py). Off with `claudeTyping` or
     `facts` false, or offline; a newer key cancels it."""
@@ -1462,7 +1473,7 @@ class H(BaseHTTPRequestHandler):
                               "words": len(dictionary.load()["words"]), "actions": [a.ID for a in actions.ALL],
                               "model_link": {"provider": provider.kind(), "connected": provider.connected(), "error": provider.state["last_error"]},
                               "claude_early": claude_type.early_stats(), "claude_gate": CLAUDE_GATE,
-                              "proofread": sys.modules["proofread"].stats() if "proofread" in sys.modules else {},
+                              "proofread": sys.modules["proofread"].stats() if "proofread" in sys.modules else {}, "reader": sys.modules["reader"].stats() if "reader" in sys.modules else {},
                               "sentence": sentence_mod.stats(),
                               "facts": sys.modules["facts"].stats() if "facts" in sys.modules else {},
                               "translate": sys.modules["translate"].stats() if "translate" in sys.modules else {},
@@ -1496,6 +1507,7 @@ class H(BaseHTTPRequestHandler):
         if self.path == "/pause": return self.send(pause(req))
         if self.path == "/proofread": return self.send(proof(req))
         if self.path == "/sentence": return self.send(sentence_proof(req))
+        if self.path == "/reader": return self.send(reader_check(req))
         if self.path == "/facts": return self.send(facts(req))
         if self.path == "/translate": return self.send(translate(req))
         if self.path == "/rework": return self.send(rework(req))
@@ -1639,8 +1651,8 @@ class H(BaseHTTPRequestHandler):
         if self.path == "/settings":
             # Aleph (or anything local) changes Drafter here; the app picks the file up within a second
             st = settings_load() or {cloud.MARK: "off"}   # a file made here is a new install's: never migrated
-            for k in ("paused", "skip", "actions_off", "model", "voice", "voiceFast", "voiceCareful", "learn", "screen", "adapter", "fmt", "voiceLive", "minGhost", "predictKeys",
-                      "claudeTyping", "claudePause", "nextMessage", "proofread", "sentenceProof", "facts", "translate", "rework", "proofreadOff", "callNotes",
+            for k in ("paused", "skip", "actions_off", "model", "voice", "voiceFast", "voiceCareful", "learn", "adapter", "fmt", "minGhost", "predictKeys",
+                      "claudeTyping", "claudePause", "nextMessage", "proofread", "sentenceProof", "readerCheck", "facts", "translate", "rework", "proofreadOff", "callNotes",
                       "streamGhost", "longGhostsAI", "longGhostsChats", "autocorrectMode"):
                 if k in req: st[k] = req[k]
             tmp = DATA / "settings.tmp"; tmp.write_text(json.dumps(st, ensure_ascii=False, indent=2)); tmp.replace(DATA / "settings.json")

@@ -156,3 +156,7 @@ class ContextCompletion(unittest.TestCase):
             self.assertIn(condition, helper)
         self.assertLess(helper.index('Ghost.shared.hide()'), helper.index('remember(key, text)'))
         self.assertIn('context: another conversation under the same title, suggestion dropped', helper)
+
+
+if __name__ == '__main__':
+    unittest.main()

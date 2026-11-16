@@ -49,13 +49,21 @@ struct GalleryList: NSViewRepresentable {
         let s = FitScroll()
         s.hasVerticalScroller = true; s.autohidesScrollers = true; s.drawsBackground = false; s.borderType = .noBorder
         s.scrollerStyle = .overlay
+        // native scrolling: momentum and elastic edges, even when the page is shorter than the window
+        s.verticalScrollElasticity = .allowed; s.horizontalScrollElasticity = .none
         let v = GalleryView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
         v.model = m; v.autoresizingMask = [.width]
         s.documentView = v
         m.galleryView = v
+        // the chunk at the top: a floating view of its own, so a scroll moves the drawn page and redraws nothing
+        // (native round: every scroll step redrew every card in view)
+        let head = GalleryStickyHead(frame: NSRect(x: 0, y: 0, width: 600, height: GalleryView.chunkH))
+        head.gallery = v; head.autoresizingMask = [.width]; head.isHidden = true
+        s.addFloatingSubview(head, for: .vertical)
+        v.sticky = head
         s.contentView.postsBoundsChangedNotifications = true
         NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: s.contentView, queue: .main) { [weak v] _ in
-            v?.needsDisplay = true; v?.reportChunk()
+            v?.scrolled(); v?.reportChunk()
         }
         return s
     }
@@ -64,19 +72,49 @@ struct GalleryList: NSViewRepresentable {
         m.galleryView = v
         let w = s.contentView.bounds.width
         if v.frame.width != w, w > 0 { v.setFrameSize(NSSize(width: w, height: v.frame.height)) }
-        let snap = m.snap
-        if snap != v.snap || v.size != m.settings.cardSize || v.laidWidth != v.bounds.width { v.apply(snap, size: m.settings.cardSize) }
+        let snap = m.snap, level = m.galleryLevel
+        if snap != v.snap || v.level != level || v.laidWidth != v.bounds.width { v.apply(snap, level: level) }
+    }
+}
+
+/// The chunk header held at the top of the gallery while its cards scroll under it (a floating subview).
+final class GalleryStickyHead: NSView {
+    weak var gallery: GalleryView?
+    var line: Int?
+    override var isFlipped: Bool { true }
+    override func draw(_ dirty: NSRect) {
+        guard let g = gallery, let k = line, k < g.snap.lines.count else { return }
+        g.drawSticky(g.snap.lines[k], bounds)
+    }
+    override func mouseDown(with e: NSEvent) {
+        guard let g = gallery, let k = line, k < g.snap.lines.count, let m = g.model else { return }
+        let id = g.snap.lines[k].id
+        m.choose(id); m.toggleFold(id)
     }
 }
 
 final class GalleryView: NSView, NSDraggingSource {
     weak var model: WindowModel?
     var snap = TapeSnap()
-    var size = 1
+    var level = GalleryZoom.Level.medium
+    var size: Int { level.cardSize ?? 0 }
     var laidWidth: CGFloat = -1
+    weak var sticky: GalleryStickyHead?
+    /// The page's running lowest edge: blocks share a row top but not a height, so the search for the first block in
+    /// view goes by the lowest edge so far, which only grows.
+    private var reach: [CGFloat] = []
+    /// Days level: each day's start and its items (indices in the model's rows), newest first.
+    private(set) var days: [(start: Double, items: [Int])] = []
+    private var heights: [Int: CGFloat] = [:]          // measured text heights (text, font, width)
+    private var summaries: [String: String] = [:]      // one-line summaries by item or day
+    private var pinch = GalleryZoom.Pinch()
+    private var pendingZoom: (pointer: NSPoint, top: CGFloat, at: Double?, id: String?, old: NSRect?, image: NSImage?, nearer: Bool)?
+    private var pop: NSPopover?
+    private var popFor: String?
+    private var popWork: DispatchWorkItem?
     override var isFlipped: Bool { true }
 
-    enum Block { case header(Int), label(Int), rule(Int), part(Int), card(Int) }
+    enum Block { case header(Int), label(Int), rule(Int), part(Int), card(Int), day(Int) }
     struct Placed { let block: Block; let rect: NSRect }
     private(set) var placed: [Placed] = []
     private var at: [String: Int] = [:]       // line id → placed index
@@ -109,11 +147,15 @@ final class GalleryView: NSView, NSDraggingSource {
 
     // MARK: layout
 
-    func apply(_ s: TapeSnap, size: Int) {
-        let again = s.lines != snap.lines || s.build != snap.build || size != self.size || laidWidth != bounds.width
+    func apply(_ s: TapeSnap, level: GalleryZoom.Level) {
+        let zoomed = level != self.level
+        let again = s.lines != snap.lines || s.build != snap.build || zoomed || laidWidth != bounds.width
         let oldChosen = snap.chosen
-        snap = s; self.size = size
+        // no jump when new content comes in: the first card in view keeps its place on the screen
+        let keep = again && !zoomed ? firstInView() : nil
+        snap = s; self.level = level
         if again { relayout() }
+        if zoomed { finishZoom() } else if let k = keep { hold(k) }
         if let c = s.chosen, c != oldChosen, let i = at[c], let from = lastChosenRect, PK.motion("fold") > 0 {
             glide = (from, Date().timeIntervalSince1970)
             glideTimer?.invalidate()
@@ -130,14 +172,16 @@ final class GalleryView: NSView, NSDraggingSource {
         laidWidth = bounds.width
         guard let m = model else { return }
         let w = Double(bounds.width)
-        cols = JournalLayout.columns(width: w, size: size)
+        let lines = level == .lines
+        cols = lines ? Swift.max(1, Swift.min(8, Int(((w - 2 * JournalLayout.pad + JournalLayout.gap) / (GalleryZoom.lineCardMin + JournalLayout.gap)).rounded(.down))))
+                     : JournalLayout.columns(width: w, size: size)
         m.galleryCols = cols
         let cw = CGFloat(JournalLayout.cardWidth(width: w, cols: cols))
-        let ch = CGFloat(JournalLayout.cardHeight[JournalLayout.step(size)])
         let gap = CGFloat(JournalLayout.gap), pad = CGFloat(JournalLayout.pad)
         var out: [Placed] = [], map: [String: Int] = [:]
         out.reserveCapacity(snap.lines.count)
         var y: CGFloat = 6
+        if level == .days { layoutDays(m, pad: pad, gap: gap); return }
         // a run: the sessions and single items between two headers, packed into the grid without gaps; a session's
         // label sits in a strip above the grid row where its first card is, as wide as its cards in that row
         var run: [(line: Int, label: Bool)] = []
@@ -146,7 +190,7 @@ final class GalleryView: NSView, NSDraggingSource {
             var cards: [Int] = [], labels: [(line: Int, first: Int, count: Int)] = []
             var open: Int?   // the label whose cards are being counted
             for e in run {
-                if e.label { labels.append((e.line, cards.count, 0)); open = labels.count - 1 }
+                if e.label { if !lines { labels.append((e.line, cards.count, 0)); open = labels.count - 1 } }
                 else {
                     if let o = open, snap.lines[e.line].inSession { labels[o].count += 1 } else { open = nil }
                     cards.append(e.line)
@@ -172,12 +216,17 @@ final class GalleryView: NSView, NSDraggingSource {
                     }
                 }
                 y += strip
+                // each card as tall as its content (native round: one height for all left tall empty cards and cut
+                // others off); a row's cards share its top
+                var rowH: CGFloat = 0
                 for k in (r * cols)..<min(cards.count, (r + 1) * cols) {
                     let l = cards[k]
+                    let ch = lines ? CGFloat(GalleryZoom.lineCardH) : cardHeight(m, snap.lines[l], width: cw)
                     let rect = NSRect(x: pad + CGFloat(k % cols) * (cw + gap), y: y, width: cw, height: ch)
                     map[snap.lines[l].id] = out.count; out.append(Placed(block: .card(l), rect: rect))
+                    rowH = Swift.max(rowH, ch)
                 }
-                y += ch + gap
+                y += rowH + gap
             }
             run = []
         }
@@ -197,9 +246,84 @@ final class GalleryView: NSView, NSDraggingSource {
             }
         }
         flush()
+        finish(out, map, bottom: y + pad)
+    }
+
+    private func finish(_ out: [Placed], _ map: [String: Int], bottom: CGFloat) {
         placed = out; at = map
-        let h = max(y + pad, enclosingScrollView?.contentView.bounds.height ?? 0)
+        var r: [CGFloat] = [], lo: CGFloat = 0
+        r.reserveCapacity(out.count)
+        for p in out { lo = Swift.max(lo, p.rect.maxY); r.append(lo) }
+        reach = r
+        let h = max(bottom, enclosingScrollView?.contentView.bounds.height ?? 0)
         if frame.height != h { setFrameSize(NSSize(width: bounds.width, height: h)) }
+    }
+
+    /// The days level: one row per day, over every item the search and the filter leave (folded chunks too).
+    private func layoutDays(_ m: WindowModel, pad: CGFloat, gap: CGFloat) {
+        let cal = TapeBuild.cal
+        let vis = m.outline.vis
+        var out: [Placed] = [], ds: [(start: Double, items: [Int])] = []
+        var y: CGFloat = 6
+        for i in m.rows.indices where i < vis.count && vis[i] {
+            let start = cal.startOfDay(for: Date(timeIntervalSince1970: m.rows[i].at)).timeIntervalSince1970
+            if let l = ds.last, l.start == start { ds[ds.count - 1].items.append(i) } else { ds.append((start, [i])) }
+        }
+        for k in ds.indices {
+            out.append(Placed(block: .day(k), rect: NSRect(x: pad, y: y, width: bounds.width - 2 * pad, height: CGFloat(GalleryZoom.dayRowH))))
+            y += CGFloat(GalleryZoom.dayRowH) + gap / 2
+        }
+        days = ds
+        finish(out, [:], bottom: y + pad)
+    }
+
+    // MARK: card heights
+
+    /// A text's height at a width, measured once (the same attributes the card draws with).
+    private func measure(_ a: NSAttributedString, _ w: CGFloat) -> CGFloat {
+        guard a.length > 0 else { return 0 }
+        var h = Hasher(); h.combine(a.string); h.combine(Int(w)); h.combine(size)
+        if let f = a.attribute(.font, at: 0, effectiveRange: nil) as? NSFont { h.combine(f.fontName); h.combine(f.pointSize) }
+        let key = h.finalize()
+        if let v = heights[key] { return v }
+        let v = ceil(a.boundingRect(with: NSSize(width: w, height: 10_000), options: [.usesLineFragmentOrigin]).height)
+        if heights.count > 20_000 { heights.removeAll() }
+        heights[key] = v
+        return v
+    }
+
+    /// A card's height from what it shows, between a floor of two text lines and a ceiling per size (5, 8, 12 lines).
+    private func cardHeight(_ m: WindowModel, _ l: JLine, width cw: CGFloat) -> CGFloat {
+        let s = JournalLayout.step(size)
+        let fixed = CGFloat(JournalLayout.cardHeight[s])
+        guard l.item >= 0, l.item < m.rows.count else { return fixed }
+        let it = m.rows[l.item]
+        let top = JournalLayout.cardTop, foot = Double(Self.footH) - 1
+        let lh = JournalLayout.lineHeight(s), w = cw - 24
+        let floor = lh * 2, ceiling = lh * [5, 8, 12][s]
+        func fit(_ c: CGFloat, max: Double = ceiling) -> CGFloat { CGFloat(GalleryZoom.fit(content: Double(c), top: top, foot: foot, minContent: floor, maxContent: max)) }
+        if let d = it.doc {
+            var c = callTitleH(it, d, w) + 4 + 30
+            if d.call, d.meSecs + d.themSecs > 0 { c += 14 }
+            if let p = d.points.first { c += Swift.min(measure(NSAttributedString(string: p, attributes: [.font: PK.text(12)]), w), ceil(12 * 1.3 * 2 + 2)) }
+            return fit(c, max: ceiling + 40)
+        }
+        guard let e = it.entry else { return fixed }
+        switch e.clip {
+        case .image where it.kind == .copied: return fixed
+        case .file where it.kind == .copied: return size == 0 ? fixed : fit(46 + 8 + 14 * 2.6 + 20)
+        case .link where it.kind == .copied:
+            let d: CGFloat = size == 0 ? 26 : 34
+            return fit(2 + d + 10 + Swift.min(measure(linkTitle(it, e), w), ceil(linkFont.pointSize * 1.3 * 3)))
+        default:
+            // a text far longer than the ceiling holds is not measured: it takes the ceiling (and fades at its foot);
+            // the chips go under the text when it leaves room, else into the foot (the detector runs only to draw)
+            let full = it.shown.isEmpty || it.kind == .typed ? it.current : it.shown
+            let perLine = Double(w) / (JournalLayout.textSize[s] * 0.62)
+            if Double(full.utf16.count) > perLine * (ceiling / lh) * 1.6 { return fit(CGFloat(ceiling)) }
+            let mono = it.kind == .copied && JournalMeta.codeLike(it.current)
+            return fit(measure(textAttr(it, mono: mono), w))
+        }
     }
 
     override func setFrameSize(_ s: NSSize) {
@@ -210,8 +334,8 @@ final class GalleryView: NSView, NSDraggingSource {
 
     /// The first placed block whose bottom is below `y` (binary search: the blocks go down the page in order).
     private func first(below y: CGFloat) -> Int {
-        var lo = 0, hi = placed.count
-        while lo < hi { let mid = (lo + hi) / 2; if placed[mid].rect.maxY < y { lo = mid + 1 } else { hi = mid } }
+        var lo = 0, hi = reach.count
+        while lo < hi { let mid = (lo + hi) / 2; if reach[mid] < y { lo = mid + 1 } else { hi = mid } }
         return max(0, lo - 2 * cols)   // a row's labels and cards share a top: step back past them
     }
 
@@ -225,6 +349,43 @@ final class GalleryView: NSView, NSDraggingSource {
         y = max(0, min(y, frame.height - vis.height))
         if y != vis.minY { clip.scroll(to: NSPoint(x: 0, y: y)); enclosingScrollView?.reflectScrolledClipView(clip) }
         reportChunk()
+    }
+
+    /// A scroll step: only the floating header may change (which chunk, pushed up by the next one); the page itself
+    /// is moved, not drawn again.
+    func scrolled() {
+        if pop != nil { closePop() }
+        guard let head = sticky else { return }
+        let vis = visibleRect
+        var line: Int?, y: CGFloat = 0
+        if level != .days, let k = chunkAbove(vis.minY), let pi = at[snap.lines[k].id], placed[pi].rect.minY < vis.minY {
+            line = k
+            if let next = placed[(pi + 1)...].first(where: { if case .header(let j) = $0.block { return snap.lines[j].kind == .chunk }; return false }),
+               next.rect.minY < vis.minY + Self.chunkH { y = next.rect.minY - vis.minY - Self.chunkH }   // the next chunk pushes it up
+        }
+        let frame = NSRect(x: 0, y: y, width: bounds.width, height: Self.chunkH)
+        if head.line != line || head.frame != frame || head.isHidden != (line == nil) {
+            let redraw = head.line != line
+            head.line = line; head.isHidden = line == nil; head.frame = frame
+            if redraw { head.needsDisplay = true }
+        }
+    }
+
+    /// The first card in view and its distance from the top (for `hold`).
+    private func firstInView() -> (id: String, dy: CGFloat)? {
+        let vis = visibleRect
+        guard vis.minY > 0 else { return nil }
+        var i = first(below: vis.minY)
+        while i < placed.count, placed[i].rect.minY <= vis.maxY {
+            if case .card = placed[i].block, placed[i].rect.minY >= vis.minY - 1 { return (lineId(i), placed[i].rect.minY - vis.minY) }
+            i += 1
+        }
+        return nil
+    }
+    private func hold(_ k: (id: String, dy: CGFloat)) {
+        guard let i = at[k.id], let clip = enclosingScrollView?.contentView else { return }
+        let y = max(0, min(placed[i].rect.minY - k.dy, frame.height - clip.bounds.height))
+        if abs(y - clip.bounds.minY) > 0.5 { clip.scroll(to: NSPoint(x: 0, y: y)); enclosingScrollView?.reflectScrolledClipView(clip) }
     }
 
     func reportChunk() {
@@ -267,19 +428,16 @@ final class GalleryView: NSView, NSDraggingSource {
                 case .label(let k): drawLabel(snap.lines[k], p.rect, m)
                 case .part(let k): drawPart(snap.lines[k], p.rect)
                 case .rule: drawRule(p.rect)
+                case .day(let k): drawDay(k, p.rect, m)
                 }
             }
             i += 1
         }
-        // the chunk in view stays at the top while its cards scroll under it
-        if let k = chunkAbove(vis.minY), let pi = at[snap.lines[k].id], placed[pi].rect.minY < vis.minY {
-            var r = NSRect(x: 0, y: vis.minY, width: bounds.width, height: Self.chunkH)
-            if let next = placed[(pi + 1)...].first(where: { if case .header(let j) = $0.block { return snap.lines[j].kind == .chunk }; return false }),
-               next.rect.minY < r.maxY { r.origin.y = next.rect.minY - r.height }   // the next chunk pushes it up
-            drawHeader(snap.lines[k], r, sticky: true)
-        }
         drawMs = Date().timeIntervalSince(t0) * 1000
     }
+
+    /// The floating header's drawing (GalleryStickyHead), in its own bounds.
+    func drawSticky(_ l: JLine, _ r: NSRect) { drawHeader(l, r, sticky: true) }
 
     private func drawHeader(_ l: JLine, _ r: NSRect, sticky: Bool) {
         let chunk = l.kind == .chunk
@@ -358,6 +516,7 @@ final class GalleryView: NSView, NSDraggingSource {
                          width: g.from.width + (r.width - g.from.width) * e, height: g.from.height + (r.height - g.from.height) * e)
         }
         if chosen { lastChosenRect = r }
+        if level == .lines { drawLineCard(it, r, chosen: chosen, picked: picked, hovered: hovered, gone: gone); return }
         let path = NSBezierPath(roundedRect: r.insetBy(dx: 0.25, dy: 0.25), xRadius: rad, yRadius: rad)
         (picked ? PK.pick : hovered ? PK.hover : PK.card).setFill(); path.fill()
         PK.line.setStroke(); path.lineWidth = 0.5; path.stroke()
@@ -440,12 +599,31 @@ final class GalleryView: NSView, NSDraggingSource {
         }
     }
     /// The height the card's text wants at this width (for where the chips go).
-    private func textNeed(_ it: TapeItem, _ r: NSRect, mono: Bool) -> CGFloat {
-        let s = (it.shown.isEmpty || it.kind == .typed ? it.current : it.shown).trimmingCharacters(in: .whitespacesAndNewlines)
+    private func textNeed(_ it: TapeItem, _ r: NSRect, mono: Bool) -> CGFloat { measure(textAttr(it, mono: mono), r.width) }
+
+    /// A text card's words as drawn (no search marks): the first sentence semibold.
+    private func textAttr(_ it: TapeItem, mono: Bool) -> NSAttributedString {
+        let full = it.shown.isEmpty || it.kind == .typed ? it.current : it.shown
+        var s = full.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.isEmpty { s = it.entry?.incomplete == true ? "No final text" : "Empty" }
         let f = mono ? PK.mono(textSize - 1) : PK.text(textSize)
         let ps = NSMutableParagraphStyle(); ps.lineSpacing = mono ? 2 : 3; ps.lineBreakMode = .byWordWrapping
-        return NSAttributedString(string: s, attributes: [.font: f, .paragraphStyle: ps])
-            .boundingRect(with: NSSize(width: r.width, height: 10_000), options: [.usesLineFragmentOrigin]).height
+        let a = NSMutableAttributedString(string: s, attributes: [.font: f, .foregroundColor: PK.ink, .paragraphStyle: ps])
+        if !mono, let n = JournalMeta.firstSentence(s), n <= a.length { a.addAttribute(.font, value: PK.text(textSize, .semibold), range: NSRange(location: 0, length: n)) }
+        return a
+    }
+    private var linkFont: NSFont { PK.text(size == 2 ? 17 : size == 0 ? 13.5 : 15.5, .semibold) }
+    private func linkTitle(_ it: TapeItem, _ e: Entry) -> NSAttributedString {
+        let p = ClipRules.parts(e.text)
+        let title = e.clipTitle.isEmpty ? (p.last.isEmpty ? p.host : p.last) : e.clipTitle
+        let ps = NSMutableParagraphStyle(); ps.lineSpacing = 2
+        return NSAttributedString(string: title, attributes: [.font: linkFont, .foregroundColor: PK.ink, .paragraphStyle: ps])
+    }
+    /// A recording card's title: up to two lines.
+    private func callTitleH(_ it: TapeItem, _ d: CallDoc, _ w: CGFloat) -> CGFloat {
+        let tf = PK.text(size == 0 ? 13.5 : 15, .semibold)
+        let title = it.shown.isEmpty ? (d.title.isEmpty ? (d.call ? "Recording" : "Voice note") : d.title) : it.shown
+        return Swift.min(measure(NSAttributedString(string: title, attributes: [.font: tf]), w), ceil(tf.pointSize * 2.7))
     }
 
     private func drawText(_ it: TapeItem, _ r: NSRect, bg: NSColor, mono: Bool) {
@@ -467,7 +645,8 @@ final class GalleryView: NSView, NSDraggingSource {
         if !mono, start == 0, let n = JournalMeta.firstSentence(s), n <= a.length { a.addAttribute(.font, value: PK.text(textSize, .semibold), range: NSRange(location: 0, length: n)) }
         let hl = PK.series("blue").withAlphaComponent(PK.dark ? 0.38 : 0.22)
         for mk in marks where NSMaxRange(mk) <= a.length { a.addAttribute(.backgroundColor, value: hl, range: mk) }
-        let need = a.boundingRect(with: NSSize(width: r.width, height: 10_000), options: [.usesLineFragmentOrigin]).height
+        let need = start > 0 || !marks.isEmpty ? a.boundingRect(with: NSSize(width: r.width, height: 10_000), options: [.usesLineFragmentOrigin]).height
+                                               : measure(a, r.width)
         a.draw(with: r, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
         if need > r.height + 2 {   // the bottom fades instead of cutting a line in half
             let fr = NSRect(x: r.minX - 12, y: r.maxY - 22, width: r.width + 24, height: 24)
@@ -486,10 +665,7 @@ final class GalleryView: NSView, NSDraggingSource {
         TapeDraw.line(mark.letter, NSRect(x: c.midX - lw / 2, y: TapeDraw.lineTop(lf, mid: c.midY), width: lw + 2, height: d), la)
         let hf = PK.text(11.5)
         TapeDraw.line(p.host, NSRect(x: c.maxX + 10, y: TapeDraw.lineTop(hf, mid: c.midY), width: r.width - d - 10, height: 16), TapeDraw.at(hf, PK.muted))
-        let title = e.clipTitle.isEmpty ? (p.last.isEmpty ? p.host : p.last) : e.clipTitle
-        let tf = PK.text(size == 2 ? 17 : size == 0 ? 13.5 : 15.5, .semibold)
-        let ps = NSMutableParagraphStyle(); ps.lineSpacing = 2
-        let a = NSAttributedString(string: title, attributes: [.font: tf, .foregroundColor: PK.ink, .paragraphStyle: ps])
+        let a = linkTitle(it, e)
         a.draw(with: NSRect(x: r.minX, y: c.maxY + 10, width: r.width, height: r.maxY - c.maxY - 10), options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
     }
 
@@ -581,7 +757,7 @@ final class GalleryView: NSView, NSDraggingSource {
     private func drawCall(_ it: TapeItem, _ d: CallDoc, _ r: NSRect) {
         let tf = PK.text(size == 0 ? 13.5 : 15, .semibold)
         let title = it.shown.isEmpty ? (d.title.isEmpty ? (d.call ? "Recording" : "Voice note") : d.title) : it.shown
-        let titleH = tf.pointSize * (r.height < 110 ? 1.4 : 2.7)   // a short card: one line of title
+        let titleH = callTitleH(it, d, r.width)
         NSAttributedString(string: title, attributes: [.font: tf, .foregroundColor: PK.ink])
             .draw(with: NSRect(x: r.minX, y: r.minY, width: r.width, height: titleH), options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
         var y = r.minY + titleH + 4
@@ -610,6 +786,202 @@ final class GalleryView: NSView, NSDraggingSource {
             NSAttributedString(string: p, attributes: [.font: PK.text(12), .foregroundColor: PK.muted])
                 .draw(with: NSRect(x: r.minX, y: y, width: r.width, height: r.maxY - y), options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
         }
+    }
+
+    // MARK: zoomed out: lines and days
+
+    private func summary(_ it: TapeItem) -> String {
+        let key = it.id + "|\(it.current.count)"
+        if let s = summaries[key] { return s }
+        var s = GalleryZoom.summary(it.doc.map { d in d.title.isEmpty ? (d.points.first ?? "") : d.title } ?? (it.shown.isEmpty || it.kind == .typed ? it.current : it.shown))
+        if s.isEmpty { s = it.noun }
+        if summaries.count > 20_000 { summaries.removeAll() }
+        summaries[key] = s
+        return s
+    }
+
+    /// A small card: the kind mark and one line of summary; the app and the time under it.
+    private func drawLineCard(_ it: TapeItem, _ r: NSRect, chosen: Bool, picked: Bool, hovered: Bool, gone: Bool) {
+        let rad = PK.radius("card")
+        let path = NSBezierPath(roundedRect: r.insetBy(dx: 0.25, dy: 0.25), xRadius: rad, yRadius: rad)
+        (picked ? PK.pick : hovered ? PK.hover : PK.card).setFill(); path.fill()
+        PK.line.setStroke(); path.lineWidth = 0.5; path.stroke()
+        if chosen {
+            let sel = NSBezierPath(roundedRect: r.insetBy(dx: -1.5, dy: -1.5), xRadius: rad + 1.5, yRadius: rad + 1.5)
+            sel.lineWidth = 1.5; PK.blue.setStroke(); sel.stroke()
+        }
+        let kid = it.kindId
+        TapeDraw.glyph(JournalMeta.glyph(kid), NSRect(x: r.minX + 10, y: r.minY + 9, width: 13, height: 13), color: PK.series(JournalMeta.series(kid)))
+        let tf = PK.text(12.5, .medium)
+        TapeDraw.line(summary(it), NSRect(x: r.minX + 30, y: r.minY + 7, width: r.width - 40, height: 17), TapeDraw.at(tf, PK.ink))
+        let qf = PK.num(11), qa = TapeDraw.at(qf, PK.faint)
+        let time = TapeDraw.time(it.at), tw = TapeDraw.width(time, qa)
+        TapeDraw.line(time, NSRect(x: r.maxX - 10 - tw, y: r.maxY - 21, width: tw + 1, height: 15), qa)
+        if !it.app.isEmpty {
+            appIcon(it.app, NSRect(x: r.minX + 30, y: r.maxY - 21, width: 14, height: 14))
+            TapeDraw.line(it.app, NSRect(x: r.minX + 49, y: r.maxY - 21, width: max(0, r.width - 70 - tw), height: 15), qa)
+        }
+        if gone { PK.card.withAlphaComponent(0.6).setFill(); path.fill() }
+    }
+
+    /// One day: its date and count, a mark per kind with its count, and one line of what happened.
+    private func drawDay(_ k: Int, _ r: NSRect, _ m: WindowModel) {
+        guard k < days.count else { return }
+        let d = days[k], hovered = hover == "day:\(k)"
+        let rad = PK.radius("card")
+        let path = NSBezierPath(roundedRect: r.insetBy(dx: 0.25, dy: 0.25), xRadius: rad, yRadius: rad)
+        (hovered ? PK.hover : PK.card).setFill(); path.fill()
+        PK.line.setStroke(); path.lineWidth = 0.5; path.stroke()
+        let title = Self.dayTitle.string(from: Date(timeIntervalSince1970: d.start))
+        let tf = PK.text(13, .semibold), ta = TapeDraw.at(tf, PK.ink)
+        TapeDraw.line(title, NSRect(x: r.minX + 14, y: r.minY + 9, width: 150, height: 18), ta)
+        let n = "\(d.items.count) " + (d.items.count == 1 ? "item" : "items")
+        let qf = PK.num(11), qa = TapeDraw.at(qf, PK.faint)
+        TapeDraw.line(n, NSRect(x: r.minX + 14, y: r.minY + 31, width: 150, height: 15), qa)
+        // the kinds with their counts, then the summary
+        var count: [String: Int] = [:], order: [String] = []
+        for i in d.items where i < m.rows.count { let id = m.rows[i].kindId; if count[id] == nil { order.append(id) }; count[id, default: 0] += 1 }
+        var x = r.minX + 170
+        for id in order.prefix(5) {
+            TapeDraw.glyph(JournalMeta.glyph(id), NSRect(x: x, y: r.minY + 11, width: 13, height: 13), color: PK.series(JournalMeta.series(id)))
+            let s = "\(count[id] ?? 0)", w = TapeDraw.width(s, qa)
+            TapeDraw.line(s, NSRect(x: x + 16, y: r.minY + 10, width: w + 1, height: 15), qa)
+            x += 16 + w + 12
+        }
+        let key = "day:\(d.start)|\(d.items.count)"
+        let line: String
+        if let s = summaries[key] { line = s } else {
+            line = GalleryZoom.day(d.items.prefix(40).compactMap { $0 < m.rows.count ? summary(m.rows[$0]) : nil }, max: 220)
+            summaries[key] = line
+        }
+        TapeDraw.line(line, NSRect(x: r.minX + 170, y: r.minY + 31, width: r.width - 184, height: 16), TapeDraw.at(PK.text(12.5), PK.muted))
+    }
+    static let dayTitle: DateFormatter = { let f = DateFormatter(); f.setLocalizedDateFormatFromTemplate("EEE d MMM yyyy"); return f }()
+
+    // MARK: zoom (GalleryZoom: pinch, ⌘+ ⌘-)
+
+    override func magnify(with e: NSEvent) {
+        if e.phase == .began || e.phase == .mayBegin { pinch = GalleryZoom.Pinch() }
+        let n = pinch.add(Double(e.magnification))
+        if n != 0 { model?.zoomGallery(n, at: convert(e.locationInWindow, from: nil)) }
+    }
+
+    /// Before a step: what is under the pointer (or the chosen card, or the first in view), and a picture of the
+    /// page as it is, for the cross-fade.
+    func prepareZoom(at point: NSPoint?, nearer: Bool) {
+        closePop()
+        let vis = visibleRect
+        let p = point.flatMap { vis.contains($0) ? $0 : nil } ?? NSPoint(x: vis.midX, y: vis.midY)
+        var i = placedAt(p)
+        if i == nil, let c = snap.chosen, let k = at[c], placed[k].rect.intersects(vis) { i = k }
+        if i == nil { var k = first(below: vis.minY); while k < placed.count, placed[k].rect.maxY < vis.minY { k += 1 }; i = k < placed.count ? k : nil }
+        var t: Double?, id: String?
+        if let i, let m = model {
+            switch placed[i].block {
+            case .card(let l): let it = snap.lines[l].item; if it >= 0, it < m.rows.count { t = m.rows[it].at; id = snap.lines[l].id }
+            case .day(let k): if k < days.count, let f = days[k].items.first, f < m.rows.count { t = m.rows[f].at; id = m.rows[f].id }
+            default: id = lineId(i)
+            }
+        }
+        var img: NSImage?
+        if window != nil, vis.width > 0, vis.height > 0, let rep = bitmapImageRepForCachingDisplay(in: vis) {
+            cacheDisplay(in: vis, to: rep); img = NSImage(size: vis.size); img?.addRepresentation(rep)
+        }
+        pendingZoom = (p, vis.minY, t, id, i.map { placed[$0].rect }, img, nearer)
+    }
+
+    /// After a step: the same thing under the pointer, the old page fading (and growing or shrinking about the
+    /// pointer) over the new one; with Reduce Motion, a short fade only.
+    private func finishZoom() {
+        guard let z = pendingZoom, let sv = enclosingScrollView else { pendingZoom = nil; scrolled(); return }
+        pendingZoom = nil
+        let clip = sv.contentView
+        var target: Int?
+        if let id = z.id, let i = at[id] { target = i }
+        else if let t = z.at, let m = model {
+            if level == .days { target = placed.firstIndex { if case .day(let k) = $0.block { return k < days.count && t >= days[k].start && t < days[k].start + 86_400 }; return false } }
+            else {   // the card nearest in time
+                var best: (i: Int, dt: Double)?
+                for (i, p) in placed.enumerated() {
+                    guard case .card(let l) = p.block, snap.lines[l].item >= 0, snap.lines[l].item < m.rows.count else { continue }
+                    let dt = abs(m.rows[snap.lines[l].item].at - t)
+                    if best == nil || dt < best!.dt { best = (i, dt) }
+                }
+                target = best?.i
+            }
+        }
+        if let i = target {
+            let r = placed[i].rect, old = z.old ?? r
+            let y = GalleryZoom.anchor(pointer: Double(z.pointer.y), top: Double(z.top), old: (Double(old.minY), Double(old.height)), new: (Double(r.minY), Double(r.height)),
+                                       page: Double(frame.height), view: Double(clip.bounds.height))
+            clip.scroll(to: NSPoint(x: 0, y: CGFloat(y))); sv.reflectScrolledClipView(clip)
+        }
+        scrolled(); reportChunk()
+        guard let img = z.image, let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+        let still = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let cover = NSView(frame: clip.frame); cover.wantsLayer = true
+        sv.addSubview(cover, positioned: .above, relativeTo: nil)
+        let layer = CALayer(); layer.contents = cg; layer.contentsGravity = .resize
+        let w = clip.frame.width, h = clip.frame.height
+        let px = z.pointer.x, py = z.pointer.y - z.top   // in the visible page, from its top
+        layer.bounds = CGRect(x: 0, y: 0, width: w, height: h)
+        layer.anchorPoint = CGPoint(x: px / max(1, w), y: 1 - py / max(1, h))
+        layer.position = CGPoint(x: px, y: h - py)
+        cover.layer?.addSublayer(layer)
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(still ? 0.12 : 0.24)
+        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
+        CATransaction.setCompletionBlock { cover.removeFromSuperview() }
+        let fade = CABasicAnimation(keyPath: "opacity"); fade.fromValue = 1; fade.toValue = 0
+        layer.add(fade, forKey: "fade"); layer.opacity = 0
+        if !still {
+            let s: CGFloat = z.nearer ? 1.12 : 0.9
+            let grow = CABasicAnimation(keyPath: "transform"); grow.fromValue = CATransform3DIdentity; grow.toValue = CATransform3DMakeScale(s, s, 1)
+            layer.add(grow, forKey: "grow"); layer.transform = CATransform3DMakeScale(s, s, 1)
+        }
+        CATransaction.commit()
+    }
+
+    // MARK: the summary on hover (zoomed out)
+
+    private func hoverRect(_ id: String?) -> NSRect? {
+        guard let id else { return nil }
+        if id.hasPrefix("day:"), let k = Int(id.dropFirst(4)) { return placed.first { if case .day(let j) = $0.block { return j == k }; return false }?.rect }
+        return at[id].map { placed[$0].rect }
+    }
+    private func closePop() { popWork?.cancel(); popWork = nil; pop?.close(); pop = nil; popFor = nil }
+    /// Zoomed out, a card or a day the pointer rests on shows its summary in a small popover; moving off closes it.
+    private func hoverPop(_ id: String?) {
+        guard level < .small else { closePop(); return }
+        if id == popFor, id != nil { return }
+        closePop()
+        guard let id, let m = model else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.hover == id, let r = self.hoverRect(id), self.visibleRect.intersects(r) else { return }
+            let (head, lines) = self.hoverText(id, m)
+            let p = NSPopover()
+            p.behavior = .applicationDefined
+            p.animates = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            p.contentViewController = NSHostingController(rootView: HoverSummary(head: head, lines: lines))
+            p.show(relativeTo: r, of: self, preferredEdge: .maxY)
+            self.pop = p; self.popFor = id
+        }
+        popWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
+    }
+    /// What the hover summary says: for a day, its first 8 items with their times; for a card, its line.
+    func hoverText(_ id: String, _ m: WindowModel) -> (String, [String]) {
+        var head = "", lines: [String] = []
+        if id.hasPrefix("day:"), let k = Int(id.dropFirst(4)), k < days.count {
+            let d = days[k]
+            head = Self.dayTitle.string(from: Date(timeIntervalSince1970: d.start)) + " · \(d.items.count) " + (d.items.count == 1 ? "item" : "items")
+            for i in d.items.prefix(8) where i < m.rows.count { lines.append(TapeDraw.time(m.rows[i].at) + "  " + summary(m.rows[i])) }
+            if d.items.count > 8 { lines.append("and \(d.items.count - 8) more") }
+        } else if let it = m.item(id) {
+            head = it.noun + " · " + TapeView.exact(it.at) + (it.app.isEmpty ? "" : " · " + it.app)
+            lines = [GalleryZoom.summary(it.doc?.points.first ?? (it.shown.isEmpty || it.kind == .typed ? it.current : it.shown), max: 280)]
+        }
+        return (head, lines)
     }
 
     /// The foot: the kind mark, then the trail (source → where it went, or where it was written and "sent"); time
@@ -726,24 +1098,35 @@ final class GalleryView: NSView, NSDraggingSource {
         return nil
     }
     private func lineId(_ i: Int) -> String {
-        switch placed[i].block { case .card(let k), .header(let k), .label(let k), .rule(let k), .part(let k): return snap.lines[k].id }
+        switch placed[i].block {
+        case .card(let k), .header(let k), .label(let k), .rule(let k), .part(let k): return snap.lines[k].id
+        case .day(let k): return "day:\(k)"
+        }
     }
 
     override func mouseMoved(with e: NSEvent) {
         let p = convert(e.locationInWindow, from: nil)
         var h: String?, b = -1
-        if let i = placedAt(p), case .card = placed[i].block { h = lineId(i) }
+        if let i = placedAt(p) { switch placed[i].block { case .card, .day: h = lineId(i); default: break } }
         if let n = hits.firstIndex(where: { $0.0.contains(p) }) { b = n }
         if h != hover || b != hoverButton {
-            hover = h; hoverButton = b; needsDisplay = true
+            // only the cards whose look changes are drawn again
+            for r in [hoverRect(hover), hoverRect(h)].compactMap({ $0 }) { setNeedsDisplay(r.insetBy(dx: -3, dy: -3)) }
+            if h != hover { hoverPop(h) }
+            hover = h; hoverButton = b
+            if level < .small { toolTip = nil; return }
             toolTip = b >= 0 ? Self.actionTips[min(b, 2)] : h.flatMap { id in model?.item(id).map { "\($0.noun) · \(TapeView.exact($0.at)) · \($0.current.count) characters" } }
         }
     }
-    override func mouseExited(with e: NSEvent) { hover = nil; hoverButton = -1; needsDisplay = true }
+    override func mouseExited(with e: NSEvent) {
+        if let r = hoverRect(hover) { setNeedsDisplay(r.insetBy(dx: -3, dy: -3)) }
+        hover = nil; hoverButton = -1; closePop()
+    }
 
     override func mouseDown(with e: NSEvent) {
         guard let m = model else { return }
         window?.makeFirstResponder(nil)
+        closePop()
         let p = convert(e.locationInWindow, from: nil)
         if let h = hits.first(where: { $0.0.contains(p) }) { h.1(); m.tapeTick += 1; return }
         guard let i = placedAt(p) else { return }
@@ -761,6 +1144,9 @@ final class GalleryView: NSView, NSDraggingSource {
             down = (p, id)
         case .header, .label:
             m.choose(id); m.toggleFold(id)
+        case .day(let k):   // a day: its cards, the first of them under the pointer
+            if k < days.count, let f = days[k].items.first, f < m.rows.count { m.choose(m.rows[f].id) }
+            m.zoomGallery(1, at: p)
         case .part, .rule: break
         }
         m.tapeTick += 1
@@ -804,5 +1190,20 @@ final class GalleryView: NSView, NSDraggingSource {
         let before = placedAt(p).map(lineId)
         m.reorderPinned(m.dragIds, before: before)
         return true
+    }
+}
+
+/// The summary a zoomed-out card or day shows on hover: system type, the popover's own material.
+struct HoverSummary: View {
+    let head: String
+    let lines: [String]
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(head).font(.caption).foregroundStyle(.secondary)
+            ForEach(Array(lines.enumerated()), id: \.offset) { _, l in
+                Text(l).font(.callout).lineLimit(3).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(12).frame(width: 320, alignment: .leading)
     }
 }

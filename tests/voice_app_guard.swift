@@ -14,6 +14,7 @@ enum ValueType { case cfRange }
 func AXValueCreate(_ type: ValueType, _ range: inout CFRange) -> Int? { 1 }
 let kAXSelectedTextRangeAttribute = "range", kAXSelectedTextAttribute = "selection", kAXValueAttribute = "value"
 enum Result { case success, failure }
+enum VoiceMode { case enter, live }
 func AXUIElementSetAttributeValue(_ el: Int, _ key: String, _ value: Any) -> Result {
     Focus.writes.append(key)
     if key == kAXSelectedTextRangeAttribute { Focus.selected = "old "; return .success }
@@ -24,9 +25,14 @@ func AXUIElementSetAttributeValue(_ el: Int, _ key: String, _ value: Any) -> Res
 enum Focus {
     static var current: MockSpot? = MockSpot(), selected: String? = nil, element: Int? = 1
     static var value = "", writes: [String] = [], pastes: [String] = [], reads: [String] = []
-    static var failWrite = false
+    static var failWrite = false, off = false   // off: an off-limits field (Drafter's own window, a password field)
     static func spot(skip: [String]) -> (MockSpot?, String) { reads.append(DispatchQueue.lane); return (current, "") }
     static func isWeb(_ app: MockApp) -> Bool { app.web }
+    static func offLimits(_ el: Int) -> Bool { off }
+    static func setSelectedText(_ el: Int, _ text: String) -> Result {
+        if offLimits(el) { return .failure }
+        return AXUIElementSetAttributeValue(el, kAXSelectedTextAttribute, text)
+    }
     static func focused() -> Int? { element }
     static func selection() -> String? { selected }
     static func paste(_ text: String) { pastes.append(text) }
@@ -61,7 +67,7 @@ func log(_ s: String) {}
 @main struct VoiceAppGuard {
     static func reset() {
         Focus.current = MockSpot(); Focus.element = 1; Focus.selected = nil; Focus.value = ""
-        Focus.writes = []; Focus.pastes = []; Focus.reads = []; Focus.failWrite = false
+        Focus.writes = []; Focus.pastes = []; Focus.reads = []; Focus.failWrite = false; Focus.off = false
         Fields.arrows = []; Fields.collapses = 0; Keys.shared.inputRevision = 0; secure = false
         NSWorkspace.shared.frontmostApplication = MockApp()
         DispatchQueue.main.pending = []; DispatchQueue.worker.pending = []
@@ -91,7 +97,22 @@ func log(_ s: String) {}
         talk.draft("thank you"); talk.peak = 0.01; precondition(!talk.canSend)
         talk.peak = 0.1; precondition(talk.canSend, "Peak changes still count")
         talk.sending = true; precondition(!talk.canSend); talk.sending = false
+        talk.insertMode = .enter; precondition(!talk.canSend, "Return sends only in live insert mode"); talk.insertMode = .live
         talk.samples = 100; precondition(!talk.canSend)
+
+        // Off-limits fields and secure input: no AX write, no arrow, no paste on any path.
+        for blocker in 0..<2 {
+            for (web, markers) in [(false, false), (true, false), (false, true)] {
+                reset(); Focus.current!.app.web = web; Focus.current!.viaMarkers = markers
+                if blocker == 0 { Focus.off = true } else { secure = true }
+                var result: Bool? = nil
+                Focus.replace("old ", with: "new ") { result = $0 }
+                DispatchQueue.main.drain(); DispatchQueue.worker.drain()
+                precondition(result == false, "Blocked field must refuse the replace")
+                precondition(Focus.writes.isEmpty && Focus.pastes.isEmpty && Fields.arrows.isEmpty,
+                             "Nothing may reach an off-limits field or a secure-input field")
+            }
+        }
 
         // Each web/marker combination bypasses AX writes and checks actual selection.
         for (web, markers) in [(true, false), (false, true), (true, true)] {
@@ -148,6 +169,6 @@ func log(_ s: String) {}
             DispatchQueue.main.drain()
             precondition(Ghost.shared.shows == (change == 0 ? 1 : 0))
         }
-        print("PASS Return cache, closing words, rich replacement, drift and background focus")
+        print("PASS Return cache, closing words, off-limits and secure fields, rich replacement, drift and background focus")
     }
 }

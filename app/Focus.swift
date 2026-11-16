@@ -10,13 +10,15 @@ struct Spot {
     let caret: Int             // UTF-16 offset
     let before: String
     let title: String
-    let rect: CGRect?          // caret, in AX (top-left) screen coordinates
+    var rect: CGRect?          // caret, in AX (top-left) screen coordinates; a fallback anchor when `anchor` is not exact
     let role: String
     var viaMarkers = false     // rich editor read through text markers: insert by paste only
     /// Mid-line (setting `midLine`, 2026-11-15): the rest of the caret's line, not blank, at a gap between words
     /// (GhostRules.midLineOK). Empty and `mid` false everywhere else.
     var lineAfter = ""
     var mid = false
+    /// Where `rect` came from (round 2026-11-17-anchor): the caret itself, an estimate, or a chip place near the field.
+    var anchor: AnchorKind = .exact
 }
 
 enum Focus {
@@ -268,7 +270,85 @@ enum Focus {
     /// `midLine`: the ghost paths in Keys pass the setting; then a caret at a gap mid-line gives a spot with `mid` set
     /// (GhostRules.midLineOK). Native fields use their value and range; Chromium and Electron only their text markers
     /// (their value miscounts line breaks); a web field with no markers or no caret rect stays "mid-line".
-    static func spot(skip: [String], midLine: Bool = false) -> (Spot?, String) {
+    static func spot(skip: [String], midLine: Bool = false, anchor: Bool = false) -> (Spot?, String) {
+        var (s, why) = read(skip: skip, midLine: midLine)
+        guard anchor, let sp = s, Thread.isMainThread, !offLimits(sp.el) else { return (s, why) }
+        if why == "ok", sp.rect != nil {
+            noteExact(sp); chipAnchor = nil
+        } else if why == "no caret rect", let a = fallback(sp) {
+            var f = sp; f.rect = a.rect; f.anchor = a.kind; s = f
+            noteKind(sp, a); chipAnchor = a.kind == .chip ? a.rect : nil
+        }
+        return (s, why)   // why stays "no caret rect": Caret.note and the axprobe still count the field
+    }
+
+    // MARK: fallback anchor (roadmap item 6, docs/rounds/2026-11-17-anchor.md)
+
+    /// The last field that gave a real caret rect, and when: a miss right after one is a missed read, not an editor
+    /// without a caret rect (Claude and Beeper miss about 8 in 100 reads), so it stays quiet as before.
+    private static var lastExact: (el: AXUIElement, at: Date)?
+    /// The rect of the last chip-kind anchor: Ghost.show draws grey words given this rect as a chip (main thread only).
+    static var chipAnchor: CGRect?
+    private static var anchorSeen: [String: AnchorKind] = [:]
+    private static func noteExact(_ s: Spot) {
+        lastExact = (s.el, Date())
+        if let l = AnchorRules.change(&anchorSeen, app: s.app.bundleIdentifier ?? "?", kind: .exact, source: "caret", role: s.role) { log(l) }
+    }
+    private static func noteKind(_ s: Spot, _ a: Anchor) {
+        if let l = AnchorRules.change(&anchorSeen, app: s.app.bundleIdentifier ?? "?", kind: a.kind, source: a.source, role: s.role) { log(l) }
+    }
+
+    /// The field gave no caret rect: what else Accessibility answers, then AnchorRules picks. Main thread only.
+    static func fallback(_ s: Spot) -> Anchor? {
+        if offLimits(s.el) || s.mid { return nil }
+        var i = AnchorInput()
+        i.role = s.role
+        i.before = s.before
+        i.recentExact = lastExact.map { CFEqual($0.el, s.el) && Date().timeIntervalSince($0.at) < 2 } ?? false
+        if i.recentExact { return nil }
+        i.frame = frame(s.el)
+        if !s.viaMarkers {
+            // (b) the caret's line from its first character: the visual line where the field answers AXLineForIndex
+            let ns = s.value as NSString
+            let caret = min(max(s.caret, 0), ns.length)
+            var start = (ns.substring(to: caret) as NSString).range(of: "\n", options: .backwards).location
+            start = start == NSNotFound ? 0 : start + 1
+            if let line = lineStart(s.el, caret: caret), line <= caret, line >= start { start = line }
+            if start < caret {
+                i.span = bounds(s.el, start, caret - start)
+                i.lineStart = bounds(s.el, start, 1)
+                i.before = ns.substring(to: caret)
+                if let (f, _) = font(s.el, caret: caret) { i.fontSize = f.pointSize }
+            }
+        }
+        if let f = i.frame, let scr = NSScreen.screens.first(where: { axFrame($0).intersects(f) }) ?? NSScreen.main {
+            i.visible = axFrame(scr, visible: true)
+        }
+        let measure: (String, CGFloat) -> CGFloat = { t, size in (t as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: size)]).width }
+        return AnchorRules.pick(i, measure: measure)
+    }
+
+    /// The first character of the visual line holding the caret, where the field answers AXLineForIndex/AXRangeForLine.
+    private static func lineStart(_ el: AXUIElement, caret: Int) -> Int? {
+        if offLimits(el) { return nil }
+        var idx: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(el, kAXLineForIndexParameterizedAttribute as CFString, NSNumber(value: max(0, caret - 1)), &idx) == .success,
+              let line = idx as? NSNumber else { return nil }
+        var rv: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(el, kAXRangeForLineParameterizedAttribute as CFString, line, &rv) == .success,
+              let rv, CFGetTypeID(rv) == AXValueGetTypeID() else { return nil }
+        var r = CFRange()
+        return AXValueGetValue(rv as! AXValue, .cfRange, &r) ? r.location : nil
+    }
+
+    /// A screen's frame (or visible frame) in AX coordinates (top-left of the primary screen).
+    private static func axFrame(_ scr: NSScreen, visible: Bool = false) -> CGRect {
+        let f = visible ? scr.visibleFrame : scr.frame
+        let h = NSScreen.screens.first?.frame.height ?? f.height
+        return CGRect(x: f.minX, y: h - f.maxY, width: f.width, height: f.height)
+    }
+
+    private static func read(skip: [String], midLine: Bool) -> (Spot?, String) {
         guard let app = NSWorkspace.shared.frontmostApplication else { return (nil, "no app") }
         lastApp = app
         if offLimits(pid: app.processIdentifier) { return (nil, "own app") }
@@ -556,13 +636,41 @@ enum Focus {
         }
     }
 
-    /// Return (or Shift+Return: a new line that sends nothing in chat apps) in the front app, marked as Drafter's own.
-    static func pressReturn(shift: Bool = false) {
-        let src = CGEventSource(stateID: .hidSystemState)
-        for down in [true, false] {
-            let e = CGEvent(keyboardEventSource: src, virtualKey: 36, keyDown: down)
-            e?.flags = shift ? .maskShift : []; e?.setIntegerValueField(.eventSourceUserData, value: mark); e?.post(tap: .cghidEventTap)
+    /// Replace `old`, which sits right before the caret, with `new`. Only when the field still ends with it.
+    static func replace(_ old: String, with new: String, done: @escaping (Bool) -> Void) {
+        guard !old.isEmpty, !IsSecureEventInputEnabled(),
+              let s = spot(skip: []).0, !offLimits(s.el), s.before.hasSuffix(old) else { done(false); return }
+        if s.viaMarkers || isWeb(s.app) {
+            // Rich fields cannot reliably set an AX range. Select with the same
+            // marked arrow events as snippet fields, then verify before pasting.
+            let revision = Keys.shared.inputRevision
+            Fields.left(old.count, shift: true)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                guard !IsSecureEventInputEnabled(), Keys.shared.inputRevision == revision,
+                      NSWorkspace.shared.frontmostApplication?.processIdentifier == s.app.processIdentifier,
+                      let el = focused(), CFEqual(el, s.el), selection() == old else {
+                    // Undo our Shift+Left selection even on a revision/selection
+                    // mismatch. Never send recovery keys into another field.
+                    if NSWorkspace.shared.frontmostApplication?.processIdentifier == s.app.processIdentifier,
+                       let el = focused(), CFEqual(el, s.el), selection() != "" {
+                        Fields.right(1)
+                    }
+                    done(false); return
+                }
+                paste(new)
+                done(true)
+            }
+            return
         }
+        let n = (old as NSString).length
+        var r = CFRange(location: s.caret - n, length: n)
+        guard let v = AXValueCreate(.cfRange, &r),
+              AXUIElementSetAttributeValue(s.el, kAXSelectedTextRangeAttribute as CFString, v) == .success,
+              let sel: String = attr(s.el, kAXSelectedTextAttribute), sel == old else { done(false); return }
+        if Focus.setSelectedText(s.el, new) == .success,
+           let now: String = attr(s.el, kAXValueAttribute), now.contains(new) { done(true); return }
+        paste(new)   // the old words are selected, so a paste replaces them
+        done(true)
     }
 
     /// `restore: false` leaves the text on the clipboard (a fallback paste that may have missed: ⌘V still has it).

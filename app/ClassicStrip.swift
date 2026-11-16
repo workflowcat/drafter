@@ -30,6 +30,7 @@ final class ClassicStrip: StripFace {
     private func make() -> NSPanel {
         let p = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         p.isOpaque = false; p.backgroundColor = .clear; p.hasShadow = false; p.ignoresMouseEvents = true
+        p.identifier = OwnChrome.strip   // left out of Drafter's own screen pictures
         p.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 2)   // over the menu bar, like the notch
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         // Explicit notch treatment: stay black in both macOS appearances.
@@ -106,6 +107,7 @@ final class ClassicStrip: StripFace {
         if hits == nil {
             let h = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
             h.isOpaque = false; h.backgroundColor = .clear; h.hasShadow = false; h.ignoresMouseEvents = false
+            h.identifier = OwnChrome.strip
             h.acceptsMouseMovedEvents = true
             h.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 3)
             h.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]

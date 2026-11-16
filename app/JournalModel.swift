@@ -174,7 +174,7 @@ extension WindowModel {
     /// outline.
     private func show(hits found: [Int], searching: Bool) {
         let hit = searching ? found.filter { $0 < rows.count && !goneIds.contains(rows[$0].id) }.sorted() : found
-        let facets = rows.map(\.facet)
+        let facets = self.facets
         var vis = [Bool](repeating: false, count: rows.count)
         for i in hit where filter.matches(facets[i]) { vis[i] = true }
         results = vis.reduce(0) { $0 + ($1 ? 1 : 0) }
@@ -198,7 +198,7 @@ extension WindowModel {
     func reflow() {
         let (tree, vis) = outline
         lines = filter == .pinned && group == .time && query.isEmpty ? pinnedLines()
-            : group == .time ? flatten(tree, vis: vis) : flattenGroups(vis, facets: rows.map(\.facet))
+            : group == .time ? flatten(tree, vis: vis) : flattenGroups(vis, facets: facets)
         if let c = chosen, lines.contains(where: { $0.id == c }) {} else {
             chosen = lines.first { $0.kind == .row }?.id ?? lines.first { $0.selectable }?.id
             open = nil

@@ -58,6 +58,7 @@ final class ComposerStrip: StripFace {
     private func make() -> NSPanel {
         let p = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         p.isOpaque = false; p.backgroundColor = .clear; p.hasShadow = false; p.ignoresMouseEvents = true
+        p.identifier = OwnChrome.strip   // left out of Drafter's own screen pictures
         p.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 2)
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         p.contentView = view
@@ -141,6 +142,7 @@ final class ComposerStrip: StripFace {
         if hits == nil {
             let h = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
             h.isOpaque = false; h.backgroundColor = .clear; h.hasShadow = false; h.ignoresMouseEvents = false
+            h.identifier = OwnChrome.strip
             h.acceptsMouseMovedEvents = true
             h.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 3)
             h.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
@@ -203,8 +205,9 @@ final class ComposerStrip: StripFace {
 
     func level(_ pk: Float, them: Float? = nil) {
         heldMe = max(heldMe, pk); if let them { heldThem = max(heldThem, them) }
-        let still = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        // the audio's rate of calls stops here; Reduce Motion is asked only for the ones drawn (native round)
         guard Date().timeIntervalSince(levelAt) > (c.phase == .recording ? 0.25 : 0.08) else { return }
+        let still = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         levelAt = Date()
         meSeen = meSeen || heldMe >= 0.004; themSeen = themSeen || heldThem >= 0.004
         if c.phase == .recording {

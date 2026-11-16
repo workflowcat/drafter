@@ -188,6 +188,7 @@ final class Capture {
     /// Release: the picture, then where it goes. `rect` in screen points; `window` for a whole window.
     private func take(_ rect: NSRect, window: CGWindowID?, full: Bool = false) {
         let t0 = Date(), mode = self.mode, origin = self.origin, originTitle = self.originTitle
+        let hide = OwnChrome.ids()   // read on the main thread, before the overlay goes
         let scr = NSScreen.screens.first { $0.frame.intersects(rect) && $0.frame.contains(NSPoint(x: rect.midX, y: rect.midY)) }
             ?? NSScreen.screens.first { $0.frame.intersects(rect) } ?? NSScreen.main
         close("taken")
@@ -208,8 +209,7 @@ final class Capture {
                 title = w.title ?? ""; app = w.owningApplication?.applicationName ?? app
                 cfg.width = Int(w.frame.width * scale); cfg.height = Int(w.frame.height * scale)
             } else if let d = content.displays.first(where: { $0.displayID == did }) ?? content.displays.first {
-                let own = content.applications.filter { $0.processID == getpid() }
-                filter = SCContentFilter(display: d, excludingApplications: own, exceptingWindows: [])
+                filter = OwnChrome.filter(d, content, hide: hide)
                 let src = ShotRules.sourceRect(rect, display: scr.frame)
                 cfg.sourceRect = src
                 cfg.width = max(1, Int(src.width * scale)); cfg.height = max(1, Int(src.height * scale))
@@ -313,6 +313,20 @@ final class Capture {
         History.copy(text)
         Pill.shared.flash("Text on the clipboard · ⌘V to paste")
         return "on the clipboard"
+    }
+}
+
+/// Drafter's own windows a screen picture leaves out (native round, 16 November 2026): only the capture's chrome (the
+/// dimmed overlay, the capture strip, the markup panel: every CapturePanel) and the voice strip. The main window and
+/// Drafter's other windows show in a picture like any app's (before, the whole app was left out and the picture showed
+/// the window behind Drafter's). Read on the main thread.
+enum OwnChrome {
+    static let strip = NSUserInterfaceItemIdentifier("drafter.strip")
+    static func ids() -> Set<CGWindowID> {
+        Set(NSApp.windows.filter { $0 is CapturePanel || $0.identifier == strip }.map { CGWindowID($0.windowNumber) })
+    }
+    static func filter(_ d: SCDisplay, _ c: SCShareableContent, hide: Set<CGWindowID>) -> SCContentFilter {
+        SCContentFilter(display: d, excludingWindows: c.windows.filter { hide.contains($0.windowID) })
     }
 }
 

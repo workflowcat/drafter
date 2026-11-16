@@ -123,11 +123,12 @@ struct CardSize: View {
     @EnvironmentObject var m: WindowModel
     var body: some View {
         HStack(spacing: 0) {
+            let lv = m.galleryLevel
             Button { m.setCardSize(-1) } label: { Text("−").font(PKFont.text(14)).frame(width: 24, height: 22).contentShape(Rectangle()) }
-                .buttonStyle(.plain).disabled(m.settings.cardSize == 0).help("Smaller cards (⌘-)").accessibilityLabel("Smaller cards")
-            Text(["S", "M", "L"][JournalLayout.step(m.settings.cardSize)]).font(PKFont.num(11.5)).foregroundStyle(UIInk.muted).frame(width: 14)
+                .buttonStyle(.plain).disabled(m.gallery ? lv == .days : m.settings.cardSize == 0).help("Zoom out: smaller cards, then one line each, then days (⌘- or pinch)").accessibilityLabel("Zoom out")
+            Text(m.gallery ? lv.mark : ["S", "M", "L"][JournalLayout.step(m.settings.cardSize)]).font(PKFont.num(11.5)).foregroundStyle(UIInk.muted).frame(minWidth: 14).fixedSize()
             Button { m.setCardSize(1) } label: { Text("+").font(PKFont.text(14)).frame(width: 24, height: 22).contentShape(Rectangle()) }
-                .buttonStyle(.plain).disabled(m.settings.cardSize == 2).help("Larger cards (⌘+)").accessibilityLabel("Larger cards")
+                .buttonStyle(.plain).disabled(m.gallery ? lv == .large : m.settings.cardSize == 2).help("Zoom in (⌘+ or pinch)").accessibilityLabel("Zoom in")
         }
         .foregroundStyle(UIInk.muted).padding(.horizontal, 2).background(Capsule().fill(UIInk.well))
     }
@@ -701,7 +702,7 @@ struct StatusBar: View {
                 Button("Stop") { m.stopRecording() }.controlSize(.small)
             }
             if m.options.isEmpty {
-                Text(m.status.isEmpty && m.page == .tape ? m.softStatus : m.status).font(PKFont.text(12)).foregroundStyle(UIInk.muted).lineLimit(1)
+                StatusText(live: m.live, font: PKFont.text(12), color: UIInk.muted, fallback: m.page == .tape ? m.softStatus : "")
             }
             Spacer()
             if !m.engine.isEmpty {

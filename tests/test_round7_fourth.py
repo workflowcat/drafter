@@ -14,16 +14,16 @@ class Sleep(unittest.TestCase):
     def setUp(self):
         self.clock = types.SimpleNamespace(time=Mock(return_value=1000.0))
         self.load = Mock(return_value=('fake model', None))
-        ns = extract('engine/model.py', {'sleep', 'wake', '_ensure', 'oneshot'},
+        ns = extract('engine/model.py', {'sleep', 'wake', '_ensure', 'oneshot', '_drop'},
                      dict(time=self.clock, load=self.load, gc=types.SimpleNamespace(collect=Mock()),
                           mx=types.SimpleNamespace(clear_cache=Mock())), cls='Model')
         self.m = types.SimpleNamespace(lock=threading.Lock(), model=None, wake_at=0,
                                        retrain_sleep=False, repo='fake', adapter=None,
                                        head_ids=[], parked={}, marks={}, sleeps=0, _warm=Mock(),   # marks: big-model round
                                        lora=Mock(), _oneshot=Mock(return_value='answer'),
-                                       memory_gb=lambda: (0, 0))
+                                       memory_gb=lambda: (0, 0), asleep=False, _tweak=lambda tw: tw, tw=None)
         for name, fn in ns.items():
-            if name in {'sleep', 'wake', '_ensure', 'oneshot'}:
+            if name in {'sleep', 'wake', '_ensure', 'oneshot', '_drop'}:
                 setattr(self.m, name, types.MethodType(fn, self.m))
 
     def test_wake_then_short_voice_sleep_auto_wakes_through_real_routes(self):
@@ -120,8 +120,9 @@ class PhraseRebuild(unittest.TestCase):
                         test_retrain.Path(args[args.index('--output') + 1]).write_text(old + newer)
                         events.append('stage')
                     elif script == 'bench/make_train.py':
-                        self.assertEqual(args[0], '--phrases')
-                        self.assertEqual(test_retrain.Path(args[1]).read_text(), old + newer)
+                        # training reads the dated corpus (bench/corpus.py), rebuilt after the staged phrases
+                        self.assertEqual(args, ('--corpus', str(self.root / 'data/corpus.jsonl')))
+                        self.assertEqual((self.root / 'data/phrases-next.jsonl').read_text(), old + newer)
                         self.assertEqual(phrases.read_text(), old)
                         events.append('make_train')
                     elif script == 'bench/gate.py':
@@ -143,3 +144,7 @@ class PhraseRebuild(unittest.TestCase):
                     retrain.main()
                 self.assertEqual(events, ['stage', 'make_train', 'compare'] + (['gate'] if switch else []))
                 self.assertEqual(phrases.read_text(), old + newer if recording else old)
+
+
+if __name__ == '__main__':
+    unittest.main()

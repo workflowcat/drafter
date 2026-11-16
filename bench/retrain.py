@@ -1,6 +1,6 @@
 """Weekly retrain on his newest writing, switched on only if it types better on lines neither layer has seen.
 
-    .venv/bin/python bench/retrain.py [--force]
+    .venv/bin/python bench/retrain.py [--force] [--remote]     # --remote (or the setting retrainRemote): train on bnp-hetzner
     .venv/bin/python bench/retrain.py --compare data/adapters data/adapters-prev    # the test alone: nothing moves
 
 Runs only when the last retrain is 7+ days old, the Mac is on power and he has been away from the keyboard 10+ minutes
@@ -29,6 +29,18 @@ force = "--force" in sys.argv
 sys.path.insert(0, str(ROOT / "bench"))
 sys.path.insert(1, str(ROOT / "engine"))
 from retrain_state import last_retrain, last_attempt
+from lora_recipe import RECIPE
+REMOTE_TIMEOUT = 15 * 3600     # bench/remote_train.py gives the container 14 h; the rest is upload, build and pull
+
+
+def remote_wanted(argv, settings):
+    """Train his layer on bnp-hetzner (bench/remote_train.py): `--remote`, or the setting retrainRemote."""
+    return "--remote" in argv or bool((settings or {}).get("retrainRemote"))
+
+
+def base_model(settings):
+    """The engine repo the layer is recorded with (record below), so the one it is trained on remotely."""
+    return (settings or {}).get("model") or "mlx-community/Qwen3-1.7B-4bit"
 
 
 def idle_s():
@@ -95,7 +107,7 @@ def record(adapter, label):
     """The set as Drafter would type it with this layer -> (recording, last line of the bench)."""
     st = json.loads(SETTINGS.read_text())
     g = json.loads((ROOT / "data/gate.json").read_text()) if (ROOT / "data/gate.json").exists() else {}
-    args = [st.get("model") or "mlx-community/Qwen3-1.7B-4bit", "--adapter", str(Path(adapter).relative_to(ROOT) if Path(adapter).is_absolute() else adapter),
+    args = [base_model(st), "--adapter", str(Path(adapter).relative_to(ROOT) if Path(adapter).is_absolute() else adapter),
             "--boost", str(g.get("boost", 0) or 0), "--label", label]
     try:      # his older lines per chat, when they were read for this very set (Beeper may have been off)
         import typescore
@@ -229,16 +241,34 @@ def main():
         return
     ok, switch, rec_new = False, False, None
     try:
-        # paused=True terminates the server through Main.swift. Keep it alive but
-        # unload its model instead, through training AND the full comparison.
-        with sleeping_engine(report):
+        settings = json.loads(SETTINGS.read_text()) if SETTINGS.exists() else {}
+    except ValueError:
+        settings = {}
+    try:
+        if remote_wanted(sys.argv, settings):
+            # On bnp-hetzner (AGENTS.md "What leaves the Mac"): the engine keeps typing while the server trains,
+            # then sleeps only for the comparison. The training lines are deleted there after the run.
             shutil.rmtree(ROOT / "data/adapters-new", ignore_errors=True)
-            r = subprocess.run([PY, str(ROOT / "bench/train.py"), "1500", "--adapter-path", str(ROOT / "data/adapters-new")],
-                               capture_output=True, text=True, timeout=3600, stdin=subprocess.DEVNULL)
+            r = subprocess.run([PY, "-B", str(ROOT / "bench/remote_train.py"), "--out", str(ROOT / "data/adapters-new"),
+                                "--model", base_model(settings)],
+                               capture_output=True, text=True, timeout=REMOTE_TIMEOUT, stdin=subprocess.DEVNULL)
             ok = r.returncode == 0 and (ROOT / "data/adapters-new/adapters.safetensors").exists()
-            report.append(f"- training: {'done' if ok else 'failed: ' + r.stderr[-300:]}")
+            said = [l for l in r.stdout.splitlines() if l.startswith(("time:", "WARNING"))]
+            report.append(f"- training on bnp-hetzner: {'done; ' + ' '.join(said) if ok else 'failed: ' + (r.stderr or r.stdout)[-300:]}")
             if ok:
-                switch, rec_new = _compare("data/adapters", "data/adapters-new", report)
+                with sleeping_engine(report):
+                    switch, rec_new = _compare("data/adapters", "data/adapters-new", report)
+        else:
+            # paused=True terminates the server through Main.swift. Keep it alive but
+            # unload its model instead, through training AND the full comparison.
+            with sleeping_engine(report):
+                shutil.rmtree(ROOT / "data/adapters-new", ignore_errors=True)
+                r = subprocess.run([PY, str(ROOT / "bench/train.py"), str(RECIPE["iters"]), "--adapter-path", str(ROOT / "data/adapters-new")],
+                                   capture_output=True, text=True, timeout=3600, stdin=subprocess.DEVNULL)
+                ok = r.returncode == 0 and (ROOT / "data/adapters-new/adapters.safetensors").exists()
+                report.append(f"- training: {'done' if ok else 'failed: ' + r.stderr[-300:]}")
+                if ok:
+                    switch, rec_new = _compare("data/adapters", "data/adapters-new", report)
     except Exception as e:
         switch, rec_new = False, None
         report.append(f"- retrain failed: {e}")

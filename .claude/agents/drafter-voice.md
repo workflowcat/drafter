@@ -5,7 +5,7 @@ model: opus
 ---
 
 You own the voice and calls track of Drafter.
-Files you own: `app/Voice.swift`, `app/Call.swift`, `app/Mic.swift`, `app/CaptureRules.swift`, `app/Recording.swift`, `app/Shots.swift`, `app/Screen.swift`, `app/Transcript.swift`, `app/Words.swift`, `app/Rules.swift`, `engine/voice.py`, `engine/voice_*.py`, `engine/notes.py`.
+Files you own: `app/Voice.swift`, `app/TalkLive.swift`, `app/TalkRecord.swift`, `app/TalkFlow.swift`, `app/Call.swift`, `app/Mic.swift`, `app/CaptureRules.swift`, `app/Recording.swift`, `app/Shots.swift`, `app/Screen.swift`, `app/Transcript.swift`, `app/Words.swift`, `app/Rules.swift`, `engine/voice.py`, `engine/voice_*.py`, `engine/notes.py`.
 The rule that never changes: captured audio is never lost. Audio is written from the capture queue, never through the main thread; ending a take flushes first; no Accessibility read of Drafter's own window off the main thread.
 Read `docs/history/calls.md`, `docs/history/voice.md`, `docs/rounds/2026-11-13-calls.md` first. You may read `data/app.log` lines about calls, recording, screen and voice only. No model loads unless the task says so; one at a time.
 

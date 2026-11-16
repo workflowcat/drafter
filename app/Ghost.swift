@@ -18,6 +18,9 @@ final class Ghost {
     /// caret without covering it. They are drawn on a small card just under the caret's line, starting at the caret.
     private(set) var mid = false
     let midBox: Ground = { let g = Ground(); g.radius = 4; return g }()
+    /// Fallback anchor (round 2026-11-17-anchor): the field gave no place for the caret, so the grey words sit on the
+    /// action chip's row near the field (Focus.chipAnchor) instead of inline. Tab takes them as always.
+    private(set) var boxed = false
     var visible: Bool { panel.isVisible && (!text.isEmpty || action != nil) }
 
     let chipBox = Ground()
@@ -56,14 +59,16 @@ final class Ghost {
     func show(_ suggestion: String, action: [String: Any]?, at caret: CGRect, replace: String = "", mid: Bool = false) {
         plain()
         self.mid = mid && action == nil && replace.isEmpty && !suggestion.isEmpty
+        boxed = !self.mid && action == nil && replace.isEmpty && !suggestion.isEmpty && Focus.chipAnchor == caret
         midBox.isHidden = !self.mid
         if !self.replace.isEmpty, replace.isEmpty { Fixer.hidden() }   // a fix offer covered by a chip ends here (Argon 22)
         text = suggestion; self.action = action; self.replace = replace; altHint = ""
         let c = cocoa(caret)
         // the grey words in the field's own font, as if already typed; no keycap after them since 1 November 2026
         // (Andrii: "I know what tab does, clean it up")
-        let (font, fieldColor) = fieldFont(c.height)
-        let color = self.mid ? PK.muted : fieldColor   // on the card's ground, not the field's: the card's own quiet ink
+        let (font0, fieldColor) = fieldFont(c.height)
+        let font = boxed ? PK.text(13) : font0
+        let color = self.mid ? PK.muted : boxed ? PK.ink : fieldColor   // on the card's ground, not the field's: the card's own quiet ink
         label.font = font; label.textColor = color; ghostColor = color
         unsure = min(unsure, suggestion.count)
         paint(suggestion)
@@ -76,6 +81,7 @@ final class Ghost {
             // a chip: a flat row under the caret - the kind's pixel mark in its colour, then the offer in Fixel
             mark.kind = Kind.of(a["id"] as? String ?? "")
             chip.font = PK.text(13); chip.textColor = PK.ink
+            chip.isHidden = false
             chip.stringValue = t.hasPrefix("⇥ ") ? String(t.dropFirst(2)) : t
             chip.sizeToFit()
             let tw = min(chip.frame.width, 420)
@@ -88,12 +94,29 @@ final class Ghost {
             w = max(w, chipW)
         } else { chipBox.isHidden = true }
         if self.mid { placeMid(c, lh: lh); appear(); return }
+        if boxed { fitBoxed(at: c); appear(); return }
         let gap: CGFloat = chipH > 0 ? 6 : 0
         let frame = NSRect(x: c.maxX, y: c.minY - chipH - gap, width: w + 4, height: lh + chipH + gap)
         panel.setFrame(frame, display: false)
         // baseline: the grey text sits on the caret's line, centred in its height like the text it continues
         label.frame = NSRect(x: 0, y: chipH + gap + (lh - label.frame.height) / 2, width: label.frame.width, height: label.frame.height)
         appear()
+    }
+
+    /// The grey words as a chip: the action chip's ground and row, a mark, then the words; its top under `c` (a chip
+    /// anchor's 1-pt rect), or kept where it is (`c` nil) as the words change. The panel never follows the typing.
+    private func fitBoxed(at c: CGRect? = nil) {
+        label.sizeToFit()
+        if label.superview?.subviews.last !== label { panel.contentView?.addSubview(label, positioned: .above, relativeTo: chipBox) }
+        mark.kind = .next
+        let tw = min(label.frame.width, 420)
+        let h = max(26, label.frame.height + 10), w = 30 + tw + 10
+        let o = c.map { NSPoint(x: $0.minX, y: $0.minY - h) } ?? panel.frame.origin
+        panel.setFrame(NSRect(x: o.x, y: o.y, width: w, height: h), display: c == nil)
+        chipBox.frame = NSRect(x: 0, y: 0, width: w, height: h)
+        mark.frame = NSRect(x: 7, y: ((h - 16) / 2).rounded(), width: 16, height: 16)
+        chip.isHidden = true; chipBox.isHidden = false; chipBox.needsDisplay = true; mark.needsDisplay = true
+        label.frame = NSRect(x: 30, y: ((h - label.frame.height) / 2).rounded(), width: tw, height: label.frame.height)
     }
 
     /// The mid-line card: the grey words on a flat PixelKit ground one line under the caret, its left edge at the caret,
@@ -211,6 +234,7 @@ final class Ghost {
         guard visible, action == nil, replace.isEmpty, !isDraft, h != altHint else { return }
         altHint = h
         paint(text)
+        if boxed { fitBoxed(); return }
         label.sizeToFit()
         var f = panel.frame
         f.size.width = label.frame.width + (mid ? 2 * Ghost.midPad : 4)
@@ -242,6 +266,7 @@ final class Ghost {
         text += more
         unsure = max(0, min(tail, text.count))
         paint(text)
+        if boxed { fitBoxed(); return }
         label.sizeToFit()
         var f = panel.frame
         f.size.width = max(f.size.width, label.frame.width + (mid ? 2 * Ghost.midPad : 4))
@@ -256,6 +281,7 @@ final class Ghost {
         text.removeFirst(typed.count)
         unsure = min(unsure, text.count); altHint = ""   // the other ideas were for the spot before these letters
         paint(text)
+        if boxed { fitBoxed(); return true }   // a chip stays put while he types into it
         label.sizeToFit()
         var f = panel.frame
         // move right by the width of what was typed
@@ -268,7 +294,7 @@ final class Ghost {
 
     func hide() {
         if !replace.isEmpty { Fixer.hidden() }   // a fix offer went: taken, typed over or expired (log)
-        text = ""; action = nil; replace = ""; unsure = 0; altHint = ""; mid = false; midBox.isHidden = true; plain()
+        text = ""; action = nil; replace = ""; unsure = 0; altHint = ""; mid = false; boxed = false; midBox.isHidden = true; plain()
         panel.orderOut(nil)
     }
 

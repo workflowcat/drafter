@@ -132,7 +132,7 @@ extension UIShots {
         }
         let g = GalleryView(frame: NSRect(x: 0, y: 0, width: 1000, height: 900))
         let sv = NSScrollView(frame: NSRect(x: 0, y: 0, width: 1000, height: 900)); sv.documentView = g; g.model = big; big.galleryView = g
-        let t0 = Date(); g.apply(big.snap, size: 1); let lay = Date().timeIntervalSince(t0) * 1000
+        let t0 = Date(); g.apply(big.snap, level: .medium); let lay = Date().timeIntervalSince(t0) * 1000
         var draws: [Double] = []
         let steps = 40
         for k in 0..<steps {

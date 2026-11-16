@@ -53,11 +53,11 @@ final class AppWindow: NSObject, NSWindowDelegate {
             // minimised it waits, as before
             guard let self, let w = self.window, w.isVisible || w.isMiniaturized else { t.invalidate(); self?.tick = nil; return }
             guard w.isVisible else { return }
-            self.model.engine = Engine.shared.ready ? "" : Engine.shared.info
+            self.model.setEngine(Engine.shared.ready ? "" : Engine.shared.info)
             n += 1
             if self.model.docs.contains(where: \.live) || (self.model.page == .doc && n % 3 == 0) || n % 10 == 0 { self.model.loadDocs() }
         }
-        model.engine = Engine.shared.ready ? "" : Engine.shared.info
+        model.setEngine(Engine.shared.ready ? "" : Engine.shared.info)
         log("window: opened")
         // the window as it was drawn on this pass (the rows it had; fresh ones follow from reload)
         let t0 = Date()
@@ -89,14 +89,26 @@ final class WindowModel: ObservableObject {
     @Published var docs: [CallDoc] = []
     @Published var doc: CallDoc?
     @Published var playing: String?
-    @Published var playhead: Double = 0
+    /// The line being played (changes once per line, not on every tick of the playhead).
+    @Published var playTurn: Int?
+    /// The playhead lives in `live`: its 0.4 s tick redraws the Play button's time, not the whole window.
+    var playhead: Double { get { live.playhead } set { live.playhead = newValue } }
+    /// What changes often and only a small view shows: the status line and the playhead (native round, 16 November
+    /// 2026: each status change and each playhead tick rebuilt the whole window, 55 and 180 ms).
+    let live = LiveLine()
     @Published var engine = ""
     @Published var focusField = 0
     var players: [AVAudioPlayer] = []
     var playTimer: Timer?
     @Published var query = "" { didSet { if query != oldValue { open = nil; refilter() } } }
     // the journal (TapeWindow.swift, JournalModel.swift, JournalPanes.swift)
-    @Published var rows: [TapeItem] = []          // every item, built (newest first)
+    @Published var rows: [TapeItem] = [] { didSet { facetCache = nil } }   // every item, built (newest first)
+    /// Each row's facet, made once per change of the rows (a place or a key made all of them again).
+    var facetCache: [TapeFacet]?
+    var facets: [TapeFacet] {
+        if let f = facetCache { return f }
+        let f = rows.map(\.facet); facetCache = f; return f
+    }
     @Published var lines: [JLine] = []            // the outline as shown: only what is unfolded
     @Published var chosen: String?                // the chosen line (an item, a header, a session)
     @Published var open: String?                  // the item open in place (the reader closed)
@@ -127,6 +139,7 @@ final class WindowModel: ObservableObject {
     @Published var paletteIndex = 0
     @Published var overOpen = false               // the reader as a slide-over (narrow window, or the gallery)
     @Published var galleryReader: Bool?           // the gallery's docked reader (nil: closed, his choice kept)
+    @Published var galleryFar: GalleryZoom.Level? // zoomed out past the cards: days or lines (GalleryZoom)
     @Published var pinOrder: [String] = []        // the pinned items in his order (display only)
     @Published var detailsOpen = false            // the reader's Details disclosure (⌘I)
     /// Wire round: the reader's focus on a thing found in the chosen text (⌥↓ ⌥↑), its actions list (↵), for which
@@ -175,7 +188,10 @@ final class WindowModel: ObservableObject {
     /// The status line. It clears itself after a few seconds, unless it says something still running: playback (until
     /// it ends), a line ending in "…", or the command options it sits under (13 November: "Playing · 6 s" stayed for
     /// minutes after the clip ended).
-    @Published var status = "" { didSet { if status != oldValue { settleStatus() } } }
+    var status: String {
+        get { live.status }
+        set { guard newValue != live.status else { return }; live.status = newValue; settleStatus() }
+    }
     private var statusSeq = 0
     // the line at the top
     @Published var command = "" { didSet { seq += 1; options = []; thinking = false } }
@@ -190,6 +206,8 @@ final class WindowModel: ObservableObject {
     private static let follow = (takes: JSONLFollow(History.takesFile, keep: 500), clips: JSONLFollow(History.clipFile, keep: 300),
                                  typed: JSONLFollow(History.typedFile, keep: 600), drafts: JSONLFollow(History.draftsFile, keep: 600))
     private var reloadSeq = 0
+    /// The engine line, written only when it changes (the 3 s tick wrote the same line and redrew the window).
+    func setEngine(_ s: String) { if engine != s { engine = s } }
     /// Window opened: when (for the first-draw and first-answer lines in the log).
     var openedAt: Date?
     var firstAnswer: (from: Date, query: String)?
@@ -213,11 +231,14 @@ final class WindowModel: ObservableObject {
             let ms = Int(Date().timeIntervalSince(t0) * 1000)
             DispatchQueue.main.async {
                 guard mine == self.reloadSeq else { return }
-                self.takes = takes; self.clips = clips; self.typed = typed
-                self.today = ["typed": typed.filter { $0.title.isEmpty && Calendar.current.isDateInToday($0.when) }.count]
+                // a reopen with nothing new: no new lists, no build, no redraw (it rebuilt the journal every time)
+                let same = takes == self.takes && clips == self.clips && typed == self.typed
+                if !same { self.takes = takes; self.clips = clips; self.typed = typed }
+                let today = ["typed": typed.filter { $0.title.isEmpty && Calendar.current.isDateInToday($0.when) }.count]
+                if today != self.today { self.today = today }
                 self.loadStats()
-                self.applyDocs(docs)
-                log("window: reload \(ms) ms off the main thread")
+                self.applyDocs(docs, rebuild: !same)
+                log("window: reload \(ms) ms off the main thread\(same ? ", nothing new" : "")")
             }
         }
     }
@@ -432,13 +453,13 @@ struct CommandOptions: View {
                     if i < m.options.count - 1 { Rectangle().fill(UIInk.line).frame(height: 1) }
                 }
                 HStack {
-                    Text(m.status).font(PKFont.mono(11)).foregroundStyle(UIInk.faint)
+                    StatusText(live: m.live, font: PKFont.mono(11), color: UIInk.faint)
                     Spacer()
                     Button("Close") { m.options = [] }.buttonStyle(.plain).font(PKFont.text(12)).foregroundStyle(UIInk.muted)
                 }.padding(.horizontal, 16).padding(.vertical, 8).background(UIInk.soft)
             }
-            .background(UIInk.card).clipShape(RoundedRectangle(cornerRadius: PK.corner(3)))
-            .overlay { RoundedRectangle(cornerRadius: PK.corner(3)).strokeBorder(UIInk.line, lineWidth: 1) }
+            .background(.regularMaterial).clipShape(RoundedRectangle(cornerRadius: 10))
+            .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(UIInk.line, lineWidth: 0.5) }
             .shadow(color: .black.opacity(0.12), radius: 12, y: 6)
         }
     }
@@ -486,19 +507,11 @@ struct SettingsView: View {
                 Glyph("waves", size: 16).foregroundStyle(UIInk.muted).frame(width: G.toggle, alignment: .leading)
                 Text("Strip").font(PKFont.text(16))
                 Spacer()
-                HStack(spacing: 2) {
-                    ForEach(StripStyle.allCases, id: \.self) { s in
-                        let on = m.settings.stripStyle == s.rawValue
-                        Button { m.save { $0.stripStyle = s.rawValue } } label: {
-                            Text(s.name).font(PKFont.text(13)).foregroundStyle(on ? UIInk.ink : UIInk.muted)
-                                .padding(.horizontal, 10).frame(height: 26)
-                                .background(RoundedRectangle(cornerRadius: PK.corner(2)).fill(on ? UIInk.soft : .clear))
-                                .contentShape(Rectangle())
-                        }.buttonStyle(.plain).accessibilityAddTraits(on ? .isSelected : [])
-                    }
+                // the system's segmented control (native round: a hand-made one stood here)
+                SwiftUI.Picker("Strip style", selection: Binding(get: { m.settings.stripStyle }, set: { v in m.save { $0.stripStyle = v } })) {
+                    ForEach(StripStyle.allCases, id: \.self) { s in Text(s.name).tag(s.rawValue) }
                 }
-                .padding(2).overlay { RoundedRectangle(cornerRadius: PK.corner(2) + 2).strokeBorder(UIInk.line, lineWidth: 1) }
-                .accessibilityLabel("Strip style")
+                .pickerStyle(.segmented).labelsHidden().fixedSize()
                 Color.clear.frame(width: G.cloud + 12, height: 1)
             }
         }
@@ -532,12 +545,14 @@ struct SettingsView: View {
                     row("Fast model while I type fast, the bigger one in pauses", s.comboModels, typing: true) { $0.comboModels = $1 }
                     row("No suggestions after a typo", s.typoHold, typing: true) { $0.typoHold = $1 }
                     row("Suggestions in the middle of a line", s.midLine, typing: true) { $0.midLine = $1 }
+                    row("Suggestions in editors that hide the caret", s.fallbackAnchor, typing: true) { $0.fallbackAnchor = $1 }
                     modelRows
                     parityRows
                     row("Claude finishes the sentence when I pause", s.claudeTyping, sends: true, typing: true) { $0.claudeTyping = $1 }
                     row("Claude writes the rest when I stop", s.claudePause, sends: true, stat: LogStats.claude, typing: true) { $0.claudePause = $1 }
                     row("Proofread the message when I rest", s.proofread, sends: true, stat: LogStats.proofread, typing: true) { $0.proofread = $1 }
                     row("Check each sentence as I end it (Haiku or Workers AI)", s.sentenceProof, sends: true, typing: true) { $0.sentenceProof = $1 }
+                    row("A last look at a chat message before I send it", s.readerCheck, typing: true) { $0.readerCheck = $1 }
                     row("Offer my message in the chat's language", s.translate, sends: true, stat: LogStats.translate, typing: true) { $0.translate = $1 }
                     row("Answer questions from my calendar", s.facts, sends: true, stat: LogStats.facts, typing: true) { $0.facts = $1 }
                     row("Suggest the next message", s.nextMessage, sends: true, stat: LogStats.next, typing: true) { $0.nextMessage = $1 }
@@ -818,5 +833,22 @@ struct ShortcutsView: View {
             if m.preview { ideas = [Snippets.Idea(text: "Thanks, got it. I will look today and come back.", count: 4)] }
             else if Drafter.shared.settings.learn { DispatchQueue.global(qos: .utility).async { let i = Snippets.ideas(); DispatchQueue.main.async { ideas = i } } }
         }
+    }
+}
+
+/// The window's fast-changing words (native round): its own object, so only the views that show them redraw.
+final class LiveLine: ObservableObject {
+    @Published var status = ""
+    @Published var playhead: Double = 0
+}
+
+/// The status text: redraws on its own when the status changes.
+struct StatusText: View {
+    @ObservedObject var live: LiveLine
+    var font: Font
+    var color: Color
+    var fallback = ""
+    var body: some View {
+        Text(live.status.isEmpty ? fallback : live.status).font(font).foregroundStyle(color).lineLimit(1)
     }
 }

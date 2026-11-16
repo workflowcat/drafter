@@ -100,3 +100,7 @@ class RoundEleven(unittest.TestCase):
             self.assertEqual(voice.Readers().read_file_whisper('fake', fast_text='known real words'),
                              [dict(start=0, end=1, text='known real words')])
             whisper.transcribe.assert_not_called()
+
+
+if __name__ == '__main__':
+    unittest.main()

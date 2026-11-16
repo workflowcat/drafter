@@ -43,6 +43,10 @@ struct Settings: Codable {
     /// sentence alone goes to the cloud for minimal edits (Haiku races Workers AI, engine/sentence.py); the same "Fix N"
     /// chip as the proofread, Tab puts the fixes in. Under claudeTyping, off by default.
     var sentenceProof = false
+    /// Reader check before sending (roadmap item 4, an experiment, 2026-11-17): in a chat box, once the message looks
+    /// finished, a local last look (engine/reader.py: slips, a question of theirs left open) as one chip; Tab takes it,
+    /// any other key drops it. Never holds Enter, nothing leaves the Mac. Off by default.
+    var readerCheck = false
     var proofreadOff: [String] = ["ai"] // app kinds (AppKind: ai, chat, mail, other) where proofread stays quiet: a prompt to an AI needs no clean spelling
     var rework = false         // ⌥Tab on a selection: shorter, fix, clearer, warmer, formal, list, translate or his own words (app/Rework.swift)
     var fixWord = true         // the word being typed is no word he writes but one is a letter or a layout away: "→ word" at the caret, Tab swaps it (app/Fixer.swift)
@@ -104,6 +108,7 @@ struct Settings: Codable {
     var shotFolder = ""                       // "File" saves screenshots here; "" = ~/Desktop
     // keys round (14 November 2026, app/KeyRules.swift)
     var midLine = true         // a ghost with text after the caret on its line, on a small card under the line (2026-11-15; on since the fim round measured it)
+    var fallbackAnchor = true  // a field with no caret rect (web editors): the ghost at an estimated place, else on a chip near the field (2026-11-17)
     var tabBack = true         // Backspace right after Tab takes that Tab's words out and shows the grey text again
     var pickOffer = true       // after a long copy, the strip offers "Pick parts" (⌃⌥P)
     var escPause = true        // Esc twice in a field with a ghost pauses ghosts there for 10 minutes; twice again resumes
@@ -126,6 +131,7 @@ struct Settings: Codable {
     var journalView = "gallery"   // "gallery": cards; "list": rows
     var journalLook = "soft"      // the list's rows: "soft" (three zones) or "grid" (the old columns)
     var cardSize = 1              // 0 small, 1 medium, 2 large (⌘- ⌘+)
+    var retrainRemote = false     // the weekly retrain trains his layer on bnp-hetzner (bench/remote_train.py); lines deleted there after each run
 
     init() {}
     init(from d: Decoder) throws {   // a missing or wrongly typed key keeps its default, so a file written by the engine still loads
@@ -146,7 +152,7 @@ struct Settings: Codable {
         typoEngine = pick(.typoEngine, ["system"], "ranked")
         layoutFix = v(.layoutFix, z.layoutFix); autocorrectUk = v(.autocorrectUk, z.autocorrectUk)
         claudeTyping = v(.claudeTyping, z.claudeTyping); claudeModel = v(.claudeModel, z.claudeModel)
-        proofread = v(.proofread, z.proofread); sentenceProof = v(.sentenceProof, z.sentenceProof); proofreadOff = v(.proofreadOff, z.proofreadOff)
+        proofread = v(.proofread, z.proofread); sentenceProof = v(.sentenceProof, z.sentenceProof); readerCheck = v(.readerCheck, z.readerCheck); proofreadOff = v(.proofreadOff, z.proofreadOff)
         clipContext = v(.clipContext, z.clipContext); writingNote = v(.writingNote, z.writingNote); appNotes = v(.appNotes, z.appNotes)
         personalStrength = min(100, max(0, v(.personalStrength, z.personalStrength))); alternatives = v(.alternatives, z.alternatives)
         typingModel = v(.typingModel, z.typingModel)
@@ -171,7 +177,7 @@ struct Settings: Codable {
         connect = v(.connect, z.connect)
         clipImageMB = v(.clipImageMB, z.clipImageMB); clipTotalMB = v(.clipTotalMB, z.clipTotalMB)
         captureKey = v(.captureKey, z.captureKey); captureCmdShiftS = v(.captureCmdShiftS, z.captureCmdShiftS); shotLast = v(.shotLast, z.shotLast); shotFolder = v(.shotFolder, z.shotFolder)
-        tabBack = v(.tabBack, z.tabBack); midLine = v(.midLine, z.midLine); pickOffer = v(.pickOffer, z.pickOffer)
+        tabBack = v(.tabBack, z.tabBack); midLine = v(.midLine, z.midLine); fallbackAnchor = v(.fallbackAnchor, z.fallbackAnchor); pickOffer = v(.pickOffer, z.pickOffer)
         escPause = v(.escPause, z.escPause); againKey = v(.againKey, z.againKey); switchSwap = v(.switchSwap, z.switchSwap)
         typography = v(.typography, z.typography)
         typographyDash = v(.typographyDash, z.typographyDash); typographySpacedDash = v(.typographySpacedDash, z.typographySpacedDash)
@@ -186,6 +192,7 @@ struct Settings: Codable {
         journalView = pick(.journalView, ["list"], "gallery")
         journalLook = pick(.journalLook, ["grid"], "soft")
         cardSize = max(0, min(2, v(.cardSize, z.cardSize)))
+        retrainRemote = v(.retrainRemote, z.retrainRemote)
         // cloudDefaults is never read back: the engine's migration mark, always written as "off"
     }
     /// Claude switches (engine/cloud.py) are off for a new install since 2026-11-14. Once, before decoding, a file

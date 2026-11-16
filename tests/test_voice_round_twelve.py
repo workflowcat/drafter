@@ -102,3 +102,7 @@ class RoundTwelve(unittest.TestCase):
             out = voice.Readers().read_file_whisper('synthetic', lang='uk', fast_text='привіт усім')
             self.assertEqual([s['text'] for s in out], [english, english])
             self.assertEqual([s['start'] for s in out], [0, 1])
+
+
+if __name__ == '__main__':
+    unittest.main()
