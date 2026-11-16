@@ -25,6 +25,9 @@ struct KeyGaps {
     private var fieldKind = -1, fieldRev = -1
     // the key before: when it came, its key count, the field token (Keys.fieldGen) and the key count its run began at
     private var prevAt: UInt64 = 0, prevRev = -2, prevField = -1, runStart = -1
+    /// The gap before the last key in ms, -1 when unknown (first key of a run, another field, a non-letter, secure
+    /// input). Cadence round: the engine routes a key to the fast model when this is short (engine/cadence.py).
+    private(set) var lastMs = -1
 
     init() {}
 
@@ -43,8 +46,9 @@ struct KeyGaps {
     /// Keys.fieldGen, `unit` the first UTF-16 unit it typed (nil: none), `secure` secure input on, `ghost` a ghost was
     /// on screen when it came. Returns the line to log when a minute has passed.
     mutating func key(at: UInt64, rev: Int, field: Int, unit: UInt16?, secure: Bool, ghost shown: Bool) -> String? {
-        guard !secure, let u = unit, KeyGaps.isLetter(u) else { prevRev = -2; return nil }
+        guard !secure, let u = unit, KeyGaps.isLetter(u) else { prevRev = -2; lastMs = -1; return nil }
         let chained = rev == prevRev + 1 && field == prevField && at >= prevAt
+        lastMs = chained ? Int(min((at - prevAt) / 1_000_000, 60_000)) : -1
         if !chained { runStart = rev }
         defer { prevAt = at; prevRev = rev; prevField = field }
         // counted only once Keys.ask confirmed this run's field (a Tab can move the caret into another field)

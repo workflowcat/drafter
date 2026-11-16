@@ -65,6 +65,20 @@ struct KeyGapRulesChecks {
         for u: UInt16 in [0x0D, 0x09, 0x1B, 0x7F, 0xF700, 0xF8FF] { check(!KeyGaps.isLetter(u), "not a letter: \(u)") }
         for u: UInt16 in [0x20, 0x61, 0x0456, 0x2019] { check(KeyGaps.isLetter(u), "a letter: \(u)") }
 
+        // the gap before the last key (cadence round): known only inside a run of letters in one field
+        var c = KeyGaps(); var tc: UInt64 = 0
+        _ = c.key(at: tc, rev: 1, field: 0, unit: a, secure: false, ghost: false)
+        check(c.lastMs == -1, "the first key has no gap")
+        tc += 85 * ms; _ = c.key(at: tc, rev: 2, field: 0, unit: a, secure: false, ghost: false)
+        check(c.lastMs == 85, "a gap before the field is confirmed is still known: \(c.lastMs)")
+        tc += 140 * ms; _ = c.key(at: tc, rev: 4, field: 0, unit: a, secure: false, ghost: false)
+        check(c.lastMs == -1, "a key in between: unknown")
+        tc += 50 * ms; _ = c.key(at: tc, rev: 5, field: 0, unit: 0x0D, secure: false, ghost: false)
+        check(c.lastMs == -1, "Return: unknown")
+        tc += 50 * ms; _ = c.key(at: tc, rev: 6, field: 0, unit: a, secure: false, ghost: false)
+        tc += 70 * ms; _ = c.key(at: tc, rev: 7, field: 0, unit: a, secure: true, ghost: false)
+        check(c.lastMs == -1, "secure input: unknown")
+
         // a new app kind closes the window at once
         let k = n.field("ai", rev: 14)
         check(k == "keygap mail lt60 0 lt90 0 lt120 3 lt150 0 lt200 0 lt300 0 lt500 0 lt1000 0 pause 0 ghost 0", "kind change: \(k ?? "nil")")

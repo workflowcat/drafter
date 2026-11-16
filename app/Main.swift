@@ -76,7 +76,9 @@ final class Drafter {
     static let shared = Drafter()
     var settings = Settings.load()
     var lowBattery = false
-    var active: Bool { !settings.paused && !lowBattery }
+    /// Low battery no longer pauses (Andrii, 2026-11-16: "should keep running, just stay under limit"): the engine
+    /// already drops look-ahead work under 30 % and the guard keeps its memory cap. `lowBattery` only labels the menu.
+    var active: Bool { !settings.paused }
 
     /// The one way the app changes its settings: in memory, then data/settings.json. Returns the new settings.
     @discardableResult func change(_ edit: (inout Settings) -> Void) -> Settings {
@@ -143,7 +145,7 @@ final class Drafter {
     func checkBattery() {
         let (onBattery, pct) = Battery.state()
         let low = onBattery && pct < 20
-        if low != lowBattery { lowBattery = low; log("battery \(pct)% on battery=\(onBattery): auto-pause \(low)"); apply() }
+        if low != lowBattery { lowBattery = low; log("battery \(pct)% on battery=\(onBattery): light \(low)") }
     }
 }
 

@@ -50,6 +50,13 @@ enum GhostRules {
         return b
     }
 
+    /// Cadence round (2026-11-17, engine/cadence.py): with `combo` (setting comboModels) the engine keeps the fast model
+    /// beside the picked one and answers a key with it when the gap before the key, `gapMs` (KeyGaps.lastMs, -1 when
+    /// unknown), is short. `combo` always goes out, so turning the switch off lets the engine drop the second model.
+    static func cadenceBody(combo: Bool, gapMs: Int) -> [String: Any] {
+        combo && gapMs >= 0 ? ["combo": true, "gap_ms": gapMs] : ["combo": combo]
+    }
+
     /// An answer asked at an older key than the grey text on screen never replaces it (Codex review 2026-11-16: an
     /// answer kept running while he typed, step 2 `keepTyping`, may come back after a newer one was drawn).
     static func olderThanShown(askedRev: Int?, shownRev: Int?, visible: Bool) -> Bool {

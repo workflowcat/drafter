@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 ROOT = Path(__file__).resolve().parent.parent
 
 import local
+from writing_notes import normalize as normalize_notes
 
 
 def rules():
@@ -174,7 +175,7 @@ NOTES_FORM = os.environ.get("DRAFTER_NOTES_FORM", "paren")
 
 
 def notes_text(notes):
-    return re.sub(r"\s+", " ", notes or "").strip()[:NOTES_CHARS]
+    return normalize_notes(notes, NOTES_CHARS)
 
 
 # Mid-line (fill in the middle, 2026-11-15, docs/rounds/2026-11-15-fim.md): the app sends the rest of the caret's line

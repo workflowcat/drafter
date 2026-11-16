@@ -84,6 +84,11 @@ struct GhostRulesChecks {
         check(R.runBody(mode: "sentence", words: true, minWords: 3, maxWords: 5, guess: true, shade: true, strict: true) == nil, "Zoom stays strict")
         let odd = R.runBody(mode: "phrase", words: true, minWords: 9, maxWords: 2, guess: true, shade: false, strict: false)!
         check(odd["words_min"] as? Int == 5 && odd["words_max"] as? Int == 5 && odd["guess_shade"] as? Bool == false, "numbers kept in range; shade off")
+        let cb = R.cadenceBody(combo: true, gapMs: 85)
+        check(cb["combo"] as? Bool == true && cb["gap_ms"] as? Int == 85, "combo: the gap goes with it")
+        check(R.cadenceBody(combo: true, gapMs: -1)["gap_ms"] == nil, "an unknown gap is not sent")
+        let co = R.cadenceBody(combo: false, gapMs: 85)
+        check(co["combo"] as? Bool == false && co["gap_ms"] == nil, "off: combo false, no gap")
         check(R.sentencePiece("we can go. Then more") == "we can go. ", "⌃Tab: up to the sentence end and its space")
         check(R.sentencePiece("see you soon!\" ok") == "see you soon!\" ", "closing quote stays with the sentence")
         check(R.sentencePiece("version 3.5 is out") == "version 3.5 is out", "a dot inside a number is no sentence end")

@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import prompt as prompt_mod
 import local
 import provider
+from writing_notes import normalize as normalize_notes
 
 RUSSIAN = re.compile(r"[ыэъёЫЭЪЁ]")
 
@@ -130,7 +131,7 @@ BEFORE_CHARS, AFTER_CHARS, SCREEN_CHARS = 3000, 600, 2500   # Claude reads earli
 
 def notes_line(notes):
     """His writing instructions (Settings > Typing, global and this app's) as one line for a Claude prompt; "" = none."""
-    n = " ".join((notes or "").split())[:300]
+    n = normalize_notes(notes)
     return f"His writing instructions (follow them): {n}\n" if n else ""
 
 

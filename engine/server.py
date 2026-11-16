@@ -48,6 +48,7 @@ guard.start(CAP)
 from model import Model
 import model as model_mod
 import catalog
+import cadence
 from prompt import Builder
 import prompt as prompt_mod
 import dictionary
@@ -72,6 +73,8 @@ import sentence as sentence_mod
 import local
 import integrations
 import provider
+from writing_notes import normalize as normalize_notes
+from chat_template import encode as chat_ids
 
 REPO = os.environ.get("DRAFTER_MODEL", "mlx-community/Qwen3-1.7B-4bit")
 FMT = os.environ.get("DRAFTER_FMT", "raw")
@@ -247,6 +250,79 @@ model.warm(builder.head_ids)
 model.pieces()
 print(f"drafter engine: {REPO} ({(CURRENT['entry'] or {}).get('id', 'not in the catalog')}, {_why}) loaded in {model.load_s:.1f}s, head {len(builder.head_ids)} tokens, port {PORT}", flush=True)
 
+# Cadence round (2026-11-17, engine/cadence.py): the fast model (the live 1.7B + his layer) beside the picked bigger
+# one, loaded when a request asks for it (setting comboModels) and memory allows, dropped when the switch goes off, on
+# sleep and on a model switch. Same worker, same queue: one model answers each key. Its own gate is live's.
+FAST = {"m": None, "b": None, "loading": False, "used": 0, "loads": 0, "refused": 0, "gate": None, "mtime": None}
+
+
+def fast_ready():
+    return FAST["m"] is not None and not FAST["loading"] and not FAST["m"].asleep
+
+
+def slot_for(req):
+    """"fast" or "big" for this request (engine/cadence.py)."""
+    return cadence.route(req, fast_ready(), ((globals().get("CURRENT") or {}).get("entry") or {}).get("id"))
+
+
+def fast_gate():
+    """data/gate.json (live's gate, fitted on the 1.7B), read again when it changes."""
+    with GATE_LOCK:
+        p = fitted("gate.json")
+        try: mt = p.stat().st_mtime
+        except Exception: return None
+        if (mt, p) != FAST["mtime"]: FAST["gate"], FAST["mtime"] = gatecore.load(p), (mt, p)
+        return FAST["gate"]
+
+
+def fast_load(cancelled=None):
+    """On the worker: load the fast slot when memory allows; the guard's cap grows by cadence.FAST_GB."""
+    try:
+        if FAST["m"] is not None or model.asleep or model.loading: return {"fast": FAST["m"] is not None}
+        free = catalog.machine()["free_gb"]
+        if free is not None and free < cadence.FAST_GB + catalog.MARGIN_GB:
+            FAST["refused"] += 1; print(f"combo: not loaded, free {free} GB", flush=True); return {"fast": False}
+        t = time.time()
+        set_cap(guard._cap[0] + cadence.FAST_GB)
+        try:
+            m = Model(LIVE_ENTRY["repo"], catalog.adapter_for(LIVE_ENTRY, ADAPTER, DATA), strength=strength_setting())
+            fb = Builder(m, FMT); m.warm(fb.head_ids); m.pieces()
+        except Exception as e:
+            set_cap(max(CAP, guard._cap[0] - cadence.FAST_GB))
+            FAST["refused"] += 1; print(f"combo: fast model did not load ({type(e).__name__})", flush=True); return {"fast": False}
+        FAST["m"], FAST["b"] = m, fb; FAST["loads"] += 1
+        print(f"combo: fast model loaded in {time.time() - t:.1f} s, footprint {guard.footprint_gb():.2f} GB, cap {guard._cap[0]} GB", flush=True)
+        return {"fast": True}
+    finally:
+        FAST["loading"] = False
+
+
+def fast_drop(cancelled=None):
+    """On the worker: the fast slot goes, the cap comes back."""
+    m = FAST["m"]
+    if m is None: return {"fast": False}
+    FAST["m"] = FAST["b"] = None
+    m.unload(); del m
+    set_cap(max(CAP, guard._cap[0] - cadence.FAST_GB))
+    print("combo: fast model dropped", flush=True)
+    return {"fast": False}
+
+
+def fast_tend(req):
+    """A typing request: load the fast slot when combo is asked and missing, drop it when combo is off."""
+    cur = ((globals().get("CURRENT") or {}).get("entry") or {}).get("id")
+    if cadence.wanted(req, cur):
+        if FAST["m"] is None and not FAST["loading"] and not model.asleep and not model.loading and FAST["refused"] < 3:
+            FAST["loading"] = True
+            # behind typing (low), never dropped as stale; loading clears even when the job never ran
+            def go():
+                try: run(fast_load, low=True, cancel=lambda: False, timeout=120)
+                finally: FAST["loading"] = False
+            threading.Thread(target=go, daemon=True).start()
+    elif FAST["m"] is not None and not FAST["loading"] and "combo" in req:
+        threading.Thread(target=lambda: run(fast_drop, newest=False, timeout=30), daemon=True).start()
+
+
 # One worker owns the model. Only the newest request matters: older ones still waiting are answered empty,
 # and a running one stops at the next token when a newer one arrives.
 # one model, one worker: a typing request goes before look-ahead work already waiting (low), each kind in arrival
@@ -294,7 +370,8 @@ def keep_ident(req):
     m = globals().get("model")
     return (normal_space(str(req.get("after") or ""))[:400], str(req.get("after_line") or ""), bool(req.get("mid")),
             req.get("field"), id(m), getattr(m, "repo", None), getattr(m, "adapter", None), getattr(m, "strength", None),
-            ((globals().get("CURRENT") or {}).get("entry") or {}).get("id"))
+            ((globals().get("CURRENT") or {}).get("entry") or {}).get("id"),
+            globals().get("slot_for", lambda r: "big")(req))
 
 
 def worker():
@@ -345,10 +422,7 @@ def run(fn, newest=True, timeout=10, low=False, seq=None, cancel=None, before=No
 def ask(prompt, max_tokens=90, cancelled=lambda: False):
     """Field extraction for actions: a chat turn, greedy, stops at the closing brace."""
     msgs = [{"role": "user", "content": prompt}]
-    s = model.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-    if "<think>" in (model.tok.chat_template or "") and "Instruct-2507" not in model.repo:
-        s += "<think>\n\n</think>\n\n"
-    ids = model.tok.encode(s, add_special_tokens=False)
+    ids = chat_ids(model, msgs)
     out = model.oneshot(ids, max_tokens=max_tokens, stop=re.compile(r"\}\s*$"), cancelled=cancelled)
     if (DATA / "debug").exists(): print("ask:", repr(out[:300]), flush=True)
     return out
@@ -394,10 +468,7 @@ def rewrite(req):
               "тексті, якщо вказівка не каже інакше. Rewrite the text as the instruction says; reply with the new text only.\n"
               f"Вказівка / instruction: {instr}\n\nТекст / text:\n{text}")
     msgs = [{"role": "user", "content": prompt}]
-    s = model.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-    if "<think>" in (model.tok.chat_template or "") and "Instruct-2507" not in model.repo:
-        s += "<think>\n\n</think>\n\n"
-    ids = model.tok.encode(s, add_special_tokens=False)
+    ids = chat_ids(model, msgs)
     n = min(600, int(len(model.tok.encode(text)) * 2) + 40)
 
     def job(cancelled):
@@ -424,10 +495,7 @@ def outline(req):
     prompt = (f"Ось текст {kind}, який ще триває. Мовою тексту дай JSON з ключами: title (3-7 слів), points (до 5 "
               "головних пунктів, до 12 слів кожен), todos (до 4 справ: хто що робить). Лише JSON.\nТекст:\n" + text)
     msgs = [{"role": "user", "content": prompt}]
-    s = model.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-    if "<think>" in (model.tok.chat_template or "") and "Instruct-2507" not in model.repo:
-        s += "<think>\n\n</think>\n\n"
-    ids = model.tok.encode(s, add_special_tokens=False)
+    ids = chat_ids(model, msgs)
 
     def job(cancelled):
         t = time.perf_counter()
@@ -482,7 +550,7 @@ def reply(req):
     ai = bool(req.get("ai"))
     ctx = (req.get("context") or "")[-(4000 if ai else 2500):]
     if len(ctx.split()) < 3: return {"text": ""}
-    notes = " ".join(str(req.get("notes") or "").split())[:300]
+    notes = normalize_notes(str(req.get("notes") or ""))
     key = (ai, ctx[-1200:]) + ((notes,) if notes else ())
     if key in REPLY_CACHE: return {**REPLY_CACHE[key], "cached": True}
     try: voice = Path(local.setting("voice_guide", "path")).read_text()[:3500] if local.enabled("voice_guide") else P.rules()
@@ -787,6 +855,7 @@ def complete(req, low=False, seq=None, on_part=None, keep=None):
     if low and req.get("mid"): return mid_result(req, _complete(req, low=True, seq=seq, **({"keep": keep} if keep else {})))
     if low: return _complete(req, low=True, seq=seq, **({"keep": keep} if keep else {}))
     if seq is None: seq = request_seq()  # before any cache, snippet or word-only return
+    globals().get("fast_tend", lambda r: None)(req)
     earlier(req.get("app", ""), req.get("context") or "", remember=req.get("context_fresh", True))
     pack = knowledge.snapshot()
     if req.get("ahead", True):
@@ -847,9 +916,7 @@ def idle_ids(form, b, app, context, blk):
     the model's chat template. Nothing he types is in it, so all but the last token stays put per screen."""
     mine = earlier(app, context, remember=False)
     if form == "chat":
-        s = model.tok.apply_chat_template(idle_mod.chat_messages(context, app, blk, mine, local.short_name()), tokenize=False, add_generation_prompt=True)
-        if "<think>" in (model.tok.chat_template or "") and "Instruct-2507" not in model.repo: s += "<think>\n\n</think>\n\n"
-        ids, heal = model.tok.encode(s, add_special_tokens=False), ""    # the template writes its own start token
+        ids, heal = chat_ids(model, idle_mod.chat_messages(context, app, blk, mine, local.short_name())), ""
     else:
         t = idle_mod.turns_tail(context, app, blk, mine)
         heal = re.search(r"[ \t]*$", t).group(0)
@@ -940,8 +1007,15 @@ def _complete(req, low=False, seq=None, pack=None, on_part=None, keep=None):
         return {"text": f, "src": source if f else "asleep", "ms": 0}
 
     t_in = time.perf_counter()
+    # cadence round (engine/cadence.py): the fast model answers this key when he types fast and comboModels is on
+    slot = globals().get("slot_for", lambda r: "big")(req)
+    used = {}
 
     def job(cancelled):
+        m, bb, gg = model, b, g
+        if slot == "fast" and FAST["m"] is not None and not FAST["m"].asleep:   # cadence round: he types fast
+            m, bb, gg = FAST["m"], FAST["b"], (fast_gate() or g) if g else None
+            used["slot"] = "fast"; FAST["used"] += 1
         t = time.perf_counter()
         act = actions.detect(before) if chips else None
         if act:
@@ -951,24 +1025,24 @@ def _complete(req, low=False, seq=None, pack=None, on_part=None, keep=None):
         # /complete may carry Keys.contextFor's previous screen while a fresh read runs.
         # complete() tracks fresh context before any fast return; this job never moves it.
         if idle_form in ("turns", "chat"): ids, heal, stable = idle_ids(idle_form, b, app, context, blk)
-        else: ids, heal, stable = b.ids_stable(before, app, title, context, earlier(app, context, remember=False), *extras(req), after)
+        else: ids, heal, stable = bb.ids_stable(before, app, title, context, earlier(app, context, remember=False), *extras(req), after)
         prep = round((time.perf_counter() - t) * 1000, 1)
         n = max(1, min(int(req.get("max_tokens") or MAX_TOKENS), 16))
-        if g:
+        if gg:
             # the decision gate decides on the first word, then sure words follow (engine/gatecore.py)
-            th = g["th"]["ai" if ai else "chat"]
+            th = gg["th"]["ai" if ai else "chat"]
             finish = finisher.finish(before, 2, 0.5, 1) if mid else ""   # a gate feature, as bench/gate.py reads it
             seen = {}
 
             # the lower gate (earlier round, 2026-11-16): a first word the gate does not pass but scores at least
             # `guess` still shows, as a guess (drawn lighter when the app asks for it); Tab takes it the same
-            low = gatecore.guess_bar(g, ((globals().get("CURRENT") or {}).get("entry") or {}).get("id", "live"), os.environ.get("DRAFTER_GUESS")) if req.get("guess") else None
+            low = gatecore.guess_bar(gg, cadence.FAST_ID if m is not model else ((globals().get("CURRENT") or {}).get("entry") or {}).get("id", "live"), os.environ.get("DRAFTER_GUESS")) if req.get("guess") else None
             low = gatecore.early_bar(low, before, bool(req.get("early_start")))   # step 6: one notch lower, lower after a space
             if idle: low = gatecore.idle_bar(low, req.get("idle_bar"))           # step 7: the idle ghost's own bar
 
             def decide(toks):
                 f, _ = gatecore.features(toks, before, ai, finish)
-                p = gatecore.score(g["w"], f) if f else 0.0
+                p = gatecore.score(gg["w"], f) if f else 0.0
                 seen["p"] = p
                 if sel and f:
                     ps = gatecore.score(sel["w"], gatecore.sel_features("model", toks[-1][0], before, ai, model_p=p, model_low=float(p < th)))
@@ -981,7 +1055,7 @@ def _complete(req, low=False, seq=None, pack=None, on_part=None, keep=None):
                 return None
             # the word booster (2026-11-01): his own next words mixed into the model's guess, at the share the gate was
             # fit with (data/gate.json "boost"; 0 = off). His words update with every line he sends (/typed).
-            lam = float(g.get("boost", 0) or 0) if req.get("boost", True) else 0.0
+            lam = float(gg.get("boost", 0) or 0) if req.get("boost", True) else 0.0
             boost = words_mod.boost_targets(finisher, before, heal, knowledge=pack, context=context, title=title) if lam else None
             min_letters = int(req.get("min_letters") or 0)
             # the lighter tail (round two): the app's per-app length (Keys.length: "tail" bar and "tail_words")
@@ -1012,30 +1086,30 @@ def _complete(req, low=False, seq=None, pack=None, on_part=None, keep=None):
             fill = None
             if after_line:
                 # mid-line (engine/fim.py): word mode, the ghost ends where the gap is filled
-                rest = model.encode(after_line)
+                rest = m.encode(after_line)
                 fill = {"rest": rest[0] if rest else None, "text": after_line}
                 run_mode, tail, cap, min_letters, n = None, None, None, 0, fim.TOKENS
-            text, gp, first, total = model.complete_gated(ids, heal, decide, more=g.get("more", 0.5), max_words=int(g.get("max_words", 3)),
+            text, gp, first, total = m.complete_gated(ids, heal, decide, more=gg.get("more", 0.5), max_words=int(gg.get("max_words", 3)),
                                                           max_tokens=cap if run_mode else (max(n, min(24, 2 * tail_words + 2)) if tail is not None else n), cancelled=cancelled,
                                                           screen=screen, boost=boost, lam=lam, min_letters=min_letters,
                                                           grow=GROW if min_letters and not run_mode else None, grow_words=GROW_WORDS,
                                                           tail=tail, tail_words=tail_words, on_part=part_fn, run=run_mode, alts=FUTURES if req.get("ahead", True) else 0,
                                                           stable=stable, **({"mid": fill} if fill else {}))
-            sure = getattr(model, "last_sure", None)
+            sure = getattr(m, "last_sure", None)
             if run_mode: tail = -1.0     # the sure part / lighter split below applies to the run too
-            seen["alts"] = list(getattr(model, "last_alts", []) or [])
-            seen["conf"] = list(getattr(model, "last_conf", []) or [])
-            seen["raw"] = getattr(model, "last_raw", "") or ""
+            seen["alts"] = list(getattr(m, "last_alts", []) or [])
+            seen["conf"] = list(getattr(m, "last_conf", []) or [])
+            seen["raw"] = getattr(m, "last_raw", "") or ""
             out = clean(before, text.replace("\ufffd", ""))
             if short(req, out): out = ""
             if first_word:
                 if not gatecore.extends(out, first_word):
                     return {"text": first_word, "src": "words", "first": True, "gate": round(seen.get("p", 0), 3), "next": seen["raw"], "ms": round(total)}
                 res = {"text": out, "src": "gate", "first": True, "gate": round(seen.get("p", 0), 3), "next": seen["raw"], "alts": seen["alts"], "first_ms": 0, "ms": round(total)}
-                rest = text[getattr(model, "last_sure", 0) or 0:] if tail is not None else ""
+                rest = text[getattr(m, "last_sure", 0) or 0:] if tail is not None else ""
                 if rest.strip() and out.endswith(rest) and len(out) - len(rest) >= len(first_word): res["unsure"] = rest
                 return res
-            fall, source = words_mod.finish_with_source(finisher, before, g.get("words", (2, 0.6, 1)), pack) if mid and not out and req.get("words", True) and not sel else ("", "")
+            fall, source = words_mod.finish_with_source(finisher, before, gg.get("words", (2, 0.6, 1)), pack) if mid and not out and req.get("words", True) and not sel else ("", "")
             if short(req, fall): fall = ""
             if fall:
                 # the gate said no: the word being typed, from his own words, when that is clear (bench/gate.py
@@ -1043,9 +1117,9 @@ def _complete(req, low=False, seq=None, pack=None, on_part=None, keep=None):
                 if source == "know": knowledge.offered += 1
                 return {"text": fall, "src": source, "gate": round(seen.get("p", 0), 3), "next": seen["raw"], "ms": round(total)}
             res = {"text": out, "src": "gate", "gate": round(seen.get("p", 0), 3), "next": seen["raw"], "alts": seen["alts"], "first_ms": round(first), "ms": round(total),
-                   "t": dict(getattr(model, "timing", {}) or {}, prep=prep, queue=round((t - t_in) * 1000, 1))}
+                   "t": dict(getattr(m, "timing", {}) or {}, prep=prep, queue=round((t - t_in) * 1000, 1))}
             if run_mode and out:
-                res["conf"] = seen["conf"]; res["why"] = getattr(model, "last_why", None)
+                res["conf"] = seen["conf"]; res["why"] = getattr(m, "last_why", None)
             rest = text[sure:] if sure is not None and tail is not None else ""
             if out and rest.strip() and out.endswith(rest): res["unsure"] = rest
             if idle: res["idle"] = True; res["idle_form"] = idle_form
@@ -1056,21 +1130,23 @@ def _complete(req, low=False, seq=None, pack=None, on_part=None, keep=None):
         # short and sure (Andrii, 2026-10-19): at most 3 words, and only the words the model gives >= 50% to
         # (bench: shown on 9/30 cut messages instead of 29, wrong on 3 instead of 19)
         soft = float(req.get("soft", 0) or 0)
-        text, first, total = model.complete(None, raw_ids=ids, max_tokens=n, cancelled=cancelled, heal=heal,
+        text, first, total = m.complete(None, raw_ids=ids, max_tokens=n, cancelled=cancelled, heal=heal,
                                             min_p=MIN_P, max_words=int(req.get("max_words") or MAX_WORDS), bars=bars, soft=soft, soft_from=int(req.get("soft_from", 2)), screen=screen,
                                             stable=stable)
         text = text.replace("\ufffd", "")
         out = clean(before, text)
         if short(req, out): out = ""
-        res = {"text": out, "more": bool(model.hit_limit and out and "\n" not in text), "first_ms": round(first), "ms": round(total)}
+        res = {"text": out, "more": bool(m.hit_limit and out and "\n" not in text), "first_ms": round(first), "ms": round(total)}
         # the lighter tail: the words after the sure part (the app draws them lighter; Tab still takes one word)
-        if soft and model.sure_len is not None:
-            tail = text[model.sure_len:].strip()
+        if soft and m.sure_len is not None:
+            tail = text[m.sure_len:].strip()
             if tail and out.rstrip().endswith(tail): res["unsure"] = tail
         return res
     cancel = (lambda: stale(seq) and WANT[0] != keep) if keep else None
     on = {"before": normal_space(req.get("before") or "")[-4000:], "ident": keep_ident(req)} if req.get("keep_on") and not low else {}   # keep in flight
-    return run(job, low=low, seq=seq, cancel=cancel, **on)
+    res = run(job, low=low, seq=seq, cancel=cancel, **on)
+    if used.get("slot") and isinstance(res, dict): res["slot"] = used["slot"]
+    return res
 
 
 # ---- model catalog (2026-11-15, engine/catalog.py) ----
@@ -1114,6 +1190,7 @@ def models_view():
 def switch_to(target):
     """On the worker thread: unload, load `target` (live when it fails), head again. Numbers only in the log."""
     try:
+        fast_drop()   # cadence round: never two models plus a third loading
         got, err, secs = catalog.switch(model, target, LIVE_ENTRY, ADAPTER, rebuild=rebuild_head, set_cap=set_cap,
                                         data=DATA, free_gb=catalog.machine()["free_gb"])
         if got is not None: CURRENT["entry"] = got
@@ -1223,10 +1300,7 @@ def local_rewrite(text, instr, notes=""):
               "тексті, якщо вказівка не каже інакше. Rewrite the text as the instruction says; reply with the new text only.\n"
               + (f"Як він пише / his writing instructions: {notes}\n" if notes else "")
               + f"Вказівка / instruction: {instr}\n\nТекст / text:\n{text}")
-    s = model.tok.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True)
-    if "<think>" in (model.tok.chat_template or "") and "Instruct-2507" not in model.repo:
-        s += "<think>\n\n</think>\n\n"
-    ids = model.tok.encode(s, add_special_tokens=False)
+    ids = chat_ids(model, [{"role": "user", "content": prompt}])
     n = min(900, int(len(model.tok.encode(text)) * 2) + 40)
     # stops when he types again (a newer suggestion) or the request gave up, so the one model is free for typing
     # (Codex review 2026-11-01: a dismissed rework held it for up to 900 tokens)
@@ -1384,7 +1458,7 @@ class H(BaseHTTPRequestHandler):
             act, peak = model.memory_gb()
             return self.send({"ok": True, "model": model.repo, "catalog": (CURRENT["entry"] or {}).get("id"), "adapter": model.adapter, "lora_merged": len(getattr(model, "fused", []) or []), "strength": round(getattr(model, "strength", 1.0) * 100), "fmt": FMT, "pid": os.getpid(), "head_tokens": len(builder.head_ids), "head_file": getattr(model, "head_file", None), "mark_hits": getattr(model, "mark_hits", 0), "rss_gb": round(guard.rss_gb(), 2),
                               "mlx_active_gb": round(act, 2), "mlx_peak_gb": round(peak, 2), "cap_gb": guard._cap[0],
-                              "asleep": model.asleep, "sleeps": model.sleeps, "dist_used": getattr(model, "dist_used", 0), "word_gate": bool(wordgate()), "boost": (gate() or {}).get("boost", 0), "people": len(people_mem.chats), "ahead": ahead_stats(), "know": knowledge.stats(), "whom": who.stats,
+                              "asleep": model.asleep, "sleeps": model.sleeps, "dist_used": getattr(model, "dist_used", 0), "word_gate": bool(wordgate()), "combo": {"fast": FAST["m"] is not None, "used": FAST["used"], "loads": FAST["loads"], "refused": FAST["refused"]}, "boost": (gate() or {}).get("boost", 0), "people": len(people_mem.chats), "ahead": ahead_stats(), "know": knowledge.stats(), "whom": who.stats,
                               "words": len(dictionary.load()["words"]), "actions": [a.ID for a in actions.ALL],
                               "model_link": {"provider": provider.kind(), "connected": provider.connected(), "error": provider.state["last_error"]},
                               "claude_early": claude_type.early_stats(), "claude_gate": CLAUDE_GATE,
@@ -1482,7 +1556,7 @@ class H(BaseHTTPRequestHandler):
             # field or a typing request) brings it back; one-off prompts (oneshot) still load it on demand
             idle = bool(req.get("idle"))
             secs = 86400.0 if idle else max(10.0, min(float(req.get("secs", 600) or 600), 3600.0))
-            r = run(lambda c: {"slept": model.sleep(secs, retrain=bool(req.get("retrain")))}, newest=False, timeout=15)
+            r = run(lambda c: {"slept": model.sleep(secs, retrain=bool(req.get("retrain"))), **fast_drop()}, newest=False, timeout=15)
             r["claude_stopped"] = claude_type.reap(0)
             if not idle:
                 threading.Timer(secs + 1, lambda: run(lambda c: {"woke": model.wake(force=False)}, newest=False, timeout=30)).start()
@@ -1498,7 +1572,7 @@ class H(BaseHTTPRequestHandler):
             # the app saved a new "Personal style" (0-100): his layer is merged again at that scale, in the one model
             # (a few seconds, typing answers from his words meanwhile); answers prepared at the old strength go
             want = strength_setting({"personalStrength": req.get("value", 100)})
-            r = run(lambda c: {"seconds": round(model.set_strength(want), 2)}, newest=False, timeout=60)
+            r = run(lambda c: {"seconds": round(model.set_strength(want) + (FAST["m"].set_strength(want) if FAST["m"] is not None else 0), 2)}, newest=False, timeout=60)
             with AHEAD_LOCK: AHEAD.clear(); AHEAD_KIND.clear(); FUT_INDEX.clear()
             print(f"strength {round(want * 100)}%: {r.get('seconds')} s", flush=True)
             return self.send({**r, "strength": round(model.strength * 100)})

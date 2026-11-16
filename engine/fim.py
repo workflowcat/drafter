@@ -13,6 +13,7 @@ a plain continuation, and these rules end the ghost where the gap is filled:
 
 Pure functions, shared by the engine (engine/model.py complete_gated, engine/server.py) and the bench (bench/fim.py)."""
 import re
+from gatecore import next_word, word_ps
 
 END = re.compile(r"[.!?…\n]")
 WORD = re.compile(r"\s*\S+\s?")
@@ -21,19 +22,6 @@ STOP = 0.3        # p of the rest's first token that ends the ghost (bench/fim.p
 MORE = 0.5        # words after the first while each token is at least this sure (the end-of-line bar)
 WORDS = 4         # at most this many words (the gaps that matter are 1-4 words)
 TOKENS = 12       # model tokens for one mid-line ghost
-
-
-def next_word(s):
-    """Leading spaces, one word with its punctuation, the space after it (gatecore.next_word)."""
-    out, seen = "", False
-    for ch in s:
-        if ch.isspace():
-            if seen:
-                if ch == " ": out += ch
-                break
-            out += ch; continue
-        seen = True; out += ch
-    return out
 
 
 def rest_at(toks, rests, lo, heal=""):
@@ -47,19 +35,6 @@ def rest_at(toks, rests, lo, heal=""):
             if prev != lo: return 0.0
             return rests[j] if j < len(rests) and rests[j] is not None else 0.0
     return 0.0
-
-
-def word_ps(toks, pos, end):
-    """p of each token that writes raw[pos:end] (gatecore.word_ps)."""
-    raw = next((t[0] for t in reversed(toks) if t[0]), "")
-    lo = len(raw[:pos].rstrip())
-    out, start = [], 0
-    for t in toks:
-        if not t[0]: continue
-        n = len(t[0])
-        if lo < n <= end or (n == end + 1 and start < end): out.append(t[1])
-        start = n
-    return out
 
 
 def shape(toks, rests, rest, heal="", more=MORE, words=WORDS, stop=STOP, closed=False):

@@ -84,6 +84,9 @@ struct Settings: Codable {
     var shortGhosts = true
     var minGhostShort = 3
     var keepTyping = true
+    /// Cadence round (2026-11-17, docs/rounds/2026-11-17-cadence.md): with a bigger typing model picked, the live 1.7B
+    /// stays loaded beside it and answers while he types fast (a gap under 120 ms), the bigger one in longer gaps.
+    var comboModels = false
     var claudePause = false    // Claude's rest of the sentence on a typing pause (under claudeTyping); round two proposes off
     var facts = false          // a question on screen that his calendar or saved texts answer: the answer as a chip (app/Facts.swift)
     var callOff: [String] = ["notion.id"]   // call apps that never get a record offer (Notion: its own meeting notes hold the mic)
@@ -152,6 +155,7 @@ struct Settings: Codable {
         longGhostsAI = v(.longGhostsAI, z.longGhostsAI); longGhostsChats = v(.longGhostsChats, z.longGhostsChats)
         ghostLength = pick(.ghostLength, ["word", "phrase"], "sentence")   // same rule as GhostRules.lengthMode; kept here so Settings decodes alone
         shortGhosts = v(.shortGhosts, z.shortGhosts); minGhostShort = max(0, v(.minGhostShort, z.minGhostShort)); keepTyping = v(.keepTyping, z.keepTyping)
+        comboModels = v(.comboModels, z.comboModels)
         ghostWords = v(.ghostWords, z.ghostWords); guessGhosts = v(.guessGhosts, z.guessGhosts); guessShade = v(.guessShade, z.guessShade); earlyStart = v(.earlyStart, z.earlyStart); idleGhost = v(.idleGhost, z.idleGhost)
         ghostMinWords = min(5, max(1, v(.ghostMinWords, z.ghostMinWords))); ghostMaxWords = min(8, max(ghostMinWords, v(.ghostMaxWords, z.ghostMaxWords)))
         claudePause = v(.claudePause, z.claudePause); translate = v(.translate, z.translate)

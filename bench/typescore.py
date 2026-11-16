@@ -14,6 +14,8 @@ import hashlib, json, math, re, statistics, sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "engine"))
+from gatecore import next_word
 SETS = ROOT / "data/bench/sets"     # every fresh set a recording was made on, by its fingerprint (bench/make_fresh.py)
 
 
@@ -63,19 +65,6 @@ def clean(before, text):
     if len(text.strip()) >= 4 and text.strip() in last: return ""
     if before[-1:].isspace(): text = text.lstrip(" ")
     return text
-
-
-def next_word(s):
-    """app/Keys.swift nextWord: leading spaces, one word with its punctuation, the space after it."""
-    out, seen = "", False
-    for ch in s:
-        if ch.isspace():
-            if seen:
-                if ch == " ": out += ch
-                break
-            out += ch; continue
-        seen = True; out += ch
-    return out
 
 
 def is_new_word(piece):

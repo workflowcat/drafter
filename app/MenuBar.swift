@@ -25,7 +25,7 @@ final class Menu: NSObject, NSMenuDelegate {
     func menuNeedsUpdate(_ m: NSMenu) {
         m.removeAllItems()
         let t = Drafter.shared
-        let state = t.settings.paused ? "Paused" : t.lowBattery ? "Paused: battery below 20%" : Engine.shared.info
+        let state = t.settings.paused ? "Paused" : t.lowBattery ? Engine.shared.info + " · battery below 20%: lighter" : Engine.shared.info
         m.addItem(withTitle: state, action: nil, keyEquivalent: "").isEnabled = false
         if Talk.shared.recording {   // first thing in the menu while a call or long note records
             m.addItem(.separator())

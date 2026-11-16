@@ -20,11 +20,13 @@ Confidence: 95% intervals by resampling whole lines (bootstrap), since the spots
 Dates: `split()` cuts held lines into calibration and test by the date he sent them (data/typed.jsonl), after
 grouping versions of one message (a line and the same line longer or shorter, a dictated and a typed copy).
 """
-import json, random, re, statistics
+import json, random, re, statistics, sys
 from collections import defaultdict
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "engine"))
+from gatecore import next_word
 WORDCH = re.compile(r"[\w'’-]")
 CYR = re.compile(r"[А-Яа-яІіЇїЄєҐґ]")
 LAT = re.compile(r"[A-Za-z]")
@@ -32,19 +34,6 @@ LAT = re.compile(r"[A-Za-z]")
 
 def lang(text):
     return "uk" if len(CYR.findall(text)) > len(LAT.findall(text)) else "en"
-
-
-def next_word(s):
-    """app/Keys.swift nextWord: leading spaces, one word with its punctuation, the space after it."""
-    out, seen = "", False
-    for ch in s:
-        if ch.isspace():
-            if seen:
-                if ch == " ": out += ch
-                break
-            out += ch; continue
-        seen = True; out += ch
-    return out
 
 
 def first_right(ghost, truth):

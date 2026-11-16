@@ -209,6 +209,7 @@ def timed(items, rows, pol, live, seed=1, keep=False, ahead=True, debounce=DEBOU
         G, pos = "", 1
         prev = None        # (pos, done_at, branch letter, branch_ready_at) of the last answered request
         busy_until = -1.0  # keep: the running request's end
+        ext_until = -1.0   # cadence round: an extension still running on the GPU (a newer ask waits for its next token)
         pending = None     # keep: (pos asked, text, done_at, shade)
         while pos < len(text):
             t = tkey[pos - 1]; nxt = tkey[pos] if pos < len(text) else 10 ** 9
@@ -230,6 +231,8 @@ def timed(items, rows, pol, live, seed=1, keep=False, ahead=True, debounce=DEBOU
             if where == "start": rec["why"] = "guard"; pos += 1; continue
             row = rows.get((i, pos))
             if row is None: rec["why"] = "norow"; pos += 1; continue
+            see = getattr(pol, "see", None)   # cadence round: the policy may read the gaps he typed at (causal)
+            if see: see(gap[pos - 1] if pos > 1 else None, gap[pos - 2] if pos > 2 else None)
             g, eng = pol(row, before, it["src"])
             g = measure.clean(before, g)
             if not g: rec["why"] = pol.why or "gate"
@@ -240,6 +243,8 @@ def timed(items, rows, pol, live, seed=1, keep=False, ahead=True, debounce=DEBOU
             eng_all = pol.info["first_ms"] if g else (row["toks"][decision(row["toks"])][3] if row["toks"] else 0)
             start = t
             if keep and busy_until > t: start = busy_until
+            contend = getattr(pol, "contend", 0.0)
+            if contend and ext_until > start: start = start + min(contend, ext_until - start)
             hit = False
             if ahead and prev and prev[0] == pos - 1 and prev[2] and text[pos - 1] == prev[2]:
                 ready = prev[3]
@@ -248,6 +253,7 @@ def timed(items, rows, pol, live, seed=1, keep=False, ahead=True, debounce=DEBOU
             if not hit: L = (start - t) + app + eng_all
             rec.update(L=L, eng=eng_all, app=app, path="ahead" if hit else ("predicted" if predicted else "debounced"))
             done = t + L
+            first = L
             opts = getattr(pol, "opts", None)
             if opts:
                 # combo: the ghost he sees at his next key is the newest one that came by then (each model's own time)
@@ -255,12 +261,15 @@ def timed(items, rows, pol, live, seed=1, keep=False, ahead=True, debounce=DEBOU
                 pick = opts[-1] if hit else next((o for o in reversed(opts) if last or t + (start - t) + app + o[0] < nxt), None)
                 if pick is None: pick = opts[0]
                 g = measure.clean(before, pick[1]); pol.info = dict(pol.info or {}, shade=pick[2], first_ms=pick[0], src=pick[3])
-                if not hit: L = (start - t) + app + pick[0]
+                if not hit: L = (start - t) + app + pick[0]; first = (start - t) + app + opts[0][0]
+                else: first = L
+                if contend and not hit and pick is not opts[-1]: ext_until = t + (start - t) + app + opts[-1][0]
                 rec.update(L=L, eng=pick[0]); done = t + L
             if g:
                 if done < nxt or pos == len(text) - 1:
                     rec["why"] = "shown"; G = g
-                    ghosts.append(dict(record(g, text, pos), L=L, shade=pol.info["shade"], place=where))
+                    ghosts.append(dict(record(g, text, pos), L=L, first=min(first, L), shade=pol.info["shade"], place=where,
+                                       src=(pol.info or {}).get("src")))
                     prev = None
                     continue      # at this very spot: he takes it (Tab) or types on into it
                 else:
@@ -325,6 +334,9 @@ def waits(items, rows, pol, live, seeds=(1, 2, 3), **kw):
         agg["grey"].append(1000 * sum(g["words"] - g["row"] for g in ghosts) / letters)
         Ls = [g["L"] for g in fresh]
         agg["p50"].append(q(Ls, .5)); agg["p95"].append(q(Ls, .95))
+        if getattr(pol, "firsts", False):   # cadence round: the first grey text (an extension may land later)
+            Fs = [g.get("first", g["L"]) for g in fresh]
+            agg["first_p50"].append(q(Fs, .5)); agg["first_p95"].append(q(Fs, .95))
         agg["visible"].append(100 * vis / max(1, nk))
         for k in keys:
             places[k["place"]]["n"].append(1); places[k["place"]][k["why"]].append(1)

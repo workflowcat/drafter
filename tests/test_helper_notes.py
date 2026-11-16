@@ -4,11 +4,15 @@ byte-identical. The calls go through the existing claude_on / cloud.py checks (u
 .venv/bin/python -B tests/test_helper_notes.py"""
 import ast, re, sys, time, types, unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "engine"))
 import claude_type as ct
 import rework as rw
+import prompt as prompt_mod
+from writing_notes import normalize as normalize_notes
+from chat_template import encode as chat_ids
 
 NOTE = "zebra-tone: short, no greetings"
 SERVER = (ROOT / "engine/server.py").read_text()
@@ -16,6 +20,8 @@ SERVER = (ROOT / "engine/server.py").read_text()
 
 def server_fns(*names, **ns):
     ns.setdefault("who", types.SimpleNamespace(hint=lambda req, task="type": ""))   # engine/whom.py
+    ns.setdefault("normalize_notes", normalize_notes)
+    ns.setdefault("chat_ids", chat_ids)
     fns = [n for n in ast.parse(SERVER).body if isinstance(n, ast.FunctionDef) and n.name in names]
     exec(compile(ast.Module(body=fns, type_ignores=[]), "server.py", "exec"), ns)
     return ns
@@ -25,6 +31,25 @@ class FakeWorker:
     def __init__(self): self.users = []; self.turns = 1
     def ask(self, user, cancelled=lambda: False, **kw): self.users.append(user); return ("rest of it", 1, 2)
     def alive(self): return True
+
+
+class Normalization(unittest.TestCase):
+    def test_whitespace_and_exact_cap(self):
+        cases = [(None, ""), (False, ""), (0, ""), ("", ""), (" \t\r\n\u00a0", ""),
+                 ("  zebra\n\t tone\u00a0short\u2028lines ", "zebra tone short lines"),
+                 ("x" * 299 + " \n tail", "x" * 299 + " "),
+                 ("x" * 301, "x" * 300), ("\u00e9" * 301, "\u00e9" * 300)]
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(prompt_mod.notes_text(raw), expected)
+                self.assertEqual(rw.notes_text(raw), expected)
+                self.assertEqual(ct.notes_line(raw), f"His writing instructions (follow them): {expected}\n" if expected else "")
+
+    def test_local_prompt_keeps_its_own_budget(self):
+        with patch.object(prompt_mod, "NOTES_CHARS", 4):
+            self.assertEqual(prompt_mod.notes_text(" zebra tone "), "zebr")
+            self.assertEqual(rw.notes_text(" zebra tone "), "zebra tone")
+            self.assertEqual(ct.notes_line(" zebra tone "), "His writing instructions (follow them): zebra tone\n")
 
 
 class ClaudeType(unittest.TestCase):
@@ -78,6 +103,16 @@ class Rework(unittest.TestCase):
         self.assertEqual(plain, self.w.users[-1])
         self.assertNotIn("instructions", plain)
 
+    def test_note_changes_only_its_prompt_line(self):
+        text = "the zebra plan is late again"
+        rw.rework(text, "clearer", app="Mail")
+        plain = self.w.users[-1]
+        for raw, normalized in ((" \tzebra\n tone ", "zebra tone"), ("x" * 301, "x" * 300)):
+            rw._cache.clear()
+            rw.rework(text, "clearer", app="Mail", notes=raw)
+            line = f"His writing instructions (follow them unless the task says otherwise): {normalized}\n\n"
+            self.assertEqual(self.w.users[-1], plain.replace("Task: ", line + "Task: ", 1))
+
     def test_local_path(self):
         calls = []
         local = lambda *a: calls.append(a) or ""
@@ -129,6 +164,14 @@ class NextMessage(unittest.TestCase):
             plain, empty = self.run_reply(base), self.run_reply({**base, "notes": "  "})
             self.assertEqual(plain, empty)
             self.assertIn("His writing instructions (follow them): " + NOTE, self.run_reply({**base, "notes": NOTE}))
+
+    def test_note_changes_only_its_prompt_line(self):
+        for ai in (True, False):
+            base = {"context": "Them: can you send the zebra file today please", "app": "Zebra", "ai": ai}
+            plain = self.run_reply(base)
+            for raw, normalized in ((" \tzebra\n tone ", "zebra tone"), ("x" * 301, "x" * 300), (123, "123"), (False, "")):
+                suffix = f" His writing instructions (follow them): {normalized}" if normalized else ""
+                self.assertEqual(self.run_reply({**base, "notes": raw}), plain[:-len(" OPTIONS")] + suffix + " OPTIONS")
 
 
 class Pause(unittest.TestCase):

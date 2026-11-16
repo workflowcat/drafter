@@ -19,6 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import claude_type as ct
 import translate as tr
 import local
+from writing_notes import normalize as notes_text
+from worker_pool import get_or_create
 
 SYSTEM = """You rework a piece of text {name} selected, so it reads as if he wrote it himself.
 Keep his voice: plain words, short sentences, no corporate filler, no exclamation marks he did not use, no emoji he did not use. Keep the language of the text unless told to translate. Ukrainian means Ukrainian, never Russian.
@@ -80,12 +82,7 @@ def instruction(cmd, text, custom=""):
 
 def _worker(model):
     with _lock:
-        w = _workers.get(model)
-        if w is None or not w.alive() or w.turns >= ct.Worker.MAX_TURNS:
-            if w: w.stop()
-            w = _workers[model] = ct.Worker(model, system(), max_tokens=3000)
-        w.used = time.time()
-        return w
+        return get_or_create(_workers, model, ct.Worker, system, max_tokens=3000)
 
 
 # idle processes are stopped by claude_type's one reaper (10 idle minutes, or at once when memory is low)
@@ -94,10 +91,6 @@ def _worker(model):
 def warm(model="sonnet"):
     """Start the worker when the menu opens, so the first pick does not wait for the CLI to start."""
     if Path(ct.CLI).exists(): threading.Thread(target=_worker, args=(model,), daemon=True).start()
-
-
-def notes_text(notes):
-    return " ".join((notes or "").split())[:300]
 
 
 def rework(text, cmd, custom="", app="", model="sonnet", online=True, local=None, cancelled=lambda: False, notes="", hint=""):

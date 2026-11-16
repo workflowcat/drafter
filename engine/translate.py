@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import claude_type as ct
 import prompt as prompt_mod
 import local
+from worker_pool import get_or_create
 
 SYSTEM = """You translate a message {name} is typing in a chat, so it reads as if he wrote it himself in the target language.
 Keep his tone and register: casual stays casual, short stays short, a lowercase start and a missing final period stay (English "I" is still a capital). Keep names, links, emails, numbers, times (15:00 stays 15:00), emoji, code, @mentions and line breaks as they are.
@@ -69,15 +70,14 @@ def kept(text, out, target):
     return all(have[k] >= n for k, n in need.items())
 
 
+def _system():
+    names = prompt_mod.words()[:120]
+    return system() + "\n\nNames he uses: " + ", ".join(names)
+
+
 def _worker(model):
     with _lock:
-        w = _workers.get(model)
-        if w is None or not w.alive() or w.turns >= ct.Worker.MAX_TURNS:
-            if w: w.stop()
-            names = prompt_mod.words()[:120]
-            w = _workers[model] = ct.Worker(model, system() + "\n\nNames he uses: " + ", ".join(names), max_tokens=1500)
-        w.used = time.time()
-        return w
+        return get_or_create(_workers, model, ct.Worker, _system, max_tokens=1500)
 
 
 # idle processes are stopped by claude_type's one reaper (10 idle minutes, or at once when memory is low)

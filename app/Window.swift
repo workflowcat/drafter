@@ -529,6 +529,7 @@ struct SettingsView: View {
                     row("Suggest my next message while the caret rests", s.idleGhost, typing: true) { $0.idleGhost = $1 }
                     row("Show short suggestions (3 letters)", s.shortGhosts, typing: true) { $0.shortGhosts = $1 }
                     row("Finish a suggestion while I type into it", s.keepTyping, typing: true) { $0.keepTyping = $1 }
+                    row("Fast model while I type fast, the bigger one in pauses", s.comboModels, typing: true) { $0.comboModels = $1 }
                     row("No suggestions after a typo", s.typoHold, typing: true) { $0.typoHold = $1 }
                     row("Suggestions in the middle of a line", s.midLine, typing: true) { $0.midLine = $1 }
                     modelRows

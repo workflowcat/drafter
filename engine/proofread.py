@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import claude_type as ct
 import prompt as prompt_mod
 import local
+from worker_pool import get_or_create
 
 SYSTEM = """You proofread a chat message or note {name} is typing (Ukrainian and English, often mixed in one message).
 
@@ -53,12 +54,7 @@ def _system():
 def _worker(model):
     """Its own kept-running `claude` process (a whole answer, a bigger output cap); stopped after 10 idle minutes."""
     with _lock:
-        w = _workers.get(model)
-        if w is None or not w.alive() or w.turns >= ct.Worker.MAX_TURNS:
-            if w: w.stop()
-            w = _workers[model] = ct.Worker(model, _system(), max_tokens=1200)
-        w.used = time.time()
-        return w
+        return get_or_create(_workers, model, ct.Worker, _system, max_tokens=1200)
 
 
 # idle processes are stopped by claude_type's one reaper (10 idle minutes, or at once when memory is low)

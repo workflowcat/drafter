@@ -2,7 +2,7 @@
 layer strength in the head key (engine/model.py). Empty extras leave the prompt byte-identical to before; a sensitive
 copy never reaches it; both sit after the cached head. Made-up text only.
 .venv/bin/python -B tests/test_prompt_parity.py"""
-import sys, unittest
+import ast, hashlib, sys, types, unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -101,9 +101,14 @@ class Tail(unittest.TestCase):
 
 class Strength(unittest.TestCase):
     def test_head_key_keeps_todays_key_at_full_strength(self):
-        import model as model_mod
-        m = model_mod.Model.__new__(model_mod.Model)
-        m.repo, m.adapter, m.cache = "made/up-model", None, None
+        # This method only hashes metadata. Extract it without importing MLX or touching a GPU.
+        source = ast.parse((ROOT / "engine/model.py").read_text())
+        cls = next(n for n in source.body if isinstance(n, ast.ClassDef) and n.name == "Model")
+        method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "head_key")
+        ns = dict(hashlib=hashlib, Path=Path, FUSE=True, TWEAKS="")
+        exec(compile(ast.Module(body=[method], type_ignores=[]), "model.py", "exec"), ns)
+        m = types.SimpleNamespace(repo="made/up-model", adapter=None, cache=None)
+        m.head_key = types.MethodType(ns["head_key"], m)
         m.strength = 1.0; full = m.head_key([1, 2, 3])
         del m.strength; self.assertEqual(m.head_key([1, 2, 3]), full)       # an object without the field: the same key
         m.strength = 0.5; half = m.head_key([1, 2, 3])

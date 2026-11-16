@@ -11,6 +11,7 @@ from unittest.mock import Mock
 ENGINE = Path(__file__).resolve().parent.parent / "engine"
 sys.path.insert(0, str(ENGINE))
 import cloud
+from chat_template import encode as chat_ids
 
 # Every place that starts a `claude` process or hands text to one, by (module, top-level function or class).
 # A new one fails test_every_claude_call_site_is_known until it is added here with the feature that owns it.
@@ -22,6 +23,7 @@ SITES = {
     ("facts", "_worker"): "server: facts",
     ("translate", "_worker"): "server: translate",
     ("rework", "_worker"): "server: rework",
+    ("worker_pool", "get_or_create"): "shared creation under each feature's _worker lock",
     ("server", "rewrite"): "rewrite",
     ("server", "outline"): "call_notes",
     ("server", "reply"): "reply",
@@ -31,7 +33,7 @@ SITES = {
     ("router", "text"): "no caller (test_router_text_has_no_caller)",
     ("entities", "ask_claude"): "entities: cloud.allowed(\"entities\") + router.online() in the function itself; only the name goes",
 }
-SINKS = {"claude_worker.ask", "ct.Worker", "Worker"}
+SINKS = {"claude_worker.ask", "ct.Worker", "Worker", "get_or_create", "worker_type"}
 
 # server.py: a call into one of these must sit in a function that asks claude_on(<one of the features>) first
 ENTRIES = {
@@ -101,6 +103,8 @@ class Gate(unittest.TestCase):
         unknown = found - set(SITES)
         self.assertFalse(unknown, f"a new Claude call site: gate it (server.claude_on) and add it to SITES: {unknown}")
         self.assertIn(("server", "reply"), found)     # the walk itself still sees the known ones
+        self.assertTrue({(name, "_worker") for name in ("proofread", "translate", "rework", "facts")} <= found)
+        self.assertIn(("worker_pool", "get_or_create"), found)
 
     def test_server_functions_ask_first(self):
         tree = ast.parse((ENGINE / "server.py").read_text())
@@ -170,7 +174,7 @@ class Server(unittest.TestCase):
         self.ns = dict(cloud=cloud, router=types.SimpleNamespace(online=lambda: True), settings_load=lambda: {"connect": {"provider": "cli"}, **self.settings},
                        claude_type=self.ct, claude_worker=self.cw, run=lambda *a, **k: self.local(), model=types.SimpleNamespace(tok=tok),
                        REPO="x", KEYS=[0], CLAUDE_CTX=2500, DATA=Path("/nonexistent"), REPLY_CACHE={}, OPTIONS="", re=__import__("re"),
-                       time=__import__("time"), json=__import__("json"), Path=Path, _known=lambda w: False, local_rewrite=Mock(),
+                       time=__import__("time"), json=__import__("json"), Path=Path, _known=lambda w: False, local_rewrite=Mock(), chat_ids=chat_ids,
                        prompt_examples=lambda: [],
                        who=types.SimpleNamespace(hint=Mock(return_value="Keyboard now: Ukrainian.\n")))
         exec(compile(ast.Module(body=body, type_ignores=[]), "server.py", "exec"), self.ns)

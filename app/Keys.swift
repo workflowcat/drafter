@@ -867,6 +867,7 @@ final class Keys {
         // prompt and the engine's look-ahead keys stay as before without them)
         if let clip = Clip.forPrompt(before) { body["clip"] = clip }
         if Drafter.shared.settings.keepTyping { body["keep_on"] = true }   // earlier round: an older ask runs on (engine keep_running)
+        body.merge(GhostRules.cadenceBody(combo: Drafter.shared.settings.comboModels, gapMs: gaps.lastMs)) { _, b in b }   // cadence round: two models by his typing speed
         let st = Drafter.shared.settings, notes = WritingNotes.forApp(s.app.bundleIdentifier ?? "", global: st.writingNote, perApp: st.appNotes)
         if !notes.isEmpty { body["notes"] = notes }
         // mid-line (setting midLine): the rest of the caret's line first, at most two lines more; the engine fills the
